@@ -63,6 +63,17 @@ class GNWConfig:
     fatigue_rate: float = 0.1    # How fast broadcast items fade
     fatigue_threshold: float = 0.3  # Below this, item exits GNW
     competition_temp: float = 1.0   # Softmax temperature for competitive selection
+    concept_dim: int = 256       # Expected dimensionality of workspace concepts
+    context_size: int = 128      # Extended context buffer size beyond the GNW slots
+    context_decay: float = 0.95  # Decay factor for extended context items
+    context_eviction_threshold: float = 0.05  # Forget items weaker than this
+    context_update_rate: float = 0.2  # EMA rate for running context summary
+    attention_heads: int = 4     # Number of spike-attention heads
+    context_top_k: int = 5       # Max context items to retrieve per query
+    recurrent_integration_rate: float = 0.1  # Leaky integration rate across time
+    context_bias_gain: float = 0.35  # Additive bias strength during generation
+    repetition_window: int = 20  # Context history window for repetition detection
+    repetition_novelty_threshold: float = 0.8  # Inject novelty above this repetition score
 
 
 @dataclass

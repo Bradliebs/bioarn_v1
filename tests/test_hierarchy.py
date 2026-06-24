@@ -179,3 +179,213 @@ def test_generation_different_concepts() -> None:
     second = hierarchy.generate(torch.tensor([0.0, 0.9, 0.0, 0.0])).generated_sensory
 
     assert not torch.allclose(first, second)
+
+
+from bioarn.hierarchy import HierarchyConfig, VisualHierarchy
+from bioarn.training import VisionTrainConfig, VisionTrainer
+
+
+def make_visual_hierarchy_config() -> HierarchyConfig:
+    return HierarchyConfig(
+        pool_sizes=[20, 28, 36, 20],
+        concept_dims=[12, 20, 28, 14],
+        thresholds=[0.2, 0.28, 0.34, 0.4],
+        learning_rates=[0.05, 0.04, 0.03, 0.02],
+    )
+
+
+def make_unsupervised_visual_config() -> HierarchyConfig:
+    return HierarchyConfig(
+        pool_sizes=[40, 24, 24, 12],
+        concept_dims=[12, 18, 24, 12],
+        thresholds=[0.55, 0.35, 0.4, 0.45],
+        learning_rates=[0.05, 0.04, 0.03, 0.02],
+    )
+
+
+def make_structured_visual_image(label: int, seed: int) -> torch.Tensor:
+    generator = torch.Generator().manual_seed(seed)
+    image = torch.randn(3, 32, 32, generator=generator) * 0.18
+    row = (label % 5) * 5
+    col = (label // 5) * 14
+    image[label % 3, row : row + 6, :] += 0.6
+    image[(label + 1) % 3, :, col : col + 10] += 0.4
+    image[(label + 2) % 3, 8:24, 8:24] += 0.05 * label
+    return image
+
+
+def make_visual_train_test_sets(
+    *,
+    train_samples: int = 240,
+    test_samples: int = 120,
+) -> tuple[list[tuple[torch.Tensor, int]], list[tuple[torch.Tensor, int]]]:
+    train = [
+        (make_structured_visual_image(index % 10, index), index % 10)
+        for index in range(train_samples)
+    ]
+    test = [
+        (make_structured_visual_image(index % 10, 1000 + index), index % 10)
+        for index in range(test_samples)
+    ]
+    return train, test
+
+
+def train_visual_hierarchy(
+    config: HierarchyConfig,
+    samples: list[tuple[torch.Tensor, int]],
+) -> VisualHierarchy:
+    hierarchy = VisualHierarchy(config)
+    for image, label in samples:
+        hierarchy.learn(image, label=label)
+    return hierarchy
+
+
+def test_hierarchy_init() -> None:
+    hierarchy = VisualHierarchy(make_visual_hierarchy_config())
+
+    assert len(hierarchy.layers) == 4
+    assert hierarchy.layers[0].name == "V1"
+    assert hierarchy.layers[3].name == "IT"
+    assert hierarchy.binding is not None
+
+
+def test_hierarchy_process_shape() -> None:
+    hierarchy = VisualHierarchy(make_visual_hierarchy_config())
+
+    output = hierarchy.process(make_structured_visual_image(2, 7))
+
+    assert output.layer_activations[0].shape == (16, 12)
+    assert output.layer_activations[1].shape == (4, 20)
+    assert output.layer_activations[2].shape == (1, 28)
+    assert output.layer_activations[3].shape == (1, 14)
+
+
+def test_l1_patches_correct() -> None:
+    hierarchy = VisualHierarchy(make_visual_hierarchy_config())
+
+    output = hierarchy.process(make_structured_visual_image(1, 3).reshape(-1))
+
+    assert len(output.patches) == 16
+    assert output.patch_grid == (4, 4)
+    assert output.layer_inputs[0].shape[1] == hierarchy.config.l1_input_dim
+
+
+def test_l1_learns_features() -> None:
+    hierarchy = VisualHierarchy(make_unsupervised_visual_config())
+    for index in range(20):
+        generator = torch.Generator().manual_seed(index)
+        hierarchy.learn(torch.randn(3, 32, 32, generator=generator))
+
+    assert hierarchy.layers[0].pool.committed_count > 10
+
+
+def test_l2_uses_l1_output() -> None:
+    hierarchy = VisualHierarchy(make_visual_hierarchy_config())
+
+    output = hierarchy.learn(make_structured_visual_image(0, 11), label=0)
+    first_group = output.groupings[0][0]
+    expected = torch.cat([output.layer_activations[0][index] for index in first_group], dim=0)
+
+    assert hierarchy.layers[1].last_inputs.shape == (4, 4 * hierarchy.config.concept_dims[0])
+    assert torch.allclose(hierarchy.layers[1].last_inputs[0], expected, atol=1e-5)
+
+
+def test_hierarchy_learns_unsupervised() -> None:
+    hierarchy = VisualHierarchy(make_unsupervised_visual_config())
+    for index in range(20):
+        generator = torch.Generator().manual_seed(100 + index)
+        hierarchy.learn(torch.randn(3, 32, 32, generator=generator))
+
+    assert hierarchy.layers[0].pool.committed_count > 0
+    assert hierarchy.layers[1].pool.committed_count > 0
+    assert hierarchy.layers[2].pool.committed_count > 0
+    assert hierarchy.layers[3].pool.committed_count == 0
+
+
+def test_hierarchy_classifies() -> None:
+    train, _ = make_visual_train_test_sets(train_samples=160, test_samples=40)
+    hierarchy = train_visual_hierarchy(make_visual_hierarchy_config(), train)
+
+    predicted, confidence = hierarchy.classify(make_structured_visual_image(7, 5007))
+
+    assert predicted == 7
+    assert confidence > 0.5
+
+
+def test_hierarchy_abstains_on_noise() -> None:
+    train, _ = make_visual_train_test_sets(train_samples=160, test_samples=40)
+    hierarchy = train_visual_hierarchy(make_visual_hierarchy_config(), train)
+
+    predicted, confidence = hierarchy.classify(torch.randn(3, 32, 32))
+
+    assert predicted == -1
+    assert confidence == 0.0
+
+
+def test_hierarchy_accuracy_improves() -> None:
+    train, test = make_visual_train_test_sets()
+    hierarchy = train_visual_hierarchy(make_visual_hierarchy_config(), train)
+    hierarchy_accuracy = sum(
+        int(hierarchy.classify(image)[0] == label) for image, label in test
+    ) / len(test)
+
+    flat = VisionTrainer(
+        VisionTrainConfig(
+            input_dim=3072,
+            concept_dim=64,
+            max_pool_size=10,
+            margin_threshold=0.6,
+            use_batched=True,
+            num_train_samples=len(train),
+            num_test_samples=len(test),
+        )
+    )
+    flat_train = [(image.reshape(-1), label) for image, label in train]
+    flat_test = [(image.reshape(-1), label) for image, label in test]
+    flat.train_online(flat_train, num_samples=len(flat_train))
+    flat_metrics = flat.evaluate(flat_test, num_samples=len(flat_test))
+
+    assert hierarchy_accuracy > float(flat_metrics["accuracy"])
+
+
+def test_feature_binding_strengthens() -> None:
+    hierarchy = VisualHierarchy(make_visual_hierarchy_config())
+    image = make_structured_visual_image(3, 303)
+
+    first = hierarchy.learn(image, label=3)
+    lower = [first.fired_indices[0][index] for index in first.groupings[0][0]]
+    higher = first.fired_indices[1][0]
+    before = hierarchy.binding.get_strength(0, lower, higher) if hierarchy.binding else 0.0
+
+    for _ in range(4):
+        hierarchy.learn(image, label=3)
+
+    after = hierarchy.binding.get_strength(0, lower, higher) if hierarchy.binding else 0.0
+
+    assert after > before
+
+
+def test_per_layer_features() -> None:
+    hierarchy = VisualHierarchy(make_visual_hierarchy_config())
+    image = make_structured_visual_image(4, 44)
+
+    assert hierarchy.get_layer_features(image, 1).shape == (16, 12)
+    assert hierarchy.get_layer_features(image, 2).shape == (4, 20)
+    assert hierarchy.get_layer_features(image, 3).shape == (1, 28)
+    assert hierarchy.get_layer_features(image, 4).shape == (1, 14)
+
+
+def test_hierarchy_no_backprop() -> None:
+    hierarchy = VisualHierarchy(make_visual_hierarchy_config())
+    hierarchy.learn(make_structured_visual_image(5, 55), label=5)
+
+    assert all(
+        parameter.grad is None
+        for layer in hierarchy.layers
+        for parameter in layer.pool.core.parameters()
+    )
+    assert all(
+        not buffer.requires_grad
+        for layer in hierarchy.layers
+        for buffer in layer.pool.core.buffers()
+    )

@@ -15,6 +15,7 @@ from bioarn.preprocessing import (
     PreprocessingPipeline,
     SparseRandomProjection,
 )
+from bioarn.hierarchy import HierarchyConfig, VisualHierarchy
 from bioarn.training import (
     SyntheticCIFAR10Stream,
     VisionTrainConfig,
@@ -171,6 +172,62 @@ def _format_table(results: list[RunResult]) -> str:
         for row in rows
     ]
     return "\n".join([header_line, divider, *row_lines])
+
+
+def train_hierarchical_cifar() -> dict[str, object]:
+    """Train Bio-ARN with a stacked visual hierarchy on CIFAR-like images."""
+
+    base_config = _base_config(0.35)
+    train_stream, test_stream, source = _select_streams(base_config)
+    train_samples = take_samples(train_stream, 5000)
+    test_samples = take_samples(test_stream, 1000)
+
+    hierarchy = VisualHierarchy(HierarchyConfig())
+
+    unsupervised_samples = train_samples[:2000]
+    supervised_samples = train_samples[2000:5000]
+
+    print(f"[hierarchy] data_source={source}")
+    print(f"[hierarchy] phase1_unsupervised={len(unsupervised_samples)}")
+    for tensor, _ in unsupervised_samples:
+        hierarchy.learn(tensor)
+
+    print(f"[hierarchy] phase2_supervised={len(supervised_samples)}")
+    for tensor, label in supervised_samples:
+        if label is not None:
+            hierarchy.learn(tensor, label=int(label))
+
+    total = 0
+    correct = 0
+    covered = 0
+    abstained = 0
+    for tensor, label in test_samples:
+        predicted, _ = hierarchy.classify(tensor)
+        total += 1
+        abstained += int(predicted == -1)
+        if predicted != -1:
+            covered += 1
+        if label is not None and predicted == label:
+            correct += 1
+
+    result = {
+        "data_source": source,
+        "accuracy": correct / max(total, 1),
+        "coverage": covered / max(total, 1),
+        "covered_accuracy": correct / max(covered, 1),
+        "abstention_rate": abstained / max(total, 1),
+        "per_layer_committed": [layer.pool.committed_count for layer in hierarchy.layers],
+    }
+    print(
+        "[hierarchy] "
+        f"acc={result['accuracy']:.3f} "
+        f"covered={result['covered_accuracy']:.3f} "
+        f"coverage={result['coverage']:.3f} "
+        f"abstain={result['abstention_rate']:.3f}"
+    )
+    for index, committed in enumerate(result["per_layer_committed"], start=1):
+        print(f"[hierarchy] L{index}_committed={committed}")
+    return result
 
 
 def main() -> None:

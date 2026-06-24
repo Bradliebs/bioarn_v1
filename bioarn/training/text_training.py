@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from pathlib import Path
 import statistics
@@ -31,8 +31,11 @@ from bioarn.generation import (
     QualityReport,
     RepetitionPenalty,
 )
+from bioarn.language import DualLevelProcessor, WordLevelConfig, WordLevelProcessor
 from bioarn.loop import SensorimotorLoop
+from bioarn.memory import SequenceMemory, SequenceMemoryConfig
 from bioarn.tokenization import BPETokenizer, CharTokenizer, SpikeTokenEncoder
+from bioarn.workspace import RecurrentContext
 
 
 _BUILTIN_PASSAGES = [
@@ -84,6 +87,9 @@ class TextGenConfig:
     repetition_window: int = 24
     use_contextual_patterns: bool = True
     enable_ngram_cache: bool = True
+    use_word_level: bool = True
+    word_level: WordLevelConfig = field(default_factory=WordLevelConfig)
+    sequence_memory: SequenceMemoryConfig = field(default_factory=SequenceMemoryConfig)
 
 
 @dataclass
@@ -137,6 +143,11 @@ class _Prediction:
     probabilities: torch.Tensor
     sdm_confidence: float
     margin_confidence: float
+    transition_confidence: float
+    ngram_confidence: float
+    chunk_confidence: float
+    ensemble_confidence: float
+    source_predictions: dict[str, list[tuple[int, float]]]
 
 
 class TextGenerationTrainer:
@@ -172,9 +183,32 @@ class TextGenerationTrainer:
             window=self.config.repetition_window,
         )
         self.decoder = BeamSearchDecoder(beam_width=self.config.beam_width, length_penalty=0.6)
+        self.sequence_memory = SequenceMemory(
+            self.config.sequence_memory,
+            sdm=self.system.core.fabric.sdm,
+        )
+        self.sequence_memory.bind_tokenizer(self.tokenizer)
+        self.word_processor = (
+            WordLevelProcessor(self.config.word_level)
+            if self.config.use_word_level and self.config.tokenizer_type.lower() == "char"
+            else None
+        )
+        self.dual_processor = (
+            DualLevelProcessor(self, self.word_processor)
+            if self.word_processor is not None
+            else None
+        )
 
         self._runtime_token_history: list[int] = []
         self._runtime_concept_history: list[torch.Tensor] = []
+        self.recurrent_context = RecurrentContext(
+            context_dim=int(self.system.core.config.ccc.concept_dim),
+            integration_rate=float(self.system.core.gnw.config.recurrent_integration_rate),
+        )
+        self.enable_generation_context = True
+        self._last_context_utilization = 0.0
+        self._last_context_repetition = 0.0
+        self._last_topic_drift = 0.0
         self._refresh_generation_helpers()
 
     @staticmethod
@@ -229,6 +263,17 @@ class TextGenerationTrainer:
                 fatigue_rate=0.05,
                 fatigue_threshold=0.1,
                 competition_temp=0.75,
+                concept_dim=concept_dim,
+                context_size=max(64, min(256, config.context_length * 4)),
+                context_decay=0.97,
+                context_eviction_threshold=0.04,
+                context_update_rate=0.2,
+                attention_heads=4,
+                context_top_k=5,
+                recurrent_integration_rate=0.12,
+                context_bias_gain=0.4,
+                repetition_window=max(12, int(config.context_length)),
+                repetition_novelty_threshold=0.82,
             ),
             reward=RewardConfig(
                 intrinsic_scale=1.0,
@@ -262,6 +307,7 @@ class TextGenerationTrainer:
 
     def _refresh_generation_helpers(self) -> None:
         self.ngram_cache.bind_tokenizer(self.tokenizer)
+        self.sequence_memory.bind_tokenizer(self.tokenizer)
         self.decoder = BeamSearchDecoder(beam_width=self.config.beam_width, length_penalty=0.6)
         self.repetition_penalty = RepetitionPenalty(
             penalty=self.config.repetition_penalty,
@@ -395,6 +441,10 @@ class TextGenerationTrainer:
     def _reset_runtime_state(self, *, clear_workspace: bool, clear_temporal_buffer: bool) -> None:
         self._runtime_token_history = []
         self._runtime_concept_history = []
+        self.recurrent_context.reset()
+        self._last_context_utilization = 0.0
+        self._last_context_repetition = 0.0
+        self._last_topic_drift = 0.0
         self.system.language_encoder.reset_state()
         self.system.motor_stream.reset()
         self.system.hierarchy.reset()
@@ -429,8 +479,16 @@ class TextGenerationTrainer:
         count = int(self.token_concept_counts.get(int(token_id), 0))
         prototype = self.token_concept_sums.get(int(token_id))
         if count <= 0 or prototype is None:
-            return None
+            return self.sequence_memory.token_prototype(int(token_id))
         return self._normalize(prototype / float(count))
+
+    def _candidate_prototypes(self, candidate_ids: Sequence[int]) -> dict[int, torch.Tensor]:
+        prototypes: dict[int, torch.Tensor] = {}
+        for token_id in candidate_ids:
+            prototype = self._token_prototype(int(token_id))
+            if prototype is not None and float(prototype.norm().item()) > 0.0:
+                prototypes[int(token_id)] = prototype
+        return prototypes
 
     def _most_common_ccc_index(self, token_id: int) -> int | None:
         counts = self.token_to_ccc_counts.get(int(token_id))
@@ -448,6 +506,7 @@ class TextGenerationTrainer:
         normalized = self._normalize(concept)
         self._runtime_token_history.append(int(token_id))
         self._runtime_concept_history.append(normalized.detach().clone())
+        self.recurrent_context.integrate(normalized)
         workspace_index = int(ccc_index) if ccc_index is not None else -(int(token_id) + 1)
         self.system.core.gnw.inject(workspace_index, normalized, priority=max(0.1, float(confidence)))
 
@@ -460,6 +519,7 @@ class TextGenerationTrainer:
     def _update_memories(self, token_id: int, concept: torch.Tensor, ccc_index: int | None) -> None:
         token_id = int(token_id)
         normalized = self._normalize(concept)
+        self.sequence_memory.record_token(token_id, normalized)
         self.token_counts[token_id] += 1
         self.token_concept_counts[token_id] += 1
         if token_id not in self.token_concept_sums:
@@ -472,6 +532,10 @@ class TextGenerationTrainer:
         if len(self._runtime_token_history) >= 2:
             prev_token = int(self._runtime_token_history[-2])
             self.transition_counts[prev_token][token_id] += 1
+            prev_concept = self._runtime_concept_history[-2] if len(self._runtime_concept_history) >= 2 else None
+            self.sequence_memory.record_transition(prev_token, token_id, prev_concept, normalized)
+            recent_window = self._runtime_token_history[-max(2, min(self.config.context_length, 12)) :]
+            self.sequence_memory.store_sequence(recent_window)
 
     def _adapt_pool_thresholds(self) -> None:
         pool_stats = self.system.core.ccc_pool.get_pool_stats()
@@ -599,6 +663,7 @@ class TextGenerationTrainer:
         retrieved = self.system.core.fabric.sdm.retrieve_associates(noisy_query)
         if float(retrieved.norm().item()) > 0.0:
             retrieved = self._normalize(retrieved)
+        context_vector = self._current_context_vector(noisy_query) if self.enable_generation_context else torch.zeros_like(normalized)
         associates = self.system.core.fabric.retrieve_associates(noisy_query, k=4)
         if associates.directions:
             weights = torch.tensor(
@@ -611,10 +676,92 @@ class TextGenerationTrainer:
                 [self._normalize(direction).to(noisy_query) for direction in associates.directions]
             )
             blended = (weights.unsqueeze(-1) * assoc_vector).sum(dim=0)
+            if float(retrieved.norm().item()) > 0.0 and float(context_vector.norm().item()) > 0.0:
+                return self._normalize((0.55 * retrieved) + (0.25 * blended) + (0.20 * context_vector))
             if float(retrieved.norm().item()) > 0.0:
                 return self._normalize((0.7 * retrieved) + (0.3 * blended))
+            if float(context_vector.norm().item()) > 0.0:
+                return self._normalize((0.7 * blended) + (0.3 * context_vector))
             return self._normalize(blended)
+        if float(retrieved.norm().item()) > 0.0 and float(context_vector.norm().item()) > 0.0:
+            return self._normalize((0.7 * retrieved) + (0.3 * context_vector))
+        if float(context_vector.norm().item()) > 0.0:
+            return context_vector
         return retrieved if float(retrieved.norm().item()) > 0.0 else normalized
+
+    def _current_context_vector(self, query: torch.Tensor | None = None) -> torch.Tensor:
+        base = torch.zeros(self.system.core.config.ccc.concept_dim, dtype=torch.float32)
+        if hasattr(self.system.core.gnw, "get_context_vector"):
+            base = self._normalize(self.system.core.gnw.get_context_vector().detach().clone())
+        attended = torch.zeros_like(base)
+        if query is not None and hasattr(self.system.core.gnw, "attend_context"):
+            attended = self._normalize(self.system.core.gnw.attend_context(query).detach().clone())
+        recurrent = self._normalize(self.recurrent_context.state.detach().clone())
+
+        vectors: list[tuple[float, torch.Tensor]] = []
+        if float(base.norm().item()) > 0.0:
+            vectors.append((0.45, base))
+        if float(attended.norm().item()) > 0.0:
+            vectors.append((0.30, attended))
+        if float(recurrent.norm().item()) > 0.0:
+            vectors.append((0.25, recurrent))
+        if not vectors:
+            return base
+
+        combined = torch.zeros_like(base)
+        total_weight = 0.0
+        for weight, vector in vectors:
+            combined = combined + (weight * vector.to(combined))
+            total_weight += weight
+        return self._normalize(combined / max(total_weight, 1e-6))
+
+    def _apply_generation_context(self, token_ids: Sequence[int], prediction: _Prediction) -> _Prediction:
+        if not self.enable_generation_context or not prediction.candidate_ids:
+            return prediction
+
+        del token_ids
+        query = (
+            self._runtime_concept_history[-1]
+            if self._runtime_concept_history
+            else prediction.retrieved_concept.detach().clone()
+        )
+        context_vector = self._current_context_vector(query)
+        if float(context_vector.norm().item()) <= 1e-8:
+            self._last_context_utilization = 0.0
+            self._last_context_repetition = 0.0
+            self._last_topic_drift = 0.0
+            return prediction
+
+        prototypes = torch.stack(
+            [
+                (
+                    prototype
+                    if (prototype := self._token_prototype(token_id)) is not None
+                    else torch.zeros(self.system.core.config.ccc.concept_dim, dtype=torch.float32)
+                )
+                for token_id in prediction.candidate_ids
+            ],
+            dim=0,
+        )
+        context_bias = self.recurrent_context.prime_retrieval(context_vector, prototypes).to(prediction.probabilities)
+        biased_logits = torch.log(prediction.probabilities.clamp_min(1e-6))
+        biased_logits = biased_logits + (float(self.system.core.gnw.config.context_bias_gain) * context_bias)
+
+        repetition_score = self.recurrent_context.detect_repetition(
+            self._runtime_concept_history,
+            window=int(self.system.core.gnw.config.repetition_window),
+        )
+        if repetition_score >= float(self.system.core.gnw.config.repetition_novelty_threshold):
+            noise_scale = min(0.15, 0.03 + (0.12 * repetition_score))
+            biased_logits = biased_logits + (torch.randn_like(biased_logits) * noise_scale)
+
+        probabilities = torch.softmax(biased_logits, dim=0)
+        self._last_context_utilization = float(context_bias.abs().mean().item())
+        self._last_context_repetition = float(repetition_score)
+        self._last_topic_drift = float(
+            self.system.core.gnw.context.get_topic_drift() if hasattr(self.system.core.gnw, "context") else 0.0
+        )
+        return replace(prediction, probabilities=probabilities.detach().clone())
 
     def _candidate_token_ids(self) -> list[int]:
         observed = [
@@ -654,6 +801,11 @@ class TextGenerationTrainer:
                 probabilities=torch.empty(0, dtype=torch.float32),
                 sdm_confidence=0.0,
                 margin_confidence=0.0,
+                transition_confidence=0.0,
+                ngram_confidence=0.0,
+                chunk_confidence=0.0,
+                ensemble_confidence=0.0,
+                source_predictions={"sdm": [], "transition": [], "ngram": [], "chunk": []},
             )
 
         history = [int(token_id) for token_id in (history_ids if history_ids is not None else self._runtime_token_history)]
@@ -670,59 +822,30 @@ class TextGenerationTrainer:
             else:
                 current_concept = torch.zeros(self.system.core.config.ccc.concept_dim)
 
-        retrieved = self._retrieve_next_concept(current_concept, temperature=temperature)
-        prototypes_list: list[torch.Tensor] = []
-        for token_id in candidate_ids:
-            prototype = self._token_prototype(token_id)
-            if prototype is None:
-                prototype = torch.zeros(self.system.core.config.ccc.concept_dim, dtype=torch.float32)
-            prototypes_list.append(prototype)
-        prototypes = torch.stack(prototypes_list)
-        similarities = F.cosine_similarity(
-            prototypes,
-            retrieved.unsqueeze(0).expand_as(prototypes),
-            dim=-1,
+        candidate_prototypes = self._candidate_prototypes(candidate_ids)
+        sequence_result = self.sequence_memory.score_candidates(
+            context=history,
+            candidate_ids=candidate_ids,
+            token_prototypes=candidate_prototypes,
+            context_text=self._window_text(history),
+            ngram_cache=self.ngram_cache if self.config.enable_ngram_cache else None,
+            temperature=temperature,
+            fallback_concept=current_concept,
         )
-        logits = similarities * 7.5
-
-        transition_bias = torch.zeros_like(logits)
-        if current_token is not None and self.transition_counts.get(int(current_token)):
-            transitions = self.transition_counts[int(current_token)]
-            total = float(sum(transitions.values()))
-            for index, token_id in enumerate(candidate_ids):
-                transition_bias[index] = math.log1p(float(transitions.get(token_id, 0))) / max(math.log1p(total), 1.0)
-        else:
-            total = float(sum(self.token_counts.values()))
-            for index, token_id in enumerate(candidate_ids):
-                transition_bias[index] = math.log1p(float(self.token_counts.get(token_id, 0))) / max(math.log1p(total), 1.0)
-        logits = logits + (2.4 * transition_bias)
-
-        full_scores = torch.full((self._tokenizer_vocab_size(),), -12.0, dtype=torch.float32)
-        for index, token_id in enumerate(candidate_ids):
-            if token_id < full_scores.numel():
-                full_scores[token_id] = logits[index]
-
-        for special_id in self._special_token_ids:
-            if special_id < full_scores.numel():
-                full_scores[special_id] = -16.0
-
-        context_text = self._window_text(history)
-        if self.config.enable_ngram_cache:
-            full_scores = self.ngram_cache.boost_scores(full_scores, context_text)
-
-        full_probabilities = F.softmax(full_scores / max(0.05, float(temperature)), dim=0)
+        retrieved = sequence_result.retrieved_concept
+        probabilities = sequence_result.probabilities.detach().clone()
         if repetition_penalty is not None:
-            full_probabilities = repetition_penalty.apply(full_probabilities, history)
-            for stop_token in self._special_token_ids:
-                if stop_token < full_probabilities.numel():
-                    full_probabilities[stop_token] = 0.0
-            full_probabilities = full_probabilities / full_probabilities.sum().clamp_min(1e-6)
-
-        probabilities = full_probabilities[torch.tensor(candidate_ids, dtype=torch.long)]
-        probabilities = probabilities / probabilities.sum().clamp_min(1e-6)
+            probabilities = repetition_penalty.apply(
+                probabilities,
+                {"history": history, "candidate_ids": candidate_ids},
+            )
+            probabilities = probabilities / probabilities.sum().clamp_min(1e-6)
         reconstructed_spike = self._reconstruct_spike(candidate_ids, probabilities, temperature)
 
-        sdm_confidence = float(torch.clamp((similarities.max() + 1.0) * 0.5, 0.0, 1.0).item())
+        sdm_confidence = float(sequence_result.source_confidences.get("sdm", 0.0))
+        transition_confidence = float(sequence_result.source_confidences.get("transition", 0.0))
+        ngram_confidence = float(sequence_result.source_confidences.get("ngram", 0.0))
+        chunk_confidence = float(sequence_result.source_confidences.get("chunk", 0.0))
         sorted_probs = torch.sort(probabilities, descending=True).values
         if sorted_probs.numel() >= 2:
             margin_confidence = float(
@@ -742,7 +865,13 @@ class TextGenerationTrainer:
 
         confidence = math.sqrt(
             max(1e-6, float(probabilities[best_index].item()))
-            * max(0.05, sdm_confidence)
+            * max(
+                0.05,
+                (0.35 * sdm_confidence)
+                + (0.35 * transition_confidence)
+                + (0.2 * ngram_confidence)
+                + (0.1 * chunk_confidence),
+            )
             * max(0.05, margin_confidence)
         )
         return _Prediction(
@@ -754,12 +883,33 @@ class TextGenerationTrainer:
             probabilities=probabilities.detach().clone(),
             sdm_confidence=sdm_confidence,
             margin_confidence=margin_confidence,
+            transition_confidence=transition_confidence,
+            ngram_confidence=ngram_confidence,
+            chunk_confidence=chunk_confidence,
+            ensemble_confidence=float(sequence_result.confidence),
+            source_predictions=sequence_result.source_predictions,
         )
 
     def _observe_token(self, token_id: int, *, learn: bool) -> _Observation:
         context_ids = self._runtime_token_history[-(self._window_size - 1) :]
         window_ids = list(context_ids) + [int(token_id)]
         window_text = self._window_text(window_ids)
+        if learn and context_ids:
+            candidate_ids = self._candidate_token_ids()
+            if candidate_ids:
+                sequence_preview = self.sequence_memory.score_candidates(
+                    context=list(context_ids),
+                    candidate_ids=candidate_ids,
+                    token_prototypes=self._candidate_prototypes(candidate_ids),
+                    context_text=self._window_text(context_ids),
+                    ngram_cache=self.ngram_cache if self.config.enable_ngram_cache else None,
+                    temperature=1.0,
+                    fallback_concept=self._runtime_concept_history[-1] if self._runtime_concept_history else None,
+                )
+                self.sequence_memory.update_prediction_feedback(
+                    int(token_id),
+                    sequence_preview.source_predictions,
+                )
         if not learn:
             observation = self._recognize_without_learning(token_id, context_ids=context_ids)
             self._record_runtime(token_id, observation.concept, observation.ccc_index, observation.confidence)
@@ -860,14 +1010,22 @@ class TextGenerationTrainer:
     def _prime_statistics(self, raw_text: str, token_ids: Sequence[int]) -> None:
         self._latest_corpus = raw_text
         self.ngram_cache.bind_tokenizer(self.tokenizer)
+        self.sequence_memory.bind_tokenizer(self.tokenizer)
         if self.config.enable_ngram_cache:
             self.ngram_cache.learn(raw_text)
+        self.sequence_memory.learn_chunks(raw_text)
         for index in range(len(token_ids)):
             window = token_ids[max(0, index - self._window_size + 1) : index + 1]
             text = self._window_text(window)
             if text:
                 self.window_counts[text] += 1
         self._max_window_frequency = max(self._max_window_frequency, max(self.window_counts.values(), default=1))
+
+    def _train_word_level(self, raw_text: str) -> None:
+        if self.word_processor is None:
+            return
+        self.word_processor.learn_vocabulary(raw_text)
+        self.word_processor.learn_word_transitions(raw_text)
 
     def _compress_training_tokens(self, token_ids: Sequence[int]) -> list[int]:
         if len(token_ids) <= 2000:
@@ -928,6 +1086,7 @@ class TextGenerationTrainer:
                         f"lr={self.system.core.config.ccc.slow_lr:.4f}",
                         flush=True,
                     )
+                self.sequence_memory.maybe_replay(processed, prediction_errors)
 
         elapsed = time.perf_counter() - start_time
         final_stats = self.system.core.get_system_stats()
@@ -964,6 +1123,7 @@ class TextGenerationTrainer:
         token_ids = token_ids[:num_samples]
 
         self._prime_statistics(raw_text[: max(1, len(token_ids))], token_ids)
+        self._train_word_level(raw_text[: max(1, len(token_ids))])
         self._reset_runtime_state(clear_workspace=True, clear_temporal_buffer=True)
         observed_token_ids = self._compress_training_tokens(token_ids)
         token_segments = [observed_token_ids for _ in range(max(1, int(self.config.num_passes)))]
@@ -984,6 +1144,7 @@ class TextGenerationTrainer:
             if not token_ids:
                 raise ValueError("raw_text did not produce any tokens.")
             self._prime_statistics(raw_text, token_ids)
+            self._train_word_level(raw_text)
             self._reset_runtime_state(clear_workspace=True, clear_temporal_buffer=True)
             token_segments: list[list[int]] = []
             for _ in range(max(1, int(self.config.num_passes))):
@@ -1050,6 +1211,28 @@ class TextGenerationTrainer:
         self._ensure_spike_encoder()
         self.decoder = BeamSearchDecoder(beam_width=beam_width or self.config.beam_width, length_penalty=0.6)
         prompt_ids = self._normalize_generation_input(prompt)
+
+        if self.dual_processor is not None and method in {"beam", "greedy"}:
+            estimated_words = max(1, min(24, math.ceil(max_tokens / 4)))
+            constrained = self.dual_processor.generate_sentence(
+                prompt,
+                max_words=estimated_words,
+                temperature=temperature,
+            )
+            if constrained:
+                if len(constrained) <= max_tokens:
+                    return constrained
+                truncated = constrained[:max_tokens]
+                boundary = max(
+                    truncated.rfind(" "),
+                    truncated.rfind("."),
+                    truncated.rfind("!"),
+                    truncated.rfind("?"),
+                    truncated.rfind(","),
+                )
+                if boundary >= max(1, max_tokens // 2):
+                    return truncated[:boundary].rstrip()
+                return truncated.rstrip()
 
         if method == "beam":
             results = self.decoder.decode(self, prompt_ids, max_tokens=max_tokens)

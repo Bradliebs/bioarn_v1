@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from torch import nn
@@ -13,6 +13,7 @@ from bioarn.core.math_utils import cosine_similarity, normalize
 from bioarn.memory.associative_fabric import AssociationResult, AssociativeFabric, VoteResult
 from bioarn.workspace.gnw import (
     BroadcastOutput,
+    EnhancedGNW,
     GlobalNeuronalWorkspace,
     StreamOfConsciousness,
     ThoughtOutput,
@@ -74,8 +75,9 @@ class BioARNCore(nn.Module):
         self.config = config
         self.ccc_pool = CCCPool(config.ccc, config.margin_gate)
         self.fabric = AssociativeFabric(config.sdm, config.ccc)
-        self.gnw = GlobalNeuronalWorkspace(config.gnw)
-        self.stream = StreamOfConsciousness(self.gnw, config.gnw)
+        gnw_config = replace(config.gnw, concept_dim=int(config.ccc.concept_dim))
+        self.gnw: GlobalNeuronalWorkspace = EnhancedGNW(gnw_config)
+        self.stream = StreamOfConsciousness(self.gnw, gnw_config)
         self.timestep = 0
         self.last_perception: PerceptionOutput | None = None
         self.last_thought: ThoughtOutput = self._empty_thought()

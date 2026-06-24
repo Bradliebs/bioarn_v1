@@ -92,6 +92,13 @@ class BeamSearchDecoder:
     def _normalize_prompt(self, system, prompt_spikes: Any) -> list[int]:
         return system._normalize_generation_input(prompt_spikes)
 
+    @staticmethod
+    def _contextualize_prediction(system, token_ids: list[int], prediction):
+        contextualizer = getattr(system, "_apply_generation_context", None)
+        if callable(contextualizer):
+            return contextualizer(token_ids, prediction)
+        return prediction
+
     def decode(self, system, prompt_spikes, max_tokens: int = 100) -> list[GenerationResult]:
         """Generate multiple candidate sequences and return best."""
 
@@ -112,6 +119,7 @@ class BeamSearchDecoder:
                     temperature=system.config.temperature,
                     repetition_penalty=repetition_penalty,
                 )
+                prediction = self._contextualize_prediction(system, token_ids, prediction)
                 if not prediction.candidate_ids:
                     expanded.append((token_ids, score, confidences, True))
                     continue
@@ -120,10 +128,17 @@ class BeamSearchDecoder:
                 top_values, top_indices = torch.topk(prediction.probabilities, k=top_k)
                 for probability, index in zip(top_values.tolist(), top_indices.tolist(), strict=False):
                     next_token = int(prediction.candidate_ids[index])
+                    sequence_signal = max(
+                        0.05,
+                        (0.35 * float(getattr(prediction, "sdm_confidence", 0.0)))
+                        + (0.35 * float(getattr(prediction, "transition_confidence", 0.0)))
+                        + (0.2 * float(getattr(prediction, "ngram_confidence", 0.0)))
+                        + (0.1 * float(getattr(prediction, "chunk_confidence", 0.0))),
+                    )
                     local_confidence = max(
                         1e-6,
                         float(probability)
-                        * max(0.05, float(prediction.sdm_confidence))
+                        * sequence_signal
                         * max(0.05, float(prediction.margin_confidence)),
                     )
                     next_ids = token_ids + [next_token]
@@ -159,6 +174,7 @@ class BeamSearchDecoder:
                 temperature=max(0.2, float(system.config.temperature) * 0.75),
                 repetition_penalty=getattr(system, "repetition_penalty", None),
             )
+            prediction = self._contextualize_prediction(system, token_ids, prediction)
             if not prediction.candidate_ids:
                 break
             best_index = int(torch.argmax(prediction.probabilities).item())
@@ -186,6 +202,7 @@ class BeamSearchDecoder:
                 temperature=temperature,
                 repetition_penalty=getattr(system, "repetition_penalty", None),
             )
+            prediction = self._contextualize_prediction(system, token_ids, prediction)
             if not prediction.candidate_ids:
                 break
             next_index = int(torch.multinomial(prediction.probabilities, num_samples=1).item())
@@ -213,6 +230,7 @@ class BeamSearchDecoder:
                 temperature=system.config.temperature,
                 repetition_penalty=getattr(system, "repetition_penalty", None),
             )
+            prediction = self._contextualize_prediction(system, token_ids, prediction)
             if not prediction.candidate_ids:
                 break
             top_k = min(max(1, int(k)), len(prediction.candidate_ids))
@@ -244,6 +262,7 @@ class BeamSearchDecoder:
                 temperature=system.config.temperature,
                 repetition_penalty=getattr(system, "repetition_penalty", None),
             )
+            prediction = self._contextualize_prediction(system, token_ids, prediction)
             if not prediction.candidate_ids:
                 break
             values, indices = torch.sort(prediction.probabilities, descending=True)

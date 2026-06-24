@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import torch
 import torch.nn.functional as F
@@ -10,6 +10,8 @@ from torch import nn
 
 from bioarn.config import GNWConfig
 from bioarn.core.math_utils import cosine_similarity, normalize
+from bioarn.workspace.context_buffer import ContextBuffer
+from bioarn.workspace.selective_attention import SpikeAttention
 
 
 @dataclass
@@ -33,6 +35,9 @@ class BroadcastOutput:
     indices: list[int]
     num_occupied: int
     total_broadcast_energy: float
+    context_vector: torch.Tensor | None = None
+    attention_weights: list[float] = field(default_factory=list)
+    topic_drift: float = 0.0
 
 
 @dataclass
@@ -426,6 +431,154 @@ class GlobalNeuronalWorkspace(nn.Module):
         }
 
 
+class EnhancedGNW(GlobalNeuronalWorkspace):
+    """GNW with extended context buffering and spike-based attention."""
+
+    def __init__(self, config: GNWConfig, context_size: int | None = None):
+        super().__init__(config)
+        buffer_size = int(context_size or getattr(config, "context_size", 128))
+        self.context = ContextBuffer(
+            buffer_size=buffer_size,
+            context_dim=int(getattr(config, "concept_dim", 256)),
+            decay=float(getattr(config, "context_decay", 0.95)),
+            eviction_threshold=float(getattr(config, "context_eviction_threshold", 0.05)),
+            ema_rate=float(getattr(config, "context_update_rate", 0.2)),
+        )
+        self.attention = SpikeAttention(
+            dim=int(getattr(config, "concept_dim", 256)),
+            num_heads=int(getattr(config, "attention_heads", 4)),
+        )
+        self.last_attended_context = torch.zeros(
+            int(getattr(config, "concept_dim", 256)),
+            dtype=self._device_anchor.dtype,
+            device=self._device_anchor.device,
+        )
+        self.last_context_weights: list[float] = []
+
+    def _apply(self, fn):  # type: ignore[override]
+        super()._apply(fn)
+        self.context.context_vector = fn(self.context.context_vector)
+        self.context.items = [
+            replace(item, concept=fn(item.concept))
+            for item in self.context.items
+        ]
+        self.context._recent_contexts = [fn(vector) for vector in self.context._recent_contexts]
+        self.last_attended_context = fn(self.last_attended_context)
+        return self
+
+    def _top_contextual_candidates(
+        self, candidates: list[tuple[int, torch.Tensor, float]]
+    ) -> list[tuple[int, torch.Tensor, float]]:
+        limit = max(1, int(getattr(self.config, "context_top_k", 5)))
+        ranked = sorted(candidates, key=lambda candidate: float(candidate[2]), reverse=True)
+        return ranked[:limit]
+
+    @torch.no_grad()
+    def update(
+        self, fired_cccs: list[tuple[int, torch.Tensor, float]], timestep: int
+    ) -> tuple[list[int], list[int]]:
+        new_entries, evicted = super().update(fired_cccs, timestep=timestep)
+        for _, direction, confidence in self._top_contextual_candidates(fired_cccs):
+            self.context.update(direction, float(confidence))
+        return new_entries, evicted
+
+    def _augment_broadcast(
+        self,
+        base: BroadcastOutput,
+        query_direction: torch.Tensor | None = None,
+    ) -> BroadcastOutput:
+        context_vector = self.get_context_vector().to(self._device_anchor)
+        attention_weights: list[float] = []
+        if query_direction is not None and self.context.items:
+            attended, attention_weights = self.attention.attend(
+                query_direction.to(context_vector),
+                [item.concept.to(context_vector) for item in self.context.items],
+            )
+            self.last_attended_context = attended.detach().clone()
+            self.last_context_weights = list(attention_weights)
+            if float(attended.norm().item()) > 0.0:
+                context_vector = self._normalize_direction((0.6 * context_vector) + (0.4 * attended))
+        return replace(
+            base,
+            context_vector=context_vector.detach().clone(),
+            attention_weights=attention_weights,
+            topic_drift=self.context.get_topic_drift(),
+        )
+
+    @torch.no_grad()
+    def broadcast(self) -> BroadcastOutput:
+        base = super().broadcast()
+        query = self.slots[0].direction.detach().clone() if self.slots else None
+        return self._augment_broadcast(base, query)
+
+    @torch.no_grad()
+    def inject(self, ccc_index: int, direction: torch.Tensor, priority: float = 1.0) -> None:
+        super().inject(ccc_index, direction, priority=priority)
+        self.context.update(direction, float(priority))
+
+    @torch.no_grad()
+    def broadcast_with_context(
+        self,
+        item: tuple[int, torch.Tensor, float] | GNWSlot,
+        context_query: torch.Tensor | None = None,
+    ) -> BroadcastOutput:
+        """Broadcast an item while refreshing and querying extended context."""
+
+        if isinstance(item, GNWSlot):
+            ccc_index = int(item.ccc_index)
+            direction = item.direction
+            priority = max(float(item.confidence), float(item.activation) / max(1e-6, self.config.broadcast_gain))
+        else:
+            ccc_index, direction, priority = int(item[0]), item[1], float(item[2])
+        self.inject(ccc_index, direction, priority=priority)
+        base = super().broadcast()
+        query = context_query if context_query is not None else direction
+        return self._augment_broadcast(base, query)
+
+    @torch.no_grad()
+    def get_context_vector(self) -> torch.Tensor:
+        """Return the extended-context summary vector."""
+
+        return self.context.get_context_vector().to(self._device_anchor)
+
+    @torch.no_grad()
+    def attend_context(self, query: torch.Tensor, top_k: int | None = None) -> torch.Tensor:
+        """Attend into the long context buffer using spike-compatible competition."""
+
+        retrieved = self.context.attend(
+            query,
+            top_k=max(1, int(top_k or getattr(self.config, "context_top_k", 5))),
+        )
+        if not retrieved:
+            return torch.zeros(
+                int(getattr(self.config, "concept_dim", 256)),
+                dtype=self._device_anchor.dtype,
+                device=self._device_anchor.device,
+            )
+        attended, weights = self.attention.attend(
+            query.to(self._device_anchor),
+            [concept.to(self._device_anchor) for concept, _ in retrieved],
+        )
+        self.last_attended_context = attended.detach().clone()
+        self.last_context_weights = list(weights)
+        return attended.detach().clone()
+
+    @torch.no_grad()
+    def reset_context(self) -> None:
+        """Clear the extended context buffer."""
+
+        self.context.clear()
+        self.last_attended_context.zero_()
+        self.last_context_weights = []
+
+    @torch.no_grad()
+    def clear(self) -> None:
+        """Clear workspace contents and reset extended context."""
+
+        super().clear()
+        self.reset_context()
+
+
 class StreamOfConsciousness(nn.Module):
     """Sequential reasoning controller built on top of the GNW."""
 
@@ -483,4 +636,3 @@ class StreamOfConsciousness(nn.Module):
 
         occupancy_count = max(1, len(self.gnw.slots))
         return run_length > (3 * occupancy_count)
-

@@ -24,6 +24,11 @@ class PreprocessingPipeline:
                 current_dim = int(step.get_output_dim(current_dim))
         return current_dim
 
+    @staticmethod
+    def _iter_batch(x: torch.Tensor):
+        batch = x.unsqueeze(0) if x.dim() == 1 else x
+        yield from batch
+
     def fit(self, data: torch.Tensor) -> "PreprocessingPipeline":
         transformed = data.to(torch.float32)
         for _, step in self.steps:
@@ -32,6 +37,12 @@ class PreprocessingPipeline:
             else:
                 if hasattr(step, "fit"):
                     step.fit(transformed)
+                elif hasattr(step, "partial_fit"):
+                    for sample in self._iter_batch(transformed):
+                        step.partial_fit(sample)
+                elif hasattr(step, "learn"):
+                    for sample in self._iter_batch(transformed):
+                        step.learn(sample)
                 transformed = step.transform(transformed)
         return self
 
@@ -40,6 +51,12 @@ class PreprocessingPipeline:
         for _, step in self.steps:
             if hasattr(step, "partial_fit"):
                 step.partial_fit(transformed)
+            elif hasattr(step, "learn"):
+                if transformed.dim() == 1:
+                    step.learn(transformed)
+                else:
+                    for sample in transformed:
+                        step.learn(sample)
             transformed = step.transform(transformed)
         return self
 
@@ -57,6 +74,12 @@ class PreprocessingPipeline:
             else:
                 if hasattr(step, "fit"):
                     step.fit(transformed)
+                elif hasattr(step, "partial_fit"):
+                    for sample in self._iter_batch(transformed):
+                        step.partial_fit(sample)
+                elif hasattr(step, "learn"):
+                    for sample in self._iter_batch(transformed):
+                        step.learn(sample)
                 transformed = step.transform(transformed)
         return transformed
 
