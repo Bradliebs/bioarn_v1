@@ -1,4 +1,23 @@
 {
-  "universe_usage_history": [],
-  "assignment_cast_snapshots": {}
+  "universe_usage_history": [
+    {
+      "universe": "The Matrix",
+      "used_at": "2026-06-24T23:29:59Z",
+      "project": "bioarn"
+    }
+  ],
+  "assignment_cast_snapshots": {
+    "bioarn-2026-06-24": {
+      "assignment_id": "bioarn-2026-06-24",
+      "universe": "The Matrix",
+      "created_at": "2026-06-24T23:29:59Z",
+      "agents": {
+        "lead": "Neo",
+        "core-neural": "Tank",
+        "core-learning": "Morpheus",
+        "integration": "Trinity",
+        "tester": "Switch"
+      }
+    }
+  }
 }

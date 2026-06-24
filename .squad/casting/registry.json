@@ -1,3 +1,39 @@
 {
-  "agents": {}
+  "agents": {
+    "lead": {
+      "persistent_name": "Neo",
+      "universe": "The Matrix",
+      "created_at": "2026-06-24T23:29:59Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "core-neural": {
+      "persistent_name": "Tank",
+      "universe": "The Matrix",
+      "created_at": "2026-06-24T23:29:59Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "core-learning": {
+      "persistent_name": "Morpheus",
+      "universe": "The Matrix",
+      "created_at": "2026-06-24T23:29:59Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "integration": {
+      "persistent_name": "Trinity",
+      "universe": "The Matrix",
+      "created_at": "2026-06-24T23:29:59Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "tester": {
+      "persistent_name": "Switch",
+      "universe": "The Matrix",
+      "created_at": "2026-06-24T23:29:59Z",
+      "legacy_named": false,
+      "status": "active"
+    }
+  }
 }
