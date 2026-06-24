@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bioarn"
+version = "0.1.0"
+description = "Brain-inspired, low-power, multi-modal generative architecture"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [
+    {name = "Bio-ARN Team"},
+]
+keywords = ["neuromorphic", "spiking-neural-networks", "brain-inspired", "hebbian-learning", "continual-learning"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.2.0",
+    "numpy>=1.26.0",
+    "matplotlib>=3.8.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.5.0",
+    "mypy>=1.10.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/bioarn/bioarn"
+Documentation = "https://github.com/bioarn/bioarn/tree/main/docs"
+Repository = "https://github.com/bioarn/bioarn"
+
+[project.scripts]
+bioarn = "bioarn.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["bioarn*"]
+
+[tool.setuptools.data-files]
+"share/bioarn/configs" = [
+    "configs/default.yaml",
+    "configs/mnist.yaml",
+    "configs/cifar.yaml",
+    "configs/language.yaml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+markers = [
+    "slow: longer-running performance and regression checks",
+]

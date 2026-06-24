@@ -1,0 +1,24 @@
+Figure 1: System architecture diagram for Bio-ARN 2.0.
+
+Purpose:
+Show the full closed-loop system, emphasizing that Bio-ARN is not a feed-forward classifier but an embodied recurrent architecture.
+
+Layout:
+- Top block: Global Neuronal Workspace (GNW), shown as a small-capacity broadcast strip with 7 slots.
+- Middle block: multiple Concept Cell Clusters (CCCs) arranged in parallel columns.
+- Below CCCs: Associative Fabric / Sparse Distributed Memory layer connecting CCCs horizontally.
+- Below memory: Predictive Engine (PE) shown as a hierarchy with top-down predictions and bottom-up errors.
+- Bottom block: Embodied Sensorimotor Cortex with vision, text/language, audio, touch, and motor substreams.
+- Side block: Reward and Novelty System feeding modulation arrows into CCCs, PE, and GNW.
+
+Key arrows:
+1. Sensory input -> sparse spiking encoders.
+2. Prediction errors ascend from sensorimotor streams into the PE.
+3. CCCs receive sparse feature patterns from the PE/sensory layer.
+4. Active CCCs enter GNW.
+5. GNW broadcast re-enters the Associative Fabric and PE.
+6. Motor predictions descend back to the language/motor stream.
+7. Action/output feeds back as new sensory input.
+
+Caption suggestion:
+"Bio-ARN 2.0 combines sparse sensory encoding, margin-gated concept recognition, Kanerva-style associative memory, predictive coding, a bounded global workspace, and reward-modulated local learning inside a closed sensorimotor loop."

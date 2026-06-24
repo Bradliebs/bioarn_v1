@@ -1,0 +1,465 @@
+{
+  "timestamp": "2026-06-24T09:41:11.785565",
+  "platform": {
+    "system": "Windows",
+    "release": "11",
+    "python": "3.13.14",
+    "torch": "2.12.1+cpu"
+  },
+  "config": {
+    "quick": true,
+    "train_chars": 2800,
+    "eval_chars": 800,
+    "context_lengths": [
+      1,
+      4,
+      8,
+      16,
+      32
+    ],
+    "bioarn_context_length": 16,
+    "bioarn_train_samples": 2200
+  },
+  "vocab_size": 37,
+  "character_prediction_accuracy": {
+    "by_context": {
+      "1": {
+        "random": 0.02702702702702703,
+        "frequency": 0.15625,
+        "bigram": 0.3333333333333333,
+        "trigram": 0.3333333333333333,
+        "bioarn": 0.25
+      },
+      "4": {
+        "random": 0.02702702702702703,
+        "frequency": 0.21875,
+        "bigram": 0.375,
+        "trigram": 0.5416666666666666,
+        "bioarn": 0.23958333333333334
+      },
+      "8": {
+        "random": 0.02702702702702703,
+        "frequency": 0.2708333333333333,
+        "bigram": 0.40625,
+        "trigram": 0.6041666666666666,
+        "bioarn": 0.1875
+      },
+      "16": {
+        "random": 0.02702702702702703,
+        "frequency": 0.2708333333333333,
+        "bigram": 0.3958333333333333,
+        "trigram": 0.6041666666666666,
+        "bioarn": 0.1875
+      },
+      "32": {
+        "random": 0.02702702702702703,
+        "frequency": 0.2708333333333333,
+        "bigram": 0.3854166666666667,
+        "trigram": 0.6145833333333334,
+        "bioarn": 0.17708333333333334
+      }
+    },
+    "mean_accuracy": {
+      "random": 0.02702702702702703,
+      "frequency": 0.2375,
+      "bigram": 0.37916666666666665,
+      "trigram": 0.5395833333333333,
+      "bioarn": 0.20833333333333334
+    }
+  },
+  "approximate_perplexity": {
+    "random": 3.6109179126442243,
+    "frequency": 2.829544630130178,
+    "bigram": 2.1345319368787723,
+    "trigram": 1.461029458099656,
+    "bioarn": 1.0636913087591202
+  },
+  "generation_diversity": {
+    "random": {
+      "unique_bigram_ratio": 0.9789473684210527,
+      "unique_trigram_ratio": 1.0,
+      "vocabulary_coverage": 0.8918918918918919,
+      "repetition_rate": 0.020833333333333332,
+      "sample": "The I\"ecbJHwAp,\"Aabu\"xTwobqe NpieMaiHAmHkkd,rwImAxflyT:,bfAbHmerlNlkae:NwcNrmexbh.b,hne:ayhatnrMdJcx"
+    },
+    "frequency": {
+      "unique_bigram_ratio": 0.010526315789473684,
+      "unique_trigram_ratio": 0.010638297872340425,
+      "vocabulary_coverage": 0.02702702702702703,
+      "repetition_rate": 0.5,
+      "sample": "The                                                                                                 "
+    },
+    "bigram": {
+      "unique_bigram_ratio": 0.7263157894736842,
+      "unique_trigram_ratio": 0.9468085106382979,
+      "vocabulary_coverage": 0.7027027027027027,
+      "repetition_rate": 0.041666666666666664,
+      "sample": "The r bbrit iJMiIMme ps the wa athfontedheren be bOOn, afthe t gxgenghe d atomily. bpann. wha anga g"
+    },
+    "trigram": {
+      "unique_bigram_ratio": 0.8105263157894737,
+      "unique_trigram_ratio": 0.9574468085106383,
+      "vocabulary_coverage": 0.8108108108108109,
+      "repetition_rate": 0.041666666666666664,
+      "sample": "The tOadern o. O\" slThe wigavcaHnderevernesIn fg cNThe gater of,wlpproa\", atrckMund raitcMy\" , gre l"
+    },
+    "bioarn": {
+      "unique_bigram_ratio": 0.375,
+      "unique_trigram_ratio": 0.42857142857142855,
+      "vocabulary_coverage": 0.08108108108108109,
+      "repetition_rate": 0.4444444444444444,
+      "sample": "The arererere"
+    }
+  },
+  "pattern_learning": {
+    "cases": {
+      "abc-cycle": {
+        "random": {
+          "score": 0.3684210526315789,
+          "generated": "acaacbaaacacccacbaa",
+          "pattern": "abc"
+        },
+        "frequency": {
+          "score": 0.3684210526315789,
+          "generated": "aaaaaaaaaaaaaaaaaaa",
+          "pattern": "abc"
+        },
+        "bigram": {
+          "score": 1.0,
+          "generated": "abcabcabcabcabcabca",
+          "pattern": "abc"
+        },
+        "trigram": {
+          "score": 1.0,
+          "generated": "abcabcabcabcabcabca",
+          "pattern": "abc"
+        },
+        "bioarn": {
+          "score": 1.0,
+          "generated": "abcabca",
+          "pattern": "abc"
+        }
+      },
+      "the-phrase": {
+        "random": {
+          "score": 0.19444444444444445,
+          "generated": "the ra tdccbtartiaog  accio ictrtigc",
+          "pattern": "the "
+        },
+        "frequency": {
+          "score": 0.3333333333333333,
+          "generated": "the                                 ",
+          "pattern": "the "
+        },
+        "bigram": {
+          "score": 0.6111111111111112,
+          "generated": "the t cathe d caardog t the the the ",
+          "pattern": "the "
+        },
+        "trigram": {
+          "score": 0.3333333333333333,
+          "generated": "the cat the cat bird that the bird t",
+          "pattern": "the "
+        },
+        "bioarn": {
+          "score": 0.4,
+          "generated": "the caaaaa",
+          "pattern": "the "
+        }
+      },
+      "spacing-structure": {
+        "random": {
+          "score": 0.5384615384615384,
+          "generated": "a a dccbahaf  acch hchfcgd",
+          "pattern": "a "
+        },
+        "frequency": {
+          "score": 0.5384615384615384,
+          "generated": "a                         ",
+          "pattern": "a "
+        },
+        "bigram": {
+          "score": 1.0,
+          "generated": "a f c f h d b a f b g g c ",
+          "pattern": "a "
+        },
+        "trigram": {
+          "score": 1.0,
+          "generated": "a b c d e f g b c d e f g ",
+          "pattern": "a "
+        },
+        "bioarn": {
+          "score": 1.0,
+          "generated": "a h h h h ",
+          "pattern": "a "
+        }
+      }
+    },
+    "models": {
+      "random": {
+        "mean_accuracy": 0.3671090118458539
+      },
+      "frequency": {
+        "mean_accuracy": 0.4134053081421502
+      },
+      "bigram": {
+        "mean_accuracy": 0.8703703703703703
+      },
+      "trigram": {
+        "mean_accuracy": 0.7777777777777778
+      },
+      "bioarn": {
+        "mean_accuracy": 0.7999999999999999
+      }
+    }
+  },
+  "few_shot_learning": {
+    "shots": {
+      "1": {
+        "bigram": 0.14047619047619048,
+        "trigram": 0.26904761904761904,
+        "bioarn": 0.6333333333333333
+      },
+      "5": {
+        "bigram": 0.35952380952380947,
+        "trigram": 0.5833333333333333,
+        "bioarn": 0.6619047619047619
+      }
+    },
+    "cases": {
+      "1": {
+        "phrase-continuation": {
+          "bigram": {
+            "score": 0.14285714285714285,
+            "generated": "i carhr"
+          },
+          "trigram": {
+            "score": 0.14285714285714285,
+            "generated": "d catgr"
+          },
+          "bioarn": {
+            "score": 0.2857142857142857,
+            "generated": "cairiri"
+          }
+        },
+        "episodic-pairs": {
+          "bigram": {
+            "score": 0.0,
+            "generated": "c bbyc"
+          },
+          "trigram": {
+            "score": 0.5,
+            "generated": "b bczc"
+          },
+          "bioarn": {
+            "score": 0.6666666666666666,
+            "generated": "by by "
+          }
+        },
+        "paired-variants": {
+          "bigram": {
+            "score": 0.16666666666666666,
+            "generated": "r mimi"
+          },
+          "trigram": {
+            "score": 0.16666666666666666,
+            "generated": "r miam"
+          },
+          "bioarn": {
+            "score": 0.5,
+            "generated": "ro ro "
+          }
+        },
+        "symbol-sequence": {
+          "bigram": {
+            "score": 0.14285714285714285,
+            "generated": "3 A1A3C"
+          },
+          "trigram": {
+            "score": 0.2857142857142857,
+            "generated": "1 A133B"
+          },
+          "bioarn": {
+            "score": 0.7142857142857143,
+            "generated": "1 C3 C3"
+          }
+        },
+        "novel-punctuation": {
+          "bigram": {
+            "score": 0.25,
+            "generated": ". ? "
+          },
+          "trigram": {
+            "score": 0.25,
+            "generated": ". . "
+          },
+          "bioarn": {
+            "score": 1.0,
+            "generated": "! qz"
+          }
+        }
+      },
+      "5": {
+        "phrase-continuation": {
+          "bigram": {
+            "score": 0.2857142857142857,
+            "generated": "t cathh"
+          },
+          "trigram": {
+            "score": 0.0,
+            "generated": "d he do"
+          },
+          "bioarn": {
+            "score": 0.42857142857142855,
+            "generated": "cag cag"
+          }
+        },
+        "episodic-pairs": {
+          "bigram": {
+            "score": 0.16666666666666666,
+            "generated": "b ax c"
+          },
+          "trigram": {
+            "score": 0.16666666666666666,
+            "generated": "bax by"
+          },
+          "bioarn": {
+            "score": 0.6666666666666666,
+            "generated": "cz cz "
+          }
+        },
+        "paired-variants": {
+          "bigram": {
+            "score": 0.16666666666666666,
+            "generated": "r mi r"
+          },
+          "trigram": {
+            "score": 1.0,
+            "generated": "ra mi "
+          },
+          "bioarn": {
+            "score": 0.5,
+            "generated": "ru ru "
+          }
+        },
+        "symbol-sequence": {
+          "bigram": {
+            "score": 0.42857142857142855,
+            "generated": "1 A1 BA"
+          },
+          "trigram": {
+            "score": 1.0,
+            "generated": "1 B2 C3"
+          },
+          "bioarn": {
+            "score": 0.7142857142857143,
+            "generated": "1 C3 C3"
+          }
+        },
+        "novel-punctuation": {
+          "bigram": {
+            "score": 0.75,
+            "generated": ". qz"
+          },
+          "trigram": {
+            "score": 0.75,
+            "generated": ". qz"
+          },
+          "bioarn": {
+            "score": 1.0,
+            "generated": "! qz"
+          }
+        }
+      }
+    },
+    "advantage_over_bigram": 0.39761904761904754
+  },
+  "continual_learning": {
+    "bioarn": {
+      "accuracy_before": 1.0,
+      "accuracy_after": 1.0,
+      "forgetting": 0.0
+    },
+    "simple_rnn": {
+      "accuracy_before": 1.0,
+      "accuracy_after": 0.3333333333333333,
+      "forgetting": 0.6666666666666667
+    },
+    "corpora": {
+      "a_length": 191,
+      "b_length": 191,
+      "probe_set": [
+        "'a'->'b'",
+        "'b'->'c'",
+        "'c'->' '"
+      ]
+    }
+  },
+  "summary_table": {
+    "random": {
+      "next_char_accuracy_ctx8": 0.02702702702702703,
+      "next_char_accuracy_ctx32": 0.02702702702702703,
+      "approximate_perplexity": 3.6109179126442243,
+      "few_shot_1": null,
+      "few_shot_5": null,
+      "pattern_learning": 0.3671090118458539,
+      "unique_bigram_ratio": 0.9789473684210527,
+      "unique_trigram_ratio": 1.0,
+      "vocabulary_coverage": 0.8918918918918919,
+      "repetition_rate": 0.020833333333333332,
+      "continual_forgetting": null
+    },
+    "frequency": {
+      "next_char_accuracy_ctx8": 0.2708333333333333,
+      "next_char_accuracy_ctx32": 0.2708333333333333,
+      "approximate_perplexity": 2.829544630130178,
+      "few_shot_1": null,
+      "few_shot_5": null,
+      "pattern_learning": 0.4134053081421502,
+      "unique_bigram_ratio": 0.010526315789473684,
+      "unique_trigram_ratio": 0.010638297872340425,
+      "vocabulary_coverage": 0.02702702702702703,
+      "repetition_rate": 0.5,
+      "continual_forgetting": null
+    },
+    "bigram": {
+      "next_char_accuracy_ctx8": 0.40625,
+      "next_char_accuracy_ctx32": 0.3854166666666667,
+      "approximate_perplexity": 2.1345319368787723,
+      "few_shot_1": 0.14047619047619048,
+      "few_shot_5": 0.35952380952380947,
+      "pattern_learning": 0.8703703703703703,
+      "unique_bigram_ratio": 0.7263157894736842,
+      "unique_trigram_ratio": 0.9468085106382979,
+      "vocabulary_coverage": 0.7027027027027027,
+      "repetition_rate": 0.041666666666666664,
+      "continual_forgetting": null
+    },
+    "trigram": {
+      "next_char_accuracy_ctx8": 0.6041666666666666,
+      "next_char_accuracy_ctx32": 0.6145833333333334,
+      "approximate_perplexity": 1.461029458099656,
+      "few_shot_1": 0.26904761904761904,
+      "few_shot_5": 0.5833333333333333,
+      "pattern_learning": 0.7777777777777778,
+      "unique_bigram_ratio": 0.8105263157894737,
+      "unique_trigram_ratio": 0.9574468085106383,
+      "vocabulary_coverage": 0.8108108108108109,
+      "repetition_rate": 0.041666666666666664,
+      "continual_forgetting": null
+    },
+    "bioarn": {
+      "next_char_accuracy_ctx8": 0.1875,
+      "next_char_accuracy_ctx32": 0.17708333333333334,
+      "approximate_perplexity": 1.0636913087591202,
+      "few_shot_1": 0.6333333333333333,
+      "few_shot_5": 0.6619047619047619,
+      "pattern_learning": 0.7999999999999999,
+      "unique_bigram_ratio": 0.375,
+      "unique_trigram_ratio": 0.42857142857142855,
+      "vocabulary_coverage": 0.08108108108108109,
+      "repetition_rate": 0.4444444444444444,
+      "continual_forgetting": 0.0
+    }
+  }
+}

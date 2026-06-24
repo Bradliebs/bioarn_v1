@@ -1,0 +1,23 @@
+Figure 5: Energy comparison across hardware targets.
+
+Purpose:
+Show that the current CPU prototype is slow but that projected spike-native deployment is energy efficient.
+
+Suggested format:
+Two-panel chart.
+- Panel A: Log-scale bar chart of energy per inference.
+  - Loihi 2: 179.65 uJ
+  - CPU (laptop): 7.98 mJ
+  - GPU (A100): 50.55 mJ
+  - Ideal ASIC: 74.36 uJ
+- Panel B: Training energy for 5000 samples.
+  - Bio-ARN online local learning: 0.932 J
+  - Transformer batch training: 7501.76 J
+
+Add callouts:
+- "278x lower than matched transformer on A100"
+- "8050x lower projected online-training energy"
+- "Current CPU implementation remains slower despite favorable sparse activity"
+
+Caption suggestion:
+"Bio-ARN's energy claim is strongest as a hardware-software co-design result: sparse local learning is most compelling on neuromorphic or custom event-driven substrates."

@@ -1,0 +1,22 @@
+device: cpu
+dtype: float32
+seed: 42
+
+ccc:
+  input_dim: 256
+  concept_dim: 256
+  num_f1_features: 192
+  f1_top_k: 48
+  fast_lr: 1.0
+  slow_lr: 0.01
+  feedback_lr: 0.01
+  max_pool_size: 2048
+
+sdm:
+  address_dim: 8192
+  hamming_radius: 368
+  num_hard_locations: 2048
+  data_dim: 256
+
+predictive:
+  num_levels: 5

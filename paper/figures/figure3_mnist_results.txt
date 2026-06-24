@@ -1,0 +1,26 @@
+Figure 3: MNIST benchmark comparison.
+
+Purpose:
+Compare Bio-ARN, MLP, and Transformer on the archived multi-seed MNIST benchmark.
+
+Suggested format:
+Grouped bar chart with three panels.
+- Panel A: Accuracy.
+  - Bio-ARN: 82.0%
+  - MLP: 88.9%
+  - Transformer: 82.0%
+- Panel B: OOD abstention.
+  - Bio-ARN: 76.7%
+  - MLP: 21.3%
+  - Transformer: 16.6%
+- Panel C: Forgetting (lower is better).
+  - Bio-ARN: 3.2%
+  - MLP: 58.7%
+  - Transformer: 55.9%
+
+Optional overlays:
+- AUROC markers above each OOD-abstention bar.
+- Callout box: "Bio-ARN matches transformer accuracy while strongly outperforming it on abstention and forgetting."
+
+Caption suggestion:
+"Bio-ARN does not beat the MLP on raw MNIST accuracy, but it provides substantially stronger uncertainty handling and far lower continual-learning degradation."

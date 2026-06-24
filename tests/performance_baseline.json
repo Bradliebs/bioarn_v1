@@ -1,0 +1,9 @@
+{
+  "version": "0.1.0",
+  "date": "2026-06-23",
+  "inference_latency_ms": 30.0,
+  "batch_32_latency_ms": 150.0,
+  "memory_1000_cccs_mb": 200.0,
+  "sparsity_threshold": 0.15,
+  "learning_100_samples_sec": 5.0
+}

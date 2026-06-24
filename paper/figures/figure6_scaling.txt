@@ -1,0 +1,21 @@
+Figure 6: Scaling behavior of the batched CCC pool.
+
+Purpose:
+Show memory growth, vectorized inference latency, and the effect of sharding at 10K CCCs.
+
+Suggested panels:
+- Panel A: Memory vs pool size (100, 500, 1000, 2000, 5000, 10000).
+  Use approximately linear line from 1.20 MB to 120.17 MB.
+- Panel B: Vectorized inference latency vs pool size.
+  0.87, 1.10, 10.31, 10.09, 19.14, 35.85 ms/sample.
+- Panel C: 10K fast-infer comparison.
+  - Flat: 134.38 ms/sample
+  - Sharded: 29.29 ms/sample
+
+Annotation:
+- Memory slope ~0.012 MB per CCC.
+- Note that Panel B and Panel C use different query patterns, so the 10K flat numbers are not directly comparable.
+- Optional footnote: project brief cites 9.8 ms sharded inference; current archived CPU reproduction measured 29.29 ms/sample.
+
+Caption suggestion:
+"Vectorization keeps pool scaling approximately linear in memory, and locality-aware sharding becomes increasingly attractive at 10K concepts."

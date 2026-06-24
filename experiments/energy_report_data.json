@@ -1,0 +1,352 @@
+{
+  "config": {
+    "spiking": {
+      "beta": 0.9,
+      "threshold": 1.0,
+      "reset": 0.0,
+      "dt": 1.0,
+      "refractory_steps": 2
+    },
+    "margin_gate": {
+      "theta_margin": 0.5,
+      "theta_margin_lr": 0.0005,
+      "theta_resonance": 0.65
+    },
+    "ccc": {
+      "input_dim": 784,
+      "concept_dim": 64,
+      "num_f1_features": 128,
+      "f1_top_k": 16,
+      "fast_lr": 1.0,
+      "slow_lr": 0.02,
+      "feedback_lr": 0.02,
+      "max_pool_size": 25
+    },
+    "sdm": {
+      "address_dim": 10000,
+      "hamming_radius": 451,
+      "num_hard_locations": 1000,
+      "data_dim": 64,
+      "decay_rate": 0.999,
+      "stdp_window": 20
+    },
+    "predictive": {
+      "num_levels": 4,
+      "gamma": 0.1,
+      "eta": 0.01,
+      "precision_init": 1.0,
+      "error_threshold": 0.01
+    },
+    "gnw": {
+      "capacity": 7,
+      "broadcast_gain": 2.0,
+      "fatigue_rate": 0.1,
+      "fatigue_threshold": 0.3,
+      "competition_temp": 1.0
+    },
+    "reward": {
+      "intrinsic_scale": 1.0,
+      "novelty_threshold": 3.0,
+      "novelty_boost": 5.0,
+      "novelty_decay": 0.95,
+      "curiosity_weight": 0.5
+    },
+    "device": "cpu",
+    "dtype": "float32",
+    "seed": 42
+  },
+  "benchmark_reference": {
+    "timestamp": "2026-06-23T21:07:20.597058",
+    "config": {
+      "seeds": [
+        42,
+        123,
+        777
+      ],
+      "train_size": 5000,
+      "test_size": 1000,
+      "cal_size": 500,
+      "few_shot_k": [
+        1,
+        5,
+        10
+      ]
+    },
+    "mean_fired_cccs": 2.7217333333333333,
+    "bioarn": {
+      "accuracy": 0.82,
+      "dense_flops_mac": 2713600.0,
+      "active_flops_mac": 295427.3333333333,
+      "latency_ms": 2.008018000051379,
+      "params": 515155.0,
+      "memory_mb": 1.9651603698730469,
+      "training_energy_j": 0.9319441674999999
+    },
+    "mlp": {
+      "accuracy": 0.8893333333333334,
+      "dense_flops_mac": 234752.0,
+      "active_flops_mac": 234752.0,
+      "latency_ms": 0.011621999971490974,
+      "params": 235146.0,
+      "memory_mb": 0.8970108032226562,
+      "projected_gpu_energy_j": 0.050002832744000004,
+      "training_energy_j": 7500.424911600001
+    },
+    "transformer": {
+      "accuracy": 0.82,
+      "dense_flops_mac": 4427008.0,
+      "active_flops_mac": 4427008.0,
+      "latency_ms": 0.07112733335816301,
+      "params": 274698.0,
+      "memory_mb": 1.0478897094726562,
+      "projected_gpu_energy_j": 0.050011746916,
+      "training_energy_j": 7501.7620374
+    }
+  },
+  "inference_profile": {
+    "components": {
+      "CCC Pool": {
+        "dense_flops": 1642368.0,
+        "sparse_flops": 148659.2,
+        "memory_accesses": 43005.0,
+        "active_units": 342.40000000000003,
+        "total_units": 1344.0,
+        "spike_count": 346.0,
+        "time_ms": 12.301039998419583,
+        "sparsity": 0.7452380952380953,
+        "savings": 11.047873256414672
+      },
+      "SDM Retrieval": {
+        "dense_flops": 98476800.0,
+        "sparse_flops": 42560000.0,
+        "memory_accesses": 48944000.0,
+        "active_units": 0.0,
+        "total_units": 4600.0,
+        "spike_count": 0.0,
+        "time_ms": 137.49337999615818,
+        "sparsity": 1.0,
+        "savings": 2.3138345864661654
+      },
+      "PE Hierarchy": {
+        "dense_flops": 2940928.0,
+        "sparse_flops": 1199012.0,
+        "memory_accesses": 1442906.4000000001,
+        "active_units": 995.0,
+        "total_units": 1888.0,
+        "spike_count": 995.0,
+        "time_ms": 18.041860009543598,
+        "sparsity": 0.4729872881355932,
+        "savings": 2.4527927994048433
+      },
+      "GNW": {
+        "dense_flops": 744.8000000000001,
+        "sparse_flops": 284.8,
+        "memory_accesses": 678.4000000000001,
+        "active_units": 3.6,
+        "total_units": 7.0,
+        "spike_count": 3.6,
+        "time_ms": 1.109879999421537,
+        "sparsity": 0.48571428571428565,
+        "savings": 2.615168539325843
+      },
+      "Motor Stream": {
+        "dense_flops": 622592.0,
+        "sparse_flops": 304947.2,
+        "memory_accesses": 262144.0,
+        "active_units": 141.4,
+        "total_units": 640.0,
+        "spike_count": 13.4,
+        "time_ms": 10.791939997579902,
+        "sparsity": 0.7790625,
+        "savings": 2.0416386836803224
+      }
+    },
+    "total": {
+      "dense_flops": 103683432.8,
+      "sparse_flops": 44212903.2,
+      "memory_accesses": 50692733.8,
+      "active_units": 1482.4,
+      "total_units": 8479.0,
+      "spike_count": 1358.0,
+      "time_ms": 179.7381000011228,
+      "sparsity": 0.8251680622714943,
+      "savings": 2.3450944248329746
+    },
+    "total_wall_ms": 184.41699999384582,
+    "sensory_ms": 4.179780004778877,
+    "sensory_suppression": 0.0009259223937988281,
+    "visual_event_count": 186.4,
+    "active_cccs": 3.6,
+    "committed_cccs": 7.0,
+    "active_sdm_locations": 0.0,
+    "sdm_queries": 4.6,
+    "pe_suppression": 0.47298728813559326,
+    "gnw_occupancy": 3.6,
+    "recruitment_rate": 0.0,
+    "learning_rate": 0.0,
+    "recognition_confidence": 0.3601252985169843,
+    "action_confidence": 0.567957627773285
+  },
+  "learning_profile": {
+    "components": {
+      "CCC Pool": {
+        "dense_flops": 234624.0,
+        "sparse_flops": 48000.0,
+        "memory_accesses": 6151.0,
+        "active_units": 80.0,
+        "total_units": 192.0,
+        "spike_count": 81.0,
+        "time_ms": 4.614499997114763,
+        "sparsity": 0.5833333333333333,
+        "savings": 4.888
+      },
+      "SDM Retrieval": {
+        "dense_flops": 42816000.0,
+        "sparse_flops": 42560000.0,
+        "memory_accesses": 21280000.0,
+        "active_units": 0.0,
+        "total_units": 2000.0,
+        "spike_count": 0.0,
+        "time_ms": 28.409120003925636,
+        "sparsity": 1.0,
+        "savings": 1.006015037593985
+      },
+      "PE Hierarchy": {
+        "dense_flops": 2940928.0,
+        "sparse_flops": 1215606.4000000001,
+        "memory_accesses": 1440934.4000000001,
+        "active_units": 970.2,
+        "total_units": 1888.0,
+        "spike_count": 970.2,
+        "time_ms": 14.174559997627512,
+        "sparsity": 0.4861228813559322,
+        "savings": 2.4193094080452355
+      },
+      "GNW": {
+        "dense_flops": 672.0,
+        "sparse_flops": 68.0,
+        "memory_accesses": 512.0,
+        "active_units": 1.0,
+        "total_units": 7.0,
+        "spike_count": 1.0,
+        "time_ms": 0.8034800062887371,
+        "sparsity": 0.8571428571428572,
+        "savings": 9.882352941176471
+      },
+      "Motor Stream": {
+        "dense_flops": 622592.0,
+        "sparse_flops": 306380.8,
+        "memory_accesses": 262144.0,
+        "active_units": 143.6,
+        "total_units": 640.0,
+        "spike_count": 15.600000000000001,
+        "time_ms": 12.811080005485564,
+        "sparsity": 0.775625,
+        "savings": 2.0320855614973263
+      }
+    },
+    "total": {
+      "dense_flops": 46614816.0,
+      "sparse_flops": 44130055.199999996,
+      "memory_accesses": 22989741.4,
+      "active_units": 1194.8,
+      "total_units": 4727.0,
+      "spike_count": 1067.8,
+      "time_ms": 60.81274001044221,
+      "sparsity": 0.747239263803681,
+      "savings": 1.0563054088361985
+    },
+    "total_wall_ms": 64.97315999586135,
+    "sensory_ms": 3.481479996116832,
+    "sensory_suppression": 0.05493431091308594,
+    "visual_event_count": 782.6,
+    "active_cccs": 1.0,
+    "committed_cccs": 1.0,
+    "active_sdm_locations": 0.0,
+    "sdm_queries": 2.0,
+    "pe_suppression": 0.4861228813559322,
+    "gnw_occupancy": 1.0,
+    "recruitment_rate": 1.0,
+    "learning_rate": 1.0,
+    "recognition_confidence": 0.33333332935969034,
+    "action_confidence": 0.5699935913085937
+  },
+  "hardware_projections": {
+    "Loihi 2": {
+      "energy_joules": 0.00017965399399999998,
+      "power_at_1hz_w": 0.00017965399399999998,
+      "power_at_100hz_w": 0.0179653994,
+      "power_at_1khz_w": 0.17965399399999998,
+      "cost_per_million_usd": 4.990388722222222e-06,
+      "annual_cost_at_100hz_usd": 0.0157376898744,
+      "reference_transformer_energy_joules": 0.050011746916
+    },
+    "GPU (A100)": {
+      "energy_joules": 0.050551140241200006,
+      "power_at_1hz_w": 0.050551140241200006,
+      "power_at_100hz_w": 5.055114024120001,
+      "power_at_1khz_w": 50.5511402412,
+      "cost_per_million_usd": 0.0014041983400333335,
+      "annual_cost_at_100hz_usd": 4.428279885129121,
+      "reference_transformer_energy_joules": 0.050011746916
+    },
+    "CPU (laptop)": {
+      "energy_joules": 0.007976765722,
+      "power_at_1hz_w": 0.007976765722,
+      "power_at_100hz_w": 0.7976765722,
+      "power_at_1khz_w": 7.976765722,
+      "cost_per_million_usd": 0.0002215768256111111,
+      "annual_cost_at_100hz_usd": 0.6987646772472001,
+      "reference_transformer_energy_joules": 0.050011746916
+    },
+    "Ideal ASIC": {
+      "energy_joules": 7.4364249e-05,
+      "power_at_1hz_w": 7.4364249e-05,
+      "power_at_100hz_w": 0.0074364249,
+      "power_at_1khz_w": 0.07436424900000001,
+      "cost_per_million_usd": 2.0656735833333337e-06,
+      "annual_cost_at_100hz_usd": 0.006514308212400001,
+      "reference_transformer_energy_joules": 0.050011746916
+    }
+  },
+  "brain_baseline": {
+    "power_watts": 3.081627906976744e-06,
+    "energy_joules": 3.081627906976744e-09,
+    "power_ratio_vs_brain": 58298.405720323,
+    "total_neurons": 13251
+  },
+  "training_energy": {
+    "bioarn_learning_per_sample_j": 0.00018638883349999998,
+    "bioarn_total_training_j": 0.9319441674999999,
+    "transformer_total_training_j": 7501.7620374,
+    "mlp_total_training_j": 7500.424911600001,
+    "transformer_ratio": 8049.583117756892
+  },
+  "scaling_sweep": [
+    {
+      "pool_size": 100.0,
+      "active_cccs": 0.6,
+      "activation_fraction": 0.006,
+      "sparse_savings": 1399.3399339933994
+    },
+    {
+      "pool_size": 500.0,
+      "active_cccs": 1.0,
+      "activation_fraction": 0.002,
+      "sparse_savings": 4198.019801980198
+    },
+    {
+      "pool_size": 1000.0,
+      "active_cccs": 1.6,
+      "activation_fraction": 0.0016,
+      "sparse_savings": 5247.524752475247
+    },
+    {
+      "pool_size": 5000.0,
+      "active_cccs": 2.0,
+      "activation_fraction": 0.0004,
+      "sparse_savings": 20990.09900990099
+    }
+  ],
+  "report_path": "C:\\AI Projects\\bioarn\\experiments\\energy_report_results.md"
+}

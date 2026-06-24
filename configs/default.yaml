@@ -1,0 +1,55 @@
+# Bio-ARN 2.0 Default Configuration
+device: cpu
+dtype: float32
+seed: 42
+
+spiking:
+  beta: 0.9
+  threshold: 1.0
+  reset: 0.0
+  dt: 1.0
+  refractory_steps: 2
+
+margin_gate:
+  theta_margin: 0.5
+  theta_margin_lr: 0.001
+  theta_resonance: 0.7
+
+ccc:
+  input_dim: 784
+  concept_dim: 256
+  num_f1_features: 128
+  f1_top_k: 32
+  fast_lr: 1.0
+  slow_lr: 0.01
+  feedback_lr: 0.01
+  max_pool_size: 1000
+
+sdm:
+  address_dim: 10000
+  hamming_radius: 451
+  num_hard_locations: 1000
+  data_dim: 256
+  decay_rate: 0.999
+  stdp_window: 20
+
+predictive:
+  num_levels: 4
+  gamma: 0.1
+  eta: 0.01
+  precision_init: 1.0
+  error_threshold: 0.01
+
+gnw:
+  capacity: 7
+  broadcast_gain: 2.0
+  fatigue_rate: 0.1
+  fatigue_threshold: 0.3
+  competition_temp: 1.0
+
+reward:
+  intrinsic_scale: 1.0
+  novelty_threshold: 3.0
+  novelty_boost: 5.0
+  novelty_decay: 0.95
+  curiosity_weight: 0.5

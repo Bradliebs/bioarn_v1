@@ -1,0 +1,396 @@
+{
+  "timestamp": "2026-06-23T21:07:20.597058",
+  "platform": {
+    "system": "Windows",
+    "release": "11",
+    "python": "3.13.14",
+    "torch": "2.12.1+cpu",
+    "cpu": "Intel64 Family 6 Model 170 Stepping 4, GenuineIntel"
+  },
+  "config": {
+    "seeds": [
+      42,
+      123,
+      777
+    ],
+    "train_size": 5000,
+    "test_size": 1000,
+    "cal_size": 500,
+    "few_shot_k": [
+      1,
+      5,
+      10
+    ]
+  },
+  "seed_results": [
+    {
+      "seed": 42,
+      "bioarn_threshold": 0.65,
+      "mean_fired_cccs": 2.2354,
+      "scenario_a": {
+        "bioarn": {
+          "accuracy": 0.82,
+          "params": 515155,
+          "flops_mac": 2713600
+        },
+        "mlp": {
+          "accuracy": 0.89,
+          "params": 235146,
+          "flops_mac": 234752
+        },
+        "transformer": {
+          "accuracy": 0.821,
+          "params": 274698,
+          "flops_mac": 4427008
+        }
+      },
+      "scenario_b": {
+        "bioarn": {
+          "k1": 0.418,
+          "k5": 0.638,
+          "k10": 0.659
+        },
+        "mlp": {
+          "k1": 0.39899998903274536,
+          "k5": 0.5329999923706055,
+          "k10": 0.5789999961853027
+        },
+        "transformer": {
+          "k1": 0.23199999332427979,
+          "k5": 0.3149999976158142,
+          "k10": 0.3499999940395355
+        }
+      },
+      "scenario_c": {
+        "bioarn": {
+          "acc_before": 0.77,
+          "acc_after": 0.738,
+          "forgetting": 0.03200000000000003
+        },
+        "mlp": {
+          "acc_before": 0.684,
+          "acc_after": 0.006,
+          "forgetting": 0.678
+        },
+        "transformer": {
+          "acc_before": 0.528,
+          "acc_after": 0.0,
+          "forgetting": 0.528
+        }
+      },
+      "scenario_d": {
+        "bioarn": {
+          "auroc": 0.932961,
+          "abstention_rate_ood": 0.7665,
+          "f1": 0.9361904761904762,
+          "auroc_per_type": {
+            "random-noise": 0.997956,
+            "rotated-90": 0.943228,
+            "inverted": 0.998996,
+            "fashion-mnist": 0.791664
+          }
+        },
+        "mlp": {
+          "auroc": 0.719383,
+          "abstention_rate_ood": 0.23,
+          "f1": 0.8888394842152068,
+          "auroc_per_type": {
+            "random-noise": 0.803584,
+            "rotated-90": 0.763068,
+            "inverted": 0.55974,
+            "fashion-mnist": 0.75114
+          }
+        },
+        "transformer": {
+          "auroc": 0.817633,
+          "abstention_rate_ood": 0.1765,
+          "f1": 0.9229268292682927,
+          "auroc_per_type": {
+            "random-noise": 0.842672,
+            "rotated-90": 0.786888,
+            "inverted": 0.85756,
+            "fashion-mnist": 0.783412
+          }
+        }
+      },
+      "scenario_e": {
+        "bioarn": {
+          "dense_flops_mac": 2713600,
+          "active_flops_mac": 242639,
+          "sparsity": 0.089416,
+          "energy_proxy_mac": 242639,
+          "flops_savings": 11.18369264627698,
+          "latency_ms": 1.8012765000457875,
+          "params": 515155,
+          "memory_mb": 1.9651603698730469
+        },
+        "mlp": {
+          "dense_flops_mac": 234752,
+          "active_flops_mac": 234752,
+          "sparsity": 1.0,
+          "energy_proxy_mac": 234752,
+          "flops_savings": 1.0,
+          "latency_ms": 0.014210499939508736,
+          "params": 235146,
+          "memory_mb": 0.8970108032226562
+        },
+        "transformer": {
+          "dense_flops_mac": 4427008,
+          "active_flops_mac": 4427008,
+          "sparsity": 1.0,
+          "energy_proxy_mac": 4427008,
+          "flops_savings": 1.0,
+          "latency_ms": 0.05158649990335107,
+          "params": 274698,
+          "memory_mb": 1.0478897094726562
+        }
+      }
+    },
+    {
+      "seed": 123,
+      "bioarn_threshold": 0.65,
+      "mean_fired_cccs": 2.6928,
+      "scenario_a": {
+        "bioarn": {
+          "accuracy": 0.82,
+          "params": 515155,
+          "flops_mac": 2713600
+        },
+        "mlp": {
+          "accuracy": 0.895,
+          "params": 235146,
+          "flops_mac": 234752
+        },
+        "transformer": {
+          "accuracy": 0.82,
+          "params": 274698,
+          "flops_mac": 4427008
+        }
+      },
+      "scenario_b": {
+        "bioarn": {
+          "k1": 0.418,
+          "k5": 0.638,
+          "k10": 0.659
+        },
+        "mlp": {
+          "k1": 0.3919999897480011,
+          "k5": 0.44200000166893005,
+          "k10": 0.6169999837875366
+        },
+        "transformer": {
+          "k1": 0.25600001215934753,
+          "k5": 0.3319999873638153,
+          "k10": 0.3610000014305115
+        }
+      },
+      "scenario_c": {
+        "bioarn": {
+          "acc_before": 0.77,
+          "acc_after": 0.738,
+          "forgetting": 0.03200000000000003
+        },
+        "mlp": {
+          "acc_before": 0.684,
+          "acc_after": 0.098,
+          "forgetting": 0.5860000000000001
+        },
+        "transformer": {
+          "acc_before": 0.618,
+          "acc_after": 0.0,
+          "forgetting": 0.618
+        }
+      },
+      "scenario_d": {
+        "bioarn": {
+          "auroc": 0.93297,
+          "abstention_rate_ood": 0.7665,
+          "f1": 0.9361904761904762,
+          "auroc_per_type": {
+            "random-noise": 0.997992,
+            "rotated-90": 0.943228,
+            "inverted": 0.998996,
+            "fashion-mnist": 0.791664
+          }
+        },
+        "mlp": {
+          "auroc": 0.697309,
+          "abstention_rate_ood": 0.172,
+          "f1": 0.8885923949299533,
+          "auroc_per_type": {
+            "random-noise": 0.757404,
+            "rotated-90": 0.768924,
+            "inverted": 0.53254,
+            "fashion-mnist": 0.730368
+          }
+        },
+        "transformer": {
+          "auroc": 0.762558,
+          "abstention_rate_ood": 0.1135,
+          "f1": 0.9319047619047619,
+          "auroc_per_type": {
+            "random-noise": 0.706468,
+            "rotated-90": 0.803388,
+            "inverted": 0.756512,
+            "fashion-mnist": 0.783864
+          }
+        }
+      },
+      "scenario_e": {
+        "bioarn": {
+          "dense_flops_mac": 2713600,
+          "active_flops_mac": 292287,
+          "sparsity": 0.107712,
+          "energy_proxy_mac": 292287,
+          "flops_savings": 9.284025632340816,
+          "latency_ms": 2.545559999998659,
+          "params": 515155,
+          "memory_mb": 1.9651603698730469
+        },
+        "mlp": {
+          "dense_flops_mac": 234752,
+          "active_flops_mac": 234752,
+          "sparsity": 1.0,
+          "energy_proxy_mac": 234752,
+          "flops_savings": 1.0,
+          "latency_ms": 0.007801500032655895,
+          "params": 235146,
+          "memory_mb": 0.8970108032226562
+        },
+        "transformer": {
+          "dense_flops_mac": 4427008,
+          "active_flops_mac": 4427008,
+          "sparsity": 1.0,
+          "energy_proxy_mac": 4427008,
+          "flops_savings": 1.0,
+          "latency_ms": 0.08778300005360506,
+          "params": 274698,
+          "memory_mb": 1.0478897094726562
+        }
+      }
+    },
+    {
+      "seed": 777,
+      "bioarn_threshold": 0.65,
+      "mean_fired_cccs": 3.237,
+      "scenario_a": {
+        "bioarn": {
+          "accuracy": 0.82,
+          "params": 515155,
+          "flops_mac": 2713600
+        },
+        "mlp": {
+          "accuracy": 0.883,
+          "params": 235146,
+          "flops_mac": 234752
+        },
+        "transformer": {
+          "accuracy": 0.819,
+          "params": 274698,
+          "flops_mac": 4427008
+        }
+      },
+      "scenario_b": {
+        "bioarn": {
+          "k1": 0.418,
+          "k5": 0.638,
+          "k10": 0.659
+        },
+        "mlp": {
+          "k1": 0.31200000643730164,
+          "k5": 0.5099999904632568,
+          "k10": 0.5630000233650208
+        },
+        "transformer": {
+          "k1": 0.21899999678134918,
+          "k5": 0.328000009059906,
+          "k10": 0.3630000054836273
+        }
+      },
+      "scenario_c": {
+        "bioarn": {
+          "acc_before": 0.77,
+          "acc_after": 0.738,
+          "forgetting": 0.03200000000000003
+        },
+        "mlp": {
+          "acc_before": 0.516,
+          "acc_after": 0.018,
+          "forgetting": 0.498
+        },
+        "transformer": {
+          "acc_before": 0.53,
+          "acc_after": 0.0,
+          "forgetting": 0.53
+        }
+      },
+      "scenario_d": {
+        "bioarn": {
+          "auroc": 0.932962,
+          "abstention_rate_ood": 0.7665,
+          "f1": 0.9360893323829889,
+          "auroc_per_type": {
+            "random-noise": 0.99796,
+            "rotated-90": 0.943228,
+            "inverted": 0.998996,
+            "fashion-mnist": 0.791664
+          }
+        },
+        "mlp": {
+          "auroc": 0.705272,
+          "abstention_rate_ood": 0.2355,
+          "f1": 0.8883948421520675,
+          "auroc_per_type": {
+            "random-noise": 0.7337,
+            "rotated-90": 0.793316,
+            "inverted": 0.517368,
+            "fashion-mnist": 0.776704
+          }
+        },
+        "transformer": {
+          "auroc": 0.781653,
+          "abstention_rate_ood": 0.209,
+          "f1": 0.9199334758850083,
+          "auroc_per_type": {
+            "random-noise": 0.78374,
+            "rotated-90": 0.770252,
+            "inverted": 0.819488,
+            "fashion-mnist": 0.753132
+          }
+        }
+      },
+      "scenario_e": {
+        "bioarn": {
+          "dense_flops_mac": 2713600,
+          "active_flops_mac": 351356,
+          "sparsity": 0.12948,
+          "energy_proxy_mac": 351356,
+          "flops_savings": 7.723220892769726,
+          "latency_ms": 1.6772175001096912,
+          "params": 515155,
+          "memory_mb": 1.9651603698730469
+        },
+        "mlp": {
+          "dense_flops_mac": 234752,
+          "active_flops_mac": 234752,
+          "sparsity": 1.0,
+          "energy_proxy_mac": 234752,
+          "flops_savings": 1.0,
+          "latency_ms": 0.012853999942308292,
+          "params": 235146,
+          "memory_mb": 0.8970108032226562
+        },
+        "transformer": {
+          "dense_flops_mac": 4427008,
+          "active_flops_mac": 4427008,
+          "sparsity": 1.0,
+          "energy_proxy_mac": 4427008,
+          "flops_savings": 1.0,
+          "latency_ms": 0.07401250011753291,
+          "params": 274698,
+          "memory_mb": 1.0478897094726562
+        }
+      }
+    }
+  ]
+}

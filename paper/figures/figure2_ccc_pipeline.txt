@@ -1,0 +1,24 @@
+Figure 2: Concept Cell Cluster (CCC) processing pipeline.
+
+Purpose:
+Illustrate the core Bio-ARN recognition unit and the source of honest abstention.
+
+Panels:
+- Panel A: F1 feature encoder. Input vector x is projected, ReLU activated, and top-k sparsified.
+- Panel B: F2 concept projection. Sparse F1 features are mapped into concept space.
+- Panel C: Margin gate. Cosine similarity between the F2 activation and the stored concept direction is compared with theta_margin.
+- Panel D: Decision split.
+  - If confidence > theta_margin: FIRE.
+  - Else: ABSTAIN.
+- Panel E: Feedback prediction and resonance check. Fired concepts generate expected features and compare them to actual features.
+- Panel F: Learning branches.
+  - Resonance matched -> slow Hebbian tuning.
+  - No matching committed concept -> recruit a new CCC via one-shot learning.
+
+Annotations to include:
+- Equation: c_i = cos(h_i, d_i)
+- Equation: fire iff c_i > theta_margin
+- Note that abstention is architectural, not post-hoc calibration.
+
+Caption suggestion:
+"Each CCC converts sparse features into a concept-space hypothesis, gates that hypothesis through an explicit cosine-margin threshold, and only learns when top-down feedback resonates with bottom-up evidence."

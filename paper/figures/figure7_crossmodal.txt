@@ -1,0 +1,15 @@
+Figure 7: Cross-modal retrieval and alignment.
+
+Purpose:
+Illustrate how visual and textual concepts share a common associative space.
+
+Suggested layout:
+- Left: ten simple visual patterns (horizontal line, vertical line, diagonal, box, cross, etc.).
+- Right: textual labels for the same patterns.
+- Middle: shared concept space with bidirectional arrows between matched visual and text concepts.
+- Top callout: supervised retrieval accuracy = 80.0%.
+- Secondary callout: mean reciprocal rank = 0.950.
+- Optional example: text-to-image reconstruction similarity for `vertical_mid` = 0.992.
+
+Caption suggestion:
+"After label-based alignment, Bio-ARN retrieves semantically matched text from noisy visual inputs with 80.0% top-1 accuracy and 0.950 MRR, while most errors remain structurally interpretable."

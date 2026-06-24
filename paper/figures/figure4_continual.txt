@@ -1,0 +1,18 @@
+Figure 4: Continual-learning comparison.
+
+Purpose:
+Visualize catastrophic forgetting versus retention.
+
+Suggested format:
+Line or slope chart with before/after accuracy on the original task.
+- Bio-ARN: 77.0% -> 73.8% (3.2% forgetting)
+- MLP: 62.8% -> 4.1% (58.7% forgetting)
+- Transformer: 55.9% -> 0.0% (55.9% forgetting)
+
+Optional inset:
+Text benchmark continual-learning result.
+- Bio-ARN text forgetting: 0.0%
+- Simple RNN forgetting: 66.7%
+
+Caption suggestion:
+"Concept recruitment and sparse local memory substantially reduce interference during sequential learning relative to small dense baselines."
