@@ -7,6 +7,9 @@ from bioarn.generation import BeamSearchDecoder, GenerationQualityMetrics, NGram
 from bioarn.training.text_training import TextGenConfig, TextGenerationTrainer, build_builtin_corpus
 
 
+pytestmark = pytest.mark.slow
+
+
 def make_config(**overrides) -> TextGenConfig:
     config = TextGenConfig(
         tokenizer_type="char",

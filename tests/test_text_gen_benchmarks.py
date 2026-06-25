@@ -8,6 +8,9 @@ import pytest
 from experiments.benchmarks import text_gen_benchmarks as tgb
 
 
+pytestmark = pytest.mark.slow
+
+
 @pytest.fixture(scope="module")
 def benchmark_results() -> dict:
     return tgb.run_text_generation_benchmarks(quick=True)

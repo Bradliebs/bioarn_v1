@@ -37,6 +37,9 @@ dev = [
     "ruff>=0.5.0",
     "mypy>=1.10.0",
 ]
+demo = [
+    "gradio>=4.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/bioarn/bioarn"

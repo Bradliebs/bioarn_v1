@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from bioarn.training.text_training import (
@@ -8,6 +9,9 @@ from bioarn.training.text_training import (
     TextGenerationTrainer,
     TrainingMetrics,
 )
+
+
+pytestmark = pytest.mark.slow
 
 
 def make_config(**overrides) -> TextGenConfig:
