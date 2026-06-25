@@ -810,7 +810,7 @@ class TextGenerationTrainer:
             )
             if reranked:
                 word_scores = {char: float(score) for char, score in reranked}
-                word_logits = torch.tensor(
+                word_weights = torch.tensor(
                     [
                         max(1e-6, word_scores.get(self._decode_token([int(candidate_id)]), 1e-6))
                         for candidate_id in prediction.candidate_ids
@@ -818,8 +818,18 @@ class TextGenerationTrainer:
                     dtype=biased_logits.dtype,
                     device=biased_logits.device,
                 )
-                word_logits = torch.log(word_logits / word_logits.sum().clamp_min(1e-6))
-                blend = min(0.65, 0.2 + (0.45 * float(self.config.word_level.word_constraint_strength)))
+                word_distribution = word_weights / word_weights.sum().clamp_min(1e-6)
+                word_logits = torch.log(word_distribution.clamp_min(1e-6))
+                sorted_distribution = torch.sort(word_distribution, descending=True).values
+                top_confidence = float(sorted_distribution[0].item()) if len(sorted_distribution) else 0.0
+                runner_up = float(sorted_distribution[1].item()) if len(sorted_distribution) > 1 else 0.0
+                margin = max(0.0, top_confidence - runner_up)
+                partial_word_active = bool(prompt_text and prompt_text[-1] not in {" ", ".", ",", "!", "?", ";", ":", "\n", "\t"})
+                base_blend = 0.18 + (0.32 * float(self.config.word_level.word_constraint_strength))
+                confidence_bonus = (0.24 * top_confidence) + (0.18 * margin)
+                if partial_word_active:
+                    confidence_bonus += 0.08
+                blend = min(0.86, base_blend + confidence_bonus)
                 biased_logits = ((1.0 - blend) * biased_logits) + (blend * word_logits)
 
         probabilities = torch.softmax(biased_logits, dim=0)
@@ -1297,7 +1307,7 @@ class TextGenerationTrainer:
                     truncated.rfind("?"),
                     truncated.rfind(","),
                 )
-                if boundary >= max(1, max_tokens // 2):
+                if boundary >= 0:
                     return truncated[:boundary].rstrip()
                 return truncated.rstrip()
 

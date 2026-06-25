@@ -26,10 +26,13 @@ class DualLevelProcessor:
         if not self.word_processor.vocabulary:
             return ""
 
-        suggestions = self.word_processor.suggest_next_word(context_words, top_k=5)
+        suggestions = self.word_processor.suggest_next_word(context_words, top_k=8)
         target_word = self._select_target_word(context_words, suggestions, temperature=temperature)
         if not target_word:
             return ""
+        target_confidence = self._target_confidence(suggestions, target_word)
+        if target_confidence >= self._direct_emit_threshold(context_words, temperature=temperature):
+            return target_word
 
         partial = ""
         for _ in range(max(2, len(target_word) + 2)):
@@ -40,7 +43,7 @@ class DualLevelProcessor:
                 reranked = self._boost_candidate(
                     reranked,
                     target_word[len(partial)],
-                    0.9 + (0.4 / max(0.2, float(temperature))),
+                    (1.0 + (0.55 / max(0.2, float(temperature)))) * (1.0 + target_confidence),
                 )
             if not reranked:
                 break
@@ -80,6 +83,8 @@ class DualLevelProcessor:
             generated_words.append(word)
             context_words.append(word)
             if len(generated_words) >= 4 and self.word_processor.sentence_end_probability(word) >= 0.3:
+                break
+            if self._should_stop_sentence(context_words, generated_words):
                 break
 
         continuation = " ".join(generated_words).strip()
@@ -175,8 +180,22 @@ class DualLevelProcessor:
 
         if len(filtered) == 1 or temperature <= 0.35:
             return filtered[0][0]
+        lead_confidence = self._target_confidence(filtered, filtered[0][0])
+        runner_up_confidence = (
+            self._target_confidence(filtered, filtered[1][0])
+            if len(filtered) > 1
+            else 0.0
+        )
+        if lead_confidence >= 0.42 or (lead_confidence - runner_up_confidence) >= 0.12:
+            return filtered[0][0]
 
-        weights = torch.tensor([max(1e-6, float(prob)) for _, prob in filtered], dtype=torch.float32)
+        weights = torch.tensor(
+            [
+                self._candidate_weight(context_words, word, probability)
+                for word, probability in filtered
+            ],
+            dtype=torch.float32,
+        )
         logits = torch.log(weights) / max(0.15, float(temperature))
         probabilities = torch.softmax(logits, dim=0)
         chosen = int(torch.multinomial(probabilities, num_samples=1).item())
@@ -199,6 +218,63 @@ class DualLevelProcessor:
         scored = {candidate: float(score) for candidate, score in candidates}
         scored[char] = scored.get(char, 0.0) + float(bonus)
         return sorted(scored.items(), key=lambda item: (-item[1], item[0]))
+
+    def _should_stop_sentence(self, context_words: list[str], generated_words: list[str]) -> bool:
+        if not generated_words:
+            return False
+
+        current_word = generated_words[-1].lower()
+        sentence_end = self.word_processor.sentence_end_probability(current_word)
+        if len(generated_words) >= 2 and sentence_end >= 0.16:
+            return True
+
+        suggestions = self.word_processor.suggest_next_word(context_words, top_k=4)
+        if not suggestions:
+            return True
+
+        next_word = suggestions[0][0].lower()
+        next_confidence = self._target_confidence(suggestions, next_word)
+        next_frequency = self.word_processor.word_frequency(next_word)
+        function_words = {"a", "an", "the", "in", "on", "at", "of", "to"}
+        if next_frequency < 0.02:
+            if current_word == "a" and len(generated_words) == 2 and next_confidence >= 0.95:
+                return False
+            if len(generated_words) == 1:
+                return True
+            if len(generated_words) >= 3 or current_word not in function_words:
+                return True
+            if next_confidence < 0.98:
+                return True
+        return False
+
+    def _candidate_weight(
+        self,
+        context_words: list[str],
+        word: str,
+        probability: float,
+    ) -> float:
+        base = max(1e-6, float(probability))
+        frequency = self.word_processor.word_frequency(word)
+        recent = [context.lower() for context in context_words[-4:]]
+        repeats = recent.count(word.lower())
+        repeat_penalty = 0.38 ** repeats if repeats else 1.0
+        return max(1e-6, base * (1.0 + (0.85 * frequency)) * repeat_penalty)
+
+    @staticmethod
+    def _target_confidence(suggestions: list[tuple[str, float]], target_word: str) -> float:
+        if not suggestions:
+            return 0.0
+        total = sum(max(0.0, float(probability)) for _, probability in suggestions) or 1.0
+        for word, probability in suggestions:
+            if word == target_word:
+                return float(max(0.0, float(probability)) / total)
+        return 0.0
+
+    @staticmethod
+    def _direct_emit_threshold(context_words: list[str], *, temperature: float) -> float:
+        context_bonus = min(0.12, 0.04 * max(0, len(context_words) - 1))
+        temperature_penalty = max(0.0, float(temperature) - 0.9) * 0.08
+        return max(0.24, 0.44 - context_bonus + temperature_penalty)
 
     def _split_prompt_context(self, prompt_text: str) -> tuple[list[str], str]:
         prompt = str(prompt_text or "")

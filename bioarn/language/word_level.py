@@ -44,6 +44,7 @@ class WordLevelProcessor:
         self.start_word_counts: Counter[str] = Counter()
         self.sentence_end_counts: Counter[str] = Counter()
         self.sentence_occurrences: Counter[str] = Counter()
+        self.context_transition_counts: defaultdict[tuple[str, ...], Counter[str]] = defaultdict(Counter)
 
     def learn_vocabulary(self, text: str) -> None:
         """Extract a frequent vocabulary and train CCCs on whole-word patterns."""
@@ -89,6 +90,7 @@ class WordLevelProcessor:
         self.start_word_counts = Counter()
         self.sentence_end_counts = Counter()
         self.sentence_occurrences = Counter()
+        self.context_transition_counts = defaultdict(Counter)
 
         previous_word: str | None = None
         start_of_sentence = True
@@ -133,6 +135,7 @@ class WordLevelProcessor:
             max_concepts=size,
             decay=float(self.config.word_transition_decay),
         )
+        self.context_transition_counts = defaultdict(Counter)
         sentence_words: list[str] = []
         for token in _TOKEN_PATTERN.findall(text):
             if _WORD_PATTERN.fullmatch(token):
@@ -142,19 +145,11 @@ class WordLevelProcessor:
                 continue
 
             if len(sentence_words) >= 2:
-                for current_word, next_word in zip(sentence_words[:-1], sentence_words[1:], strict=False):
-                    self.word_transition_matrix.record_transition(
-                        self.word_to_id[current_word],
-                        self.word_to_id[next_word],
-                    )
+                self._record_sentence_transitions(sentence_words)
             sentence_words = []
 
         if len(sentence_words) >= 2:
-            for current_word, next_word in zip(sentence_words[:-1], sentence_words[1:], strict=False):
-                self.word_transition_matrix.record_transition(
-                    self.word_to_id[current_word],
-                    self.word_to_id[next_word],
-                )
+            self._record_sentence_transitions(sentence_words)
 
     def constrain_generation(
         self,
@@ -221,17 +216,58 @@ class WordLevelProcessor:
             return self._fallback_words(top_k)
 
         normalized = [self._normalize_partial(word) for word in context_words if self._normalize_partial(word)]
+        scores: Counter[str] = Counter()
+        matched_context = False
+
         if normalized:
+            max_context = min(len(normalized), self._context_window())
+            for size in range(max_context, 0, -1):
+                context = tuple(normalized[-size:])
+                counts = self.context_transition_counts.get(context)
+                if not counts:
+                    continue
+                matched_context = True
+                total = float(sum(counts.values())) or 1.0
+                context_weight = 1.0 + (0.45 * float(size - 1))
+                backoff_weight = 0.78 ** float(max_context - size)
+                for word, count in counts.items():
+                    prior = self.word_frequency(word)
+                    scores[word] += backoff_weight * context_weight * (
+                        (0.82 * (float(count) / total)) + (0.18 * prior)
+                    )
+
             current = normalized[-1]
             token_id = self.word_to_id.get(current)
             if token_id is not None:
-                predictions = self.word_transition_matrix.predict_next(token_id, top_k=max(1, int(top_k)))
-                if predictions:
-                    return [
-                        (self.id_to_word[word_id], float(probability))
-                        for word_id, probability in predictions
-                        if word_id in self.id_to_word
-                    ]
+                predictions = self.word_transition_matrix.predict_next(
+                    token_id,
+                    top_k=max(max(1, int(top_k)), 8),
+                )
+                unigram_weight = 0.45 if matched_context else 1.0
+                for word_id, probability in predictions:
+                    word = self.id_to_word.get(word_id)
+                    if word is None:
+                        continue
+                    scores[word] += unigram_weight * float(probability)
+
+        if scores:
+            recent = normalized[-3:]
+            reranked: list[tuple[str, float]] = []
+            for word, score in scores.items():
+                frequency = self.word_frequency(word)
+                repeats = recent.count(word)
+                repeat_penalty = 0.42 ** repeats if repeats else 1.0
+                adjusted = ((0.78 * float(score)) + (0.22 * frequency)) * repeat_penalty
+                if normalized and word == normalized[-1] and len(scores) > 1:
+                    adjusted *= 0.18
+                if adjusted > 0.0:
+                    reranked.append((word, float(adjusted)))
+            if reranked:
+                reranked.sort(key=lambda item: (-item[1], -self.word_counts[item[0]], item[0]))
+                limited = reranked[: max(1, int(top_k))]
+                total = sum(score for _, score in limited) or 1.0
+                return [(word, float(score) / total) for word, score in limited]
+
         if self.start_word_counts:
             total = float(sum(self.start_word_counts.values())) or 1.0
             ranked = self.start_word_counts.most_common(max(1, int(top_k)))
@@ -263,6 +299,13 @@ class WordLevelProcessor:
             return 0.0
         return float(self.sentence_end_counts.get(token, 0) / total)
 
+    def word_frequency(self, word: str) -> float:
+        token = self._normalize_partial(word)
+        if not token or not self.word_counts:
+            return 0.0
+        total = float(sum(self.word_counts[candidate] for candidate in self.vocabulary)) or 1.0
+        return float(self.word_counts.get(token, 0) / total)
+
     def _build_ccc_pool(self) -> CCCPool:
         ccc_config = CCCConfig(
             input_dim=int(self.config.word_spike_dim),
@@ -280,6 +323,10 @@ class WordLevelProcessor:
             theta_resonance=0.45,
         )
         return CCCPool(ccc_config, margin_config)
+
+    def _context_window(self) -> int:
+        configured = int(getattr(self.config, "word_context_window", 4))
+        return max(2, min(4, configured))
 
     def _extract_words(self, text: str) -> list[str]:
         return [match.group(0).lower() for match in _WORD_PATTERN.finditer(text or "")]
@@ -305,6 +352,19 @@ class WordLevelProcessor:
         if pool_output.fired_indices:
             return int(pool_output.fired_indices[0])
         return None
+
+    def _record_sentence_transitions(self, sentence_words: list[str]) -> None:
+        max_context = self._context_window()
+        for index in range(1, len(sentence_words)):
+            next_word = sentence_words[index]
+            current_word = sentence_words[index - 1]
+            self.word_transition_matrix.record_transition(
+                self.word_to_id[current_word],
+                self.word_to_id[next_word],
+            )
+            for size in range(1, min(max_context, index) + 1):
+                context = tuple(sentence_words[index - size : index])
+                self.context_transition_counts[context][next_word] += 1.0
 
     def _fallback_words(self, top_k: int) -> list[tuple[str, float]]:
         if not self.word_counts:
