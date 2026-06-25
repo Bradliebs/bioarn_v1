@@ -1,6 +1,13 @@
 """Bio-ARN 2.0 hyperparameters and configuration."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from bioarn.ensemble.config import EnsembleConfig
+    from bioarn.hierarchy.config import HierarchyConfig
 
 
 @dataclass
@@ -96,6 +103,11 @@ class BioARNConfig:
     predictive: PredictiveConfig = field(default_factory=PredictiveConfig)
     gnw: GNWConfig = field(default_factory=GNWConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
+
+    # Optional module configs — when set, enable hierarchy preprocessing and
+    # ensemble voting in BioARNCore; when None those modules are bypassed.
+    hierarchy: HierarchyConfig | None = None
+    ensemble: EnsembleConfig | None = None
 
     # Global settings
     device: str = "cpu"          # "cpu" or "cuda"
