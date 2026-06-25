@@ -23,3 +23,21 @@ Recovery commit (d99976c) included sequence memory module, memory config, extend
 ## Learnings
 
 <!-- Append new learnings below. Each entry is something lasting about the project. -->
+
+
+## Session 2026-06-25T08:42:45Z
+
+**Mission:** Enhancing training for ensemble + tuning learning
+
+**Context:** Team-wide orchestration sprint to optimize training pipelines for new modules.
+
+**Assigned Tasks:**
+- Optimize training loop for ensemble module (voting, boosting, expert balance)
+- Tune learning rates and schedules for hierarchy-aware training
+- Implement adaptive capacity allocation for dynamic experts
+- Coordinate with Neo (module integration), Trinity (experiments)
+
+**Session Dependencies:**
+- Waiting on Neo for wired system.py
+- Switch must clear test suite blocker (venv, PyYAML, gradio)
+- Results will be measured in Trinity's comparison experiments

@@ -1,26 +1,39 @@
-# Project Context
+# Trinity (Integration) — History
 
-- **Owner:** Brad Liebs
-- **Project:** Bio-ARN 2.0 — Brain-inspired, low-power, multi-modal generative architecture
-- **Stack:** Python 3.11+, PyTorch, spiking neural networks, neuromorphic computing
-- **Created:** 2026-06-24
+## Session 2026-06-24T23:50:23Z
 
-## Architecture Overview
+**Mission:** Check experiments and integration state
 
-Integration & experiment areas I own:
-- `experiments/` — CIFAR training, ensemble, text gen (v2/v3), feature comparison, context demo
-- `bioarn/ensemble/` — Boosting, voting, diversity
-- `bioarn/language/` — Word-level processing, dual processor, word trie
-- `bioarn/config.py` — System configuration
-- `configs/` — Experiment configurations
-- `demo/` — Demo scripts
+- Spawned for integration and experiment audit
+- Running comprehensive integration state evaluation
 
-Key results: 82% MNIST accuracy, 0.933 OOD AUROC, 179.65 µJ/inference on projected Loihi 2.
 
-## Current State (Recovery)
+## Session 2026-06-25T02:08:39Z
 
-Recovery commit (d99976c) included new experiments (CIFAR, ensemble_cifar, text_gen_v2/v3, feature_comparison, context_demo), ensemble module, language module, and config updates. The team was testing and seeing improvements.
+**Mission:** Post-crash integration assessment
 
-## Learnings
+- All 13 experiment scripts intact and syntactically complete
+- Ensemble module production-quality (4 archetypes, 3 voting modes, Hebbian boosting)
+- Language module newest code (dual_processor.py, word_level.py from crash era)
+- Text gen improvement trajectory: v1 baseline → v2 sequence memory → v3 dual char+word
+- All results reproducible (278× energy, 82% MNIST, 0.933 OOD AUROC from 2026-06-23)
+- Demo app complete, needs gradio installed
+- Next: run text_gen_v3.py and ensemble_cifar.py to validate crash recovery
 
-<!-- Append new learnings below. Each entry is something lasting about the project. -->
+
+## Session 2026-06-25T08:42:45Z
+
+**Mission:** Updating BioARNConfig + building comparison experiments
+
+**Context:** Team-wide orchestration sprint to integrate new modules and measure impact.
+
+**Assigned Tasks:**
+- Update BioARNConfig to expose hierarchy and ensemble options
+- Build 2-3 controlled comparison experiments (hierarchy impact, ensemble benefit, multimodal)
+- Validate multimodal training pipeline completeness
+- Deliver measurable results showing improvements or clear trade-offs
+
+**Session Dependencies:**
+- Waiting on Neo to wire modules into system.py
+- Text generation v3 (dual_processor) ready as baseline
+- Will feed results back to team for decision-making

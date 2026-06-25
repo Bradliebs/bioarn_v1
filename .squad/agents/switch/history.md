@@ -1,24 +1,42 @@
-# Project Context
+# Switch (Tester) — History
 
-- **Owner:** Brad Liebs
-- **Project:** Bio-ARN 2.0 — Brain-inspired, low-power, multi-modal generative architecture
-- **Stack:** Python 3.11+, PyTorch, pytest, spiking neural networks, neuromorphic computing
-- **Created:** 2026-06-24
+## Session 2026-06-24T23:50:23Z
 
-## Architecture Overview
+**Mission:** Run full test suite and assess test health
 
-Test areas I own:
-- `tests/` — All test files
-- Current tests: test_hierarchy, test_ensemble, test_sparse_coding, test_sequence_memory, test_word_level, test_context_attention
-- Test framework: pytest
-- README claims 202 tests passed
+- Spawned as part of initial team assessment
+- Running comprehensive test health evaluation
 
-Key areas needing test coverage: spiking neurons, concept cells, GNW workspace, memory systems, predictive coding, training loops, OOD detection, energy metrics.
 
-## Current State (Recovery)
+## Session 2026-06-25T02:08:39Z
 
-Recovery commit (d99976c) included new tests: test_hierarchy, test_ensemble, test_sparse_coding, test_sequence_memory, test_word_level, test_context_attention. The team was actively testing and seeing improvements.
+**Mission:** Post-crash test suite assessment
 
-## Learnings
+- 411/411 runnable tests PASS (427 collected, zero failures)
+- 16 text generation tests too slow for CPU CI, need @pytest.mark.slow
+- PyYAML dependency missing from venv despite being in pyproject.toml (blocker)
+- Gradio missing from optional deps, test_demo.py fails at collection
+- Recommended: regenerate venv, add gradio to [demo], mark slow tests, move benchmarks to experiments/
 
-<!-- Append new learnings below. Each entry is something lasting about the project. -->
+
+## Session 2026-06-25T08:42:45Z
+
+**Mission:** Writing integration tests for hierarchy+ensemble
+
+**Context:** Team-wide orchestration sprint to validate module integration and infrastructure.
+
+**Assigned Critical Tasks (P0):**
+- Regenerate venv with `pip install -e ".[dev]"` (restore PyYAML)
+- Add gradio to optional deps in pyproject.toml
+- Verify test_demo.py passes
+
+**Assigned P1 Tasks:**
+- Create 15+ integration tests for hierarchy module
+- Create 15+ integration tests for ensemble module (experts, voting, boosting)
+- Validate end-to-end flows with both modules active
+- Mark slow text generation tests with @pytest.mark.slow (16 tests)
+- Ensure all 411 baseline tests remain passing
+
+**Session Dependencies:**
+- Blocking P0 must be cleared before team can proceed with module integration
+- Results from Neo, Trinity, Morpheus will be validated by new tests

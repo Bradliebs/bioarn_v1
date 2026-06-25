@@ -1,32 +1,38 @@
-# Project Context
+# Neo (Lead) — History
 
-- **Owner:** Brad Liebs
-- **Project:** Bio-ARN 2.0 — Brain-inspired, low-power, multi-modal generative architecture
-- **Stack:** Python 3.11+, PyTorch, spiking neural networks, neuromorphic computing
-- **Created:** 2026-06-24
+## Session 2026-06-24T23:50:23Z
 
-## Architecture Overview
+**Mission:** Review architecture and assess project health
 
-Bio-ARN 2.0 is an embodied cognitive stack built from:
-- **Spiking neurons** with margin-gated concept cells
-- **Global Neuronal Workspace (GNW)** — conscious broadcast channel with attentional spotlight
-- **Concept Cell Clusters (CCCs)** — F1 input → F2 concept neuron → F3 prediction layers
-- **Sparse associative memory** with Hebbian learning
-- **Predictive coding** for top-down/bottom-up inference
-- **Continual online learning without backprop**
-- **Neuromorphic energy efficiency** targeting Loihi 2
+- Spawned as lead for initial team assessment
+- Running architecture review and project health evaluation
 
-Key results: 82% MNIST accuracy, 0.933 OOD AUROC, 3.2% catastrophic forgetting, 278× lower energy than transformer.
 
-## Current State (Recovery)
+## Session 2026-06-25T02:08:39Z
 
-Machine crash interrupted active development. Recovery commit (d99976c) saved:
-- New modules: hierarchy, ensemble, language, sparse coding
-- Workspace improvements: context buffer, selective attention, recurrent context
-- Memory: sequence memory
-- New experiments and tests
-- The team was testing model output and seeing improvements
+**Mission:** Post-crash architecture assessment
 
-## Learnings
+- Architecture assessment complete: core backbone (system.py → loop.py) production-ready
+- 17 packages import cleanly, no circular dependencies
+- Hierarchy and ensemble modules are functional but orphaned from default training path
+- Multimodal has same integration gap
+- Gradio missing from optional deps, causes test_demo.py collection failure
+- Recommended: add gradio to [demo] extra; wire hierarchy/ensemble into VisionTrainer
 
-<!-- Append new learnings below. Each entry is something lasting about the project. -->
+
+## Session 2026-06-25T08:42:45Z
+
+**Mission:** Wiring hierarchy+ensemble into BioARNCore (system.py)
+
+**Context:** Team-wide orchestration sprint to wire new modules into default training path and validate integration.
+
+**Assigned Tasks:**
+- Integrate hierarchy and ensemble modules into VisionTrainer default training path
+- Ensure non-breaking changes to existing training loops
+- Validate both modules work seamlessly with the backbone architecture
+- Coordinate with Trinity (config), Morpheus (training), Switch (tests)
+
+**Session Dependencies:**
+- Switch must confirm venv clean and dependencies restored (P0)
+- Must preserve all 411 passing tests as baseline
+- Results feeding into Trinity's comparison experiments
