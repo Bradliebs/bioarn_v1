@@ -1,5 +1,7 @@
 """Training exports for Bio-ARN."""
 
+from typing import TYPE_CHECKING
+
 from bioarn.training.ensemble_training import (
     AugmentFn,
     EnsembleTrainMetrics,
@@ -22,6 +24,13 @@ from bioarn.training.vision_training import (
     take_samples,
 )
 
+if TYPE_CHECKING:
+    from bioarn.training.multimodal_training import (
+        MultimodalExample,
+        MultimodalTrainer,
+        MultimodalTrainingResult,
+    )
+
 Trainer = OnlineTrainer
 
 __all__ = [
@@ -31,6 +40,9 @@ __all__ = [
     "EvalResult",
     "ExpertTrainMetrics",
     "GenerationMetrics",
+    "MultimodalExample",
+    "MultimodalTrainer",
+    "MultimodalTrainingResult",
     "OnlineTrainer",
     "Trainer",
     "SyntheticCIFAR10Stream",
@@ -44,3 +56,20 @@ __all__ = [
     "load_cifar10_or_synthetic",
     "take_samples",
 ]
+
+
+def __getattr__(name: str):
+    if name in {"MultimodalExample", "MultimodalTrainer", "MultimodalTrainingResult"}:
+        from bioarn.training.multimodal_training import (
+            MultimodalExample,
+            MultimodalTrainer,
+            MultimodalTrainingResult,
+        )
+
+        exports = {
+            "MultimodalExample": MultimodalExample,
+            "MultimodalTrainer": MultimodalTrainer,
+            "MultimodalTrainingResult": MultimodalTrainingResult,
+        }
+        return exports[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
