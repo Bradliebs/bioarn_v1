@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -18,6 +19,10 @@ from bioarn.workspace.gnw import (
     StreamOfConsciousness,
     ThoughtOutput,
 )
+
+if TYPE_CHECKING:
+    from bioarn.ensemble import EnsembleConfig, EnsemblePool, EnsembleResult
+    from bioarn.hierarchy import HierarchyConfig, HierarchyOutput, VisualHierarchy
 
 
 @dataclass
@@ -81,6 +86,20 @@ class BioARNCore(nn.Module):
         self.timestep = 0
         self.last_perception: PerceptionOutput | None = None
         self.last_thought: ThoughtOutput = self._empty_thought()
+
+        hierarchy_config: HierarchyConfig | None = getattr(config, "hierarchy", None)
+        if hierarchy_config is not None:
+            from bioarn.hierarchy import VisualHierarchy
+            self.hierarchy: VisualHierarchy | None = VisualHierarchy(hierarchy_config)
+        else:
+            self.hierarchy = None
+
+        ensemble_config: EnsembleConfig | None = getattr(config, "ensemble", None)
+        if ensemble_config is not None:
+            from bioarn.ensemble import EnsemblePool
+            self.ensemble: EnsemblePool | None = EnsemblePool(ensemble_config)
+        else:
+            self.ensemble = None
 
     @staticmethod
     def _empty_associations() -> AssociationResult:
@@ -177,7 +196,13 @@ class BioARNCore(nn.Module):
     def _perceive_impl(
         self, raw_input: torch.Tensor, *, allow_recruit: bool
     ) -> PerceptionOutput:
-        pool_output = self._run_pool(raw_input, allow_recruit=allow_recruit)
+        if self.hierarchy is not None:
+            hierarchy_output: HierarchyOutput = self.hierarchy.process(raw_input)
+            processed_input = hierarchy_output.final_features.reshape(-1).to(torch.float32)
+        else:
+            processed_input = raw_input
+
+        pool_output = self._run_pool(processed_input, allow_recruit=allow_recruit)
         active_cccs = self._active_cccs(pool_output)
 
         for index, direction, confidence in active_cccs:
@@ -279,6 +304,19 @@ class BioARNCore(nn.Module):
             num_hypotheses=perception.num_fired,
             agreement=float(perception.vote_result.agreement_score),
         )
+
+    @torch.no_grad()
+    def ensemble_recognize(self, raw_input: torch.Tensor) -> EnsembleResult | RecognitionOutput:
+        """Recognize using the ensemble pool if configured, otherwise fall back to recognize().
+
+        When an ensemble is configured, each expert pool votes on the classification and
+        returns a full EnsembleResult with per-expert predictions and agreement scores.
+        Without an ensemble, delegates to the standard CCC recognition path.
+        """
+
+        if self.ensemble is not None:
+            return self.ensemble.classify(raw_input)
+        return self.recognize(raw_input)
 
     @torch.no_grad()
     def learn_from_perception(self, perception: PerceptionOutput, raw_input: torch.Tensor) -> None:
