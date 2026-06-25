@@ -133,12 +133,28 @@ class WordLevelProcessor:
             max_concepts=size,
             decay=float(self.config.word_transition_decay),
         )
-        words = [word for word in self._extract_words(text) if word in self.word_to_id]
-        for current_word, next_word in zip(words[:-1], words[1:], strict=False):
-            self.word_transition_matrix.record_transition(
-                self.word_to_id[current_word],
-                self.word_to_id[next_word],
-            )
+        sentence_words: list[str] = []
+        for token in _TOKEN_PATTERN.findall(text):
+            if _WORD_PATTERN.fullmatch(token):
+                word = token.lower()
+                if word in self.word_to_id:
+                    sentence_words.append(word)
+                continue
+
+            if len(sentence_words) >= 2:
+                for current_word, next_word in zip(sentence_words[:-1], sentence_words[1:], strict=False):
+                    self.word_transition_matrix.record_transition(
+                        self.word_to_id[current_word],
+                        self.word_to_id[next_word],
+                    )
+            sentence_words = []
+
+        if len(sentence_words) >= 2:
+            for current_word, next_word in zip(sentence_words[:-1], sentence_words[1:], strict=False):
+                self.word_transition_matrix.record_transition(
+                    self.word_to_id[current_word],
+                    self.word_to_id[next_word],
+                )
 
     def constrain_generation(
         self,

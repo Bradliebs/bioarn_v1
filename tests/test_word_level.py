@@ -130,6 +130,21 @@ def test_word_transitions_learned() -> None:
     assert predicted_words & {"cat", "dog", "bird", "fish", "baker", "sun", "moon", "warm"}
 
 
+def test_word_transitions_respect_sentence_boundaries() -> None:
+    processor = WordLevelProcessor(make_word_config())
+    corpus = "alpha beta. gamma delta."
+    processor.learn_vocabulary(corpus)
+    processor.learn_word_transitions(corpus)
+
+    beta_id = processor.word_to_id["beta"]
+    predicted_ids = {
+        word_id
+        for word_id, _ in processor.word_transition_matrix.predict_next(beta_id, top_k=4)
+    }
+
+    assert predicted_ids == set()
+
+
 def test_constrain_generation() -> None:
     processor = WordLevelProcessor(make_word_config())
     processor.learn_vocabulary(PREFIX_TEXT)
@@ -213,6 +228,39 @@ def test_word_level_beats_char_only() -> None:
 
     assert real_word_ratio(dual_samples) >= 0.8
     assert repetition_score(dual_samples) < repetition_score(char_samples)
+
+
+def test_generation_context_biases_partial_word_continuations() -> None:
+    trainer = make_trainer(use_contextual_patterns=True, enable_ngram_cache=True)
+    trainer.train_on_text(CORPUS[:320], context_length=12)
+
+    prompt_ids = trainer.tokenizer.encode("The c")
+    raw_prediction = trainer._predict_from_tokens(prompt_ids, temperature=0.7, repetition_penalty=None)
+    contextual_prediction = trainer._apply_generation_context(prompt_ids, raw_prediction)
+
+    a_id = trainer.tokenizer.encode("a")[0]
+    o_id = trainer.tokenizer.encode("o")[0]
+    a_index = raw_prediction.candidate_ids.index(a_id)
+    o_index = raw_prediction.candidate_ids.index(o_id)
+    raw_ratio = float(raw_prediction.probabilities[a_index] / raw_prediction.probabilities[o_index].clamp_min(1e-6))
+    contextual_ratio = float(
+        contextual_prediction.probabilities[a_index] / contextual_prediction.probabilities[o_index].clamp_min(1e-6)
+    )
+
+    assert contextual_ratio > raw_ratio
+
+
+def test_word_level_context_vector_tracks_last_completed_word() -> None:
+    trainer = make_trainer(use_contextual_patterns=True, enable_ngram_cache=True)
+    trainer.train_on_text(CORPUS[:320], context_length=12)
+
+    trainer._predict_from_tokens(trainer.tokenizer.encode("The baker "), temperature=0.7, repetition_penalty=None)
+    context_vector = trainer._word_level_context_vector()
+    baker_concept = trainer.word_processor.word_concept("baker")
+
+    assert baker_concept is not None
+    assert float(context_vector.norm().item()) > 0.0
+    assert trainer._cosine(context_vector, baker_concept) > 0.8
 
 
 def test_no_backprop_word_level() -> None:

@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 import math
 from pathlib import Path
+import re
 import statistics
 import time
 from typing import Iterable, Iterator, Sequence
@@ -689,6 +690,47 @@ class TextGenerationTrainer:
             return context_vector
         return retrieved if float(retrieved.norm().item()) > 0.0 else normalized
 
+    def _word_level_context_vector(self) -> torch.Tensor:
+        base = torch.zeros(self.system.core.config.ccc.concept_dim, dtype=torch.float32)
+        if self.word_processor is None or not self._runtime_token_history:
+            return base
+
+        tail = self._runtime_token_history[-max(48, int(self.config.context_length) * 6) :]
+        history_text = self._decode_token(tail)
+        if not history_text:
+            return base
+
+        trailing_boundary = bool(history_text and history_text[-1] in {" ", ".", ",", "!", "?", ";", ":", "\n", "\t"})
+        words = [match.group(0).lower() for match in re.finditer(r"[A-Za-z']+", history_text)]
+        if not words:
+            return base
+        if not trailing_boundary:
+            words = words[:-1]
+        if not words:
+            return base
+
+        vectors: list[tuple[float, torch.Tensor]] = []
+        for rank, word in enumerate(reversed(words[-3:]), start=1):
+            concept = self.word_processor.word_concept(word)
+            if concept is None or float(concept.norm().item()) <= 1e-8:
+                continue
+            aligned = concept.to(torch.float32)
+            if aligned.numel() > base.numel():
+                aligned = aligned[: base.numel()]
+            elif aligned.numel() < base.numel():
+                aligned = F.pad(aligned, (0, base.numel() - aligned.numel()))
+            vectors.append((1.0 / float(rank), self._normalize(aligned)))
+
+        if not vectors:
+            return base
+
+        combined = torch.zeros_like(base)
+        total_weight = 0.0
+        for weight, vector in vectors:
+            combined = combined + (weight * vector.to(combined))
+            total_weight += weight
+        return self._normalize(combined / max(total_weight, 1e-6))
+
     def _current_context_vector(self, query: torch.Tensor | None = None) -> torch.Tensor:
         base = torch.zeros(self.system.core.config.ccc.concept_dim, dtype=torch.float32)
         if hasattr(self.system.core.gnw, "get_context_vector"):
@@ -697,14 +739,17 @@ class TextGenerationTrainer:
         if query is not None and hasattr(self.system.core.gnw, "attend_context"):
             attended = self._normalize(self.system.core.gnw.attend_context(query).detach().clone())
         recurrent = self._normalize(self.recurrent_context.state.detach().clone())
+        word_level = self._word_level_context_vector()
 
         vectors: list[tuple[float, torch.Tensor]] = []
         if float(base.norm().item()) > 0.0:
-            vectors.append((0.45, base))
+            vectors.append((0.4, base))
         if float(attended.norm().item()) > 0.0:
-            vectors.append((0.30, attended))
+            vectors.append((0.25, attended))
         if float(recurrent.norm().item()) > 0.0:
-            vectors.append((0.25, recurrent))
+            vectors.append((0.2, recurrent))
+        if float(word_level.norm().item()) > 0.0:
+            vectors.append((0.15, word_level))
         if not vectors:
             return base
 
@@ -719,41 +764,63 @@ class TextGenerationTrainer:
         if not self.enable_generation_context or not prediction.candidate_ids:
             return prediction
 
-        del token_ids
         query = (
             self._runtime_concept_history[-1]
             if self._runtime_concept_history
             else prediction.retrieved_concept.detach().clone()
         )
         context_vector = self._current_context_vector(query)
-        if float(context_vector.norm().item()) <= 1e-8:
-            self._last_context_utilization = 0.0
-            self._last_context_repetition = 0.0
-            self._last_topic_drift = 0.0
-            return prediction
-
-        prototypes = torch.stack(
-            [
-                (
-                    prototype
-                    if (prototype := self._token_prototype(token_id)) is not None
-                    else torch.zeros(self.system.core.config.ccc.concept_dim, dtype=torch.float32)
-                )
-                for token_id in prediction.candidate_ids
-            ],
-            dim=0,
-        )
-        context_bias = self.recurrent_context.prime_retrieval(context_vector, prototypes).to(prediction.probabilities)
         biased_logits = torch.log(prediction.probabilities.clamp_min(1e-6))
-        biased_logits = biased_logits + (float(self.system.core.gnw.config.context_bias_gain) * context_bias)
+        if float(context_vector.norm().item()) > 1e-8:
+            prototypes = torch.stack(
+                [
+                    (
+                        prototype
+                        if (prototype := self._token_prototype(token_id)) is not None
+                        else torch.zeros(self.system.core.config.ccc.concept_dim, dtype=torch.float32)
+                    )
+                    for token_id in prediction.candidate_ids
+                ],
+                dim=0,
+            )
+            context_bias = self.recurrent_context.prime_retrieval(context_vector, prototypes).to(prediction.probabilities)
+            biased_logits = biased_logits + (float(self.system.core.gnw.config.context_bias_gain) * context_bias)
 
-        repetition_score = self.recurrent_context.detect_repetition(
-            self._runtime_concept_history,
-            window=int(self.system.core.gnw.config.repetition_window),
-        )
-        if repetition_score >= float(self.system.core.gnw.config.repetition_novelty_threshold):
-            noise_scale = min(0.15, 0.03 + (0.12 * repetition_score))
-            biased_logits = biased_logits + (torch.randn_like(biased_logits) * noise_scale)
+            repetition_score = self.recurrent_context.detect_repetition(
+                self._runtime_concept_history,
+                window=int(self.system.core.gnw.config.repetition_window),
+            )
+            if repetition_score >= float(self.system.core.gnw.config.repetition_novelty_threshold):
+                noise_scale = min(0.15, 0.03 + (0.12 * repetition_score))
+                biased_logits = biased_logits + (torch.randn_like(biased_logits) * noise_scale)
+        else:
+            context_bias = torch.zeros_like(prediction.probabilities)
+            repetition_score = 0.0
+
+        if self.dual_processor is not None and self.config.tokenizer_type.lower() == "char":
+            prompt_text = self._decode_token([int(token_id) for token_id in token_ids])
+            char_candidates = [
+                (self._decode_token([int(candidate_id)]), float(probability.item()))
+                for candidate_id, probability in zip(prediction.candidate_ids, prediction.probabilities, strict=False)
+            ]
+            reranked = self.dual_processor.rerank_char_candidates(
+                prompt_text,
+                char_candidates,
+                temperature=max(0.2, float(self.config.temperature)),
+            )
+            if reranked:
+                word_scores = {char: float(score) for char, score in reranked}
+                word_logits = torch.tensor(
+                    [
+                        max(1e-6, word_scores.get(self._decode_token([int(candidate_id)]), 1e-6))
+                        for candidate_id in prediction.candidate_ids
+                    ],
+                    dtype=biased_logits.dtype,
+                    device=biased_logits.device,
+                )
+                word_logits = torch.log(word_logits / word_logits.sum().clamp_min(1e-6))
+                blend = min(0.65, 0.2 + (0.45 * float(self.config.word_level.word_constraint_strength)))
+                biased_logits = ((1.0 - blend) * biased_logits) + (blend * word_logits)
 
         probabilities = torch.softmax(biased_logits, dim=0)
         self._last_context_utilization = float(context_bias.abs().mean().item())

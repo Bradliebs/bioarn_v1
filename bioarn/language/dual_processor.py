@@ -10,6 +10,7 @@ import torch
 from .word_level import WordLevelProcessor
 
 _WORD_PATTERN = re.compile(r"[A-Za-z']+")
+_SEPARATORS = {" ", ".", ",", "!", "?", ";", ":", "\n", "\t"}
 
 
 class DualLevelProcessor:
@@ -32,16 +33,21 @@ class DualLevelProcessor:
 
         partial = ""
         for _ in range(max(2, len(target_word) + 2)):
+            prompt_text = self._compose_prompt_text(context_words, partial)
             candidates = self._char_candidates(context_words, partial)
-            next_index = min(len(partial), len(target_word) - 1)
-            expected = target_word[next_index] if target_word else ""
-            if expected:
-                candidates.append((expected, 1.0 + (0.5 / max(0.2, float(temperature)))))
-            constrained = self.word_processor.constrain_generation(candidates, partial)
-            if not constrained:
+            reranked = self.rerank_char_candidates(prompt_text, candidates, temperature=temperature)
+            if target_word and len(partial) < len(target_word):
+                reranked = self._boost_candidate(
+                    reranked,
+                    target_word[len(partial)],
+                    0.9 + (0.4 / max(0.2, float(temperature))),
+                )
+            if not reranked:
                 break
-            next_char = constrained[0][0] if isinstance(constrained[0], tuple) else constrained[0]
-            if not next_char or not next_char.isalpha():
+            next_char = reranked[0][0] if isinstance(reranked[0], tuple) else reranked[0]
+            if next_char in _SEPARATORS and self.word_processor.trie.is_complete_word(partial):
+                break
+            if not next_char or (not next_char.isalpha() and next_char != "'"):
                 break
             partial += next_char.lower()
             if partial == target_word:
@@ -103,6 +109,9 @@ class DualLevelProcessor:
         if not token_ids:
             return candidates
         prediction = predictor(token_ids, temperature=max(0.2, float(getattr(self.char_system.config, "temperature", 1.0))), repetition_penalty=None)
+        contextualize = getattr(self.char_system, "_apply_generation_context", None)
+        if callable(contextualize):
+            prediction = contextualize(token_ids, prediction)
         if not getattr(prediction, "candidate_ids", None):
             return candidates
         top_k = min(8, len(prediction.candidate_ids))
@@ -113,6 +122,37 @@ class DualLevelProcessor:
             if len(char) == 1:
                 candidates.append((char.lower(), float(value)))
         return candidates
+
+    def rerank_char_candidates(
+        self,
+        prompt_text: str,
+        char_candidates: list[tuple[str, float]],
+        *,
+        temperature: float,
+    ) -> list[tuple[str, float]]:
+        """Blend character evidence with trie and next-word constraints."""
+
+        if not char_candidates:
+            return []
+
+        context_words, partial_word = self._split_prompt_context(prompt_text)
+        constrained = self.word_processor.constrain_generation(char_candidates, partial_word)
+        scored = {
+            str(char)[:1].lower(): float(score)
+            for char, score in constrained
+            if isinstance(char, str) and str(char)[:1]
+        }
+
+        if not scored:
+            return []
+
+        for char, bonus in self._suggested_next_chars(context_words, partial_word).items():
+            scored[char] = scored.get(char, 0.0) + (
+                float(bonus) * (0.45 + (0.5 / max(0.25, float(temperature))))
+            )
+
+        ranked = sorted(scored.items(), key=lambda item: (-item[1], item[0]))
+        return [(char, float(score)) for char, score in ranked]
 
     def _select_target_word(
         self,
@@ -141,6 +181,69 @@ class DualLevelProcessor:
         probabilities = torch.softmax(logits, dim=0)
         chosen = int(torch.multinomial(probabilities, num_samples=1).item())
         return filtered[chosen][0]
+
+    @staticmethod
+    def _compose_prompt_text(context_words: list[str], partial_word: str) -> str:
+        prompt = " ".join(context_words[-6:]).strip()
+        return f"{prompt} {partial_word}".strip() if prompt else partial_word
+
+    @staticmethod
+    def _boost_candidate(
+        candidates: list[tuple[str, float]],
+        token: str,
+        bonus: float,
+    ) -> list[tuple[str, float]]:
+        char = str(token)[:1].lower()
+        if not char:
+            return candidates
+        scored = {candidate: float(score) for candidate, score in candidates}
+        scored[char] = scored.get(char, 0.0) + float(bonus)
+        return sorted(scored.items(), key=lambda item: (-item[1], item[0]))
+
+    def _split_prompt_context(self, prompt_text: str) -> tuple[list[str], str]:
+        prompt = str(prompt_text or "")
+        words = [match.group(0).lower() for match in _WORD_PATTERN.finditer(prompt)]
+        if not words:
+            return [], ""
+        if prompt and prompt[-1] not in _SEPARATORS:
+            return words[:-1], words[-1]
+        return words, ""
+
+    def _suggested_next_chars(self, context_words: list[str], partial_word: str) -> dict[str, float]:
+        scores: dict[str, float] = {}
+        suggestions = self.word_processor.suggest_next_word(
+            context_words,
+            top_k=max(4, int(self.word_processor.config.trie_max_completions)),
+        )
+
+        for word, probability in suggestions:
+            if partial_word:
+                if not word.startswith(partial_word):
+                    continue
+                if len(word) > len(partial_word):
+                    char = word[len(partial_word)]
+                    scores[char] = scores.get(char, 0.0) + float(probability)
+                elif word == partial_word:
+                    sentence_end = self.word_processor.sentence_end_probability(word)
+                    scores[" "] = scores.get(" ", 0.0) + max(0.2, 1.0 - sentence_end)
+                    scores["."] = scores.get(".", 0.0) + max(0.05, sentence_end)
+                continue
+
+            if word:
+                first = word[0]
+                scores[first] = scores.get(first, 0.0) + float(probability)
+
+        if partial_word:
+            completions = self.word_processor.trie.get_completions(
+                partial_word,
+                top_k=max(4, int(self.word_processor.config.trie_max_completions)),
+            )
+            for rank, word in enumerate(completions, start=1):
+                if len(word) > len(partial_word):
+                    char = word[len(partial_word)]
+                    scores[char] = scores.get(char, 0.0) + (1.0 / float(rank + 1))
+
+        return scores
 
 
 __all__ = ["DualLevelProcessor"]
