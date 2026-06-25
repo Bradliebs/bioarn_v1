@@ -353,14 +353,20 @@ class EnsemblePool:
         return max(0.25, accuracy / max(1.0 - accuracy, 0.05))
 
     @staticmethod
-    def _confidence_reliability(state: _ExpertState) -> float:
-        if state.total_predictions == 0:
-            return 1.0
-        return state.correct_predictions / max(state.total_predictions, 1)
-
-    @staticmethod
     def _positive_confidence(confidence: float) -> float:
-        return min(1.0, max((float(confidence) - 0.5) * 2.0, 0.0))
+        scaled = min(1.0, max((float(confidence) - 0.5) * 2.0, 0.0))
+        return scaled * scaled
+
+    def _vote_capacity(self, expert_index: int, state: _ExpertState, predicted_class: int) -> float:
+        if predicted_class < 0:
+            return 0.0
+        if self.config.voting_method == "majority":
+            base_weight = 1.0
+        elif self.config.voting_method == "confidence":
+            base_weight = 1.0
+        else:
+            base_weight = self._expert_reliability(state)
+        return base_weight * self._class_weight(expert_index, predicted_class)
 
     def _class_weight(self, expert_index: int, predicted_class: int) -> float:
         if self.boosting is None or predicted_class < 0:
@@ -437,12 +443,19 @@ class EnsemblePool:
         active_count = sum(int(not result.abstained and result.predicted_class >= 0) for result in expert_results)
         agreement = vote_counts[predicted_class] / max(active_count, 1)
         support_fraction = vote_counts[predicted_class] / max(len(expert_results), 1)
-        calibrated_support = 0.0
-        for state, prediction in zip(self.experts, expert_results, strict=False):
-            if prediction.abstained or prediction.predicted_class != predicted_class:
-                continue
-            calibrated_support += self._positive_confidence(prediction.confidence) * self._confidence_reliability(state)
-        confidence = min(1.0, calibrated_support / max(len(expert_results), 1))
+        total_vote_weight = sum(
+            float(prediction.vote_weight)
+            for prediction in expert_results
+            if not prediction.abstained and prediction.predicted_class >= 0
+        )
+        support_mass = float(vote_totals[predicted_class])
+        support_capacity = sum(
+            self._vote_capacity(expert_index, state, int(predicted_class))
+            for expert_index, state in enumerate(self.experts)
+        )
+        normalized_support = min(1.0, support_mass / max(support_capacity, 1e-6))
+        consensus = support_mass / max(total_vote_weight, 1e-6) if total_vote_weight > 0.0 else 0.0
+        confidence = normalized_support * (0.75 + 0.25 * consensus)
         if support_fraction < self.config.abstention_threshold:
             confidence *= max(support_fraction / max(self.config.abstention_threshold, 1e-6), 0.1)
 
