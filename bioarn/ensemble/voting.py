@@ -9,7 +9,7 @@ from typing import Any
 import torch
 
 from bioarn.core.ccc import CCCPool, CCCPoolOutput
-from bioarn.core.math_utils import cosine_similarity, normalize
+from bioarn.core.math_utils import normalize
 from bioarn.ensemble.boosting import HebbianBoosting
 from bioarn.ensemble.config import EnsembleConfig
 from bioarn.scaling import BatchedCCCPool, PoolInferenceSummary
@@ -58,7 +58,7 @@ class _PrototypeBank:
         labels = list(self.prototypes.keys())
         stacked = torch.stack([self.prototypes[label].to(concept_direction) for label in labels], dim=0)
         query = normalize(concept_direction.reshape(1, -1)).expand_as(stacked)
-        similarities = cosine_similarity(stacked, query)
+        similarities = torch.sum(stacked * query, dim=-1)
         return int(labels[int(torch.argmax(similarities).item())])
 
 
@@ -352,6 +352,16 @@ class EnsemblePool:
         accuracy = state.correct_predictions / max(state.total_predictions, 1)
         return max(0.25, accuracy / max(1.0 - accuracy, 0.05))
 
+    @staticmethod
+    def _confidence_reliability(state: _ExpertState) -> float:
+        if state.total_predictions == 0:
+            return 1.0
+        return state.correct_predictions / max(state.total_predictions, 1)
+
+    @staticmethod
+    def _positive_confidence(confidence: float) -> float:
+        return min(1.0, max((float(confidence) - 0.5) * 2.0, 0.0))
+
     def _class_weight(self, expert_index: int, predicted_class: int) -> float:
         if self.boosting is None or predicted_class < 0:
             return 1.0
@@ -364,9 +374,9 @@ class EnsemblePool:
         if self.config.voting_method == "majority":
             base_weight = 1.0
         elif self.config.voting_method == "confidence":
-            base_weight = max(float(prediction.confidence), 0.0)
+            base_weight = self._positive_confidence(prediction.confidence)
         else:
-            base_weight = max(float(prediction.confidence), 0.0) * self._expert_reliability(state)
+            base_weight = self._positive_confidence(prediction.confidence) * self._expert_reliability(state)
         return base_weight * self._class_weight(expert_index, prediction.predicted_class)
 
     @torch.no_grad()
@@ -426,11 +436,15 @@ class EnsemblePool:
         )
         active_count = sum(int(not result.abstained and result.predicted_class >= 0) for result in expert_results)
         agreement = vote_counts[predicted_class] / max(active_count, 1)
-        total_vote_weight = sum(vote_totals.values())
-        confidence_share = vote_totals[predicted_class] / max(total_vote_weight, 1e-6)
-        confidence = min(1.0, (0.5 * confidence_share) + (0.5 * agreement))
-        if agreement < self.config.abstention_threshold:
-            confidence *= max(agreement / max(self.config.abstention_threshold, 1e-6), 0.1)
+        support_fraction = vote_counts[predicted_class] / max(len(expert_results), 1)
+        calibrated_support = 0.0
+        for state, prediction in zip(self.experts, expert_results, strict=False):
+            if prediction.abstained or prediction.predicted_class != predicted_class:
+                continue
+            calibrated_support += self._positive_confidence(prediction.confidence) * self._confidence_reliability(state)
+        confidence = min(1.0, calibrated_support / max(len(expert_results), 1))
+        if support_fraction < self.config.abstention_threshold:
+            confidence *= max(support_fraction / max(self.config.abstention_threshold, 1e-6), 0.1)
 
         result = EnsembleResult(
             predicted_class=int(predicted_class),

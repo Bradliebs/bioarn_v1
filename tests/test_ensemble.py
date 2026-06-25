@@ -173,6 +173,23 @@ def test_agreement_correlates_accuracy() -> None:
     assert sum(high_agreement) / len(high_agreement) >= sum(low_agreement) / len(low_agreement)
 
 
+def test_ensemble_confidence_uses_absolute_expert_confidence() -> None:
+    low_confidence_unanimous = EnsemblePool(EnsembleConfig(num_experts=3, voting_method="weighted"))
+    for name in ("a", "b", "c"):
+        low_confidence_unanimous.add_expert(name, MockExpert(lambda _: (1, 0.2)))
+
+    high_confidence_majority = EnsemblePool(EnsembleConfig(num_experts=3, voting_method="weighted"))
+    high_confidence_majority.add_expert("a", MockExpert(lambda _: (1, 0.95)))
+    high_confidence_majority.add_expert("b", MockExpert(lambda _: (1, 0.9)))
+    high_confidence_majority.add_expert("c", MockExpert(lambda _: (2, 0.9)))
+
+    unanimous = low_confidence_unanimous.classify(torch.tensor([0.0]))
+    majority = high_confidence_majority.classify(torch.tensor([0.0]))
+
+    assert unanimous.agreement == 1.0
+    assert unanimous.confidence < majority.confidence
+
+
 def test_ensemble_learns() -> None:
     first = MockExpert(lambda _: (0, 0.8))
     second = MockExpert(lambda _: (1, 0.6))
