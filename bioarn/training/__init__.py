@@ -1,5 +1,11 @@
 """Training exports for Bio-ARN."""
 
+from bioarn.training.ensemble_training import (
+    AugmentFn,
+    EnsembleTrainMetrics,
+    EnsembleTrainer,
+    ExpertTrainMetrics,
+)
 from bioarn.training.trainer import EvalResult, OnlineTrainer, TrainResult
 from bioarn.training.text_training import (
     GenerationMetrics,
@@ -19,7 +25,11 @@ from bioarn.training.vision_training import (
 Trainer = OnlineTrainer
 
 __all__ = [
+    "AugmentFn",
+    "EnsembleTrainMetrics",
+    "EnsembleTrainer",
     "EvalResult",
+    "ExpertTrainMetrics",
     "GenerationMetrics",
     "OnlineTrainer",
     "Trainer",

@@ -204,6 +204,35 @@ class _PrototypeBank:
         return cloned
 
 
+def _interleave_by_class(
+    samples: list[tuple[torch.Tensor, int | None]],
+) -> list[tuple[torch.Tensor, int | None]]:
+    """Round-robin interleave samples by class label.
+
+    Interleaved presentation (class 0, class 1, …, class 0, class 1, …) helps
+    online Hebbian learners build balanced concept representations from the start,
+    which reduces the chance of early CCCs over-specialising on whichever class
+    happened to appear first in the stream.  Unlabelled samples are appended at
+    the end.
+    """
+    class_buckets: defaultdict[int, list[tuple[torch.Tensor, int | None]]] = defaultdict(list)
+    unlabeled: list[tuple[torch.Tensor, int | None]] = []
+    for tensor, label in samples:
+        if label is None:
+            unlabeled.append((tensor, label))
+        else:
+            class_buckets[int(label)].append((tensor, label))
+
+    interleaved: list[tuple[torch.Tensor, int | None]] = []
+    classes = sorted(class_buckets.keys())
+    while any(class_buckets[c] for c in classes):
+        for c in classes:
+            if class_buckets[c]:
+                interleaved.append(class_buckets[c].pop(0))
+    interleaved.extend(unlabeled)
+    return interleaved
+
+
 def _iter_samples(data_stream: StreamingDataSource | Iterable[DataSample | tuple[torch.Tensor, int]]) -> Iterator[DataSample | tuple[torch.Tensor, int]]:
     if isinstance(data_stream, StreamingDataSource):
         yield from data_stream.stream()
@@ -421,11 +450,37 @@ class VisionTrainer:
         self,
         data_stream: StreamingDataSource | Iterable[DataSample | tuple[torch.Tensor, int]],
         num_samples: int | None = None,
+        *,
+        num_passes: int = 1,
+        interleave_classes: bool = False,
     ) -> dict[str, object]:
+        """Train the system online on a stream of samples.
+
+        Args:
+            data_stream: Labelled samples to train on.
+            num_samples: Cap on samples to materialise from the stream.  Defaults
+                to ``config.num_train_samples``.
+            num_passes: Number of full passes over the materialised sample list.
+                Pass 1 is processed in presentation order; subsequent passes are
+                independently shuffled.  Values > 1 improve convergence because
+                early samples (trained before any concepts existed) are revisited
+                after the prototype bank is populated.
+            interleave_classes: When ``True``, reorder the materialised samples
+                into round-robin class order before the first pass
+                (class 0, class 1, …, class 0, class 1, …).  This prevents long
+                runs of the same class from monopolising early CCC slots, which
+                helps the system build balanced, well-separated class prototypes —
+                particularly useful when the source stream is sorted by class.
+        """
         target_samples = self.config.num_train_samples if num_samples is None else int(num_samples)
+        num_passes = max(1, int(num_passes))
         samples = self._materialize_samples(data_stream, target_samples)
         train_samples, warmup_samples = self._fit_preprocessing(samples)
-        effective_target = len(train_samples)
+
+        if interleave_classes:
+            train_samples = _interleave_by_class(train_samples)
+
+        effective_target = len(train_samples) * num_passes
         processed = 0
         correct = 0
         labeled = 0
@@ -435,41 +490,52 @@ class VisionTrainer:
         abstention_curve: list[float] = []
         progress_interval = max(1, max(effective_target, 1) // 10)
 
-        for tensor, label in train_samples:
-            tensor = self._prepare_tensor(tensor)
-            fired_indices, concept, confidence, abstained_flag = self._step_pool(
-                tensor,
-                allow_recruit=True,
-            )
-            prediction = None if abstained_flag else self._recognition_label(concept, fired_indices)
+        for pass_index in range(num_passes):
+            if pass_index == 0:
+                pass_samples = train_samples
+            else:
+                # Shuffle independently for each repeat pass so the system
+                # does not memorise a fixed sequence.
+                perm = torch.randperm(len(train_samples)).tolist()
+                pass_samples = [train_samples[i] for i in perm]
 
-            processed += 1
-            if label is not None:
-                labeled += 1
-                correct += int(prediction == label)
-            abstained += int(abstained_flag)
-
-            if not abstained_flag and label is not None:
-                self.label_bank.update(int(label), concept)
-            self._record_ccc_activity(fired_indices, label, confidence)
-
-            pool_stats = self._pool_stats()
-            accuracy_curve.append(correct / max(labeled, 1))
-            utilization_curve.append(int(pool_stats["num_committed"]) / self.config.max_pool_size)
-            abstention_curve.append(abstained / processed)
-
-            if processed % progress_interval == 0 or processed == effective_target:
-                print(
-                    f"[train] {processed}/{effective_target} "
-                    f"cccs={int(pool_stats['num_committed'])} "
-                    f"acc={accuracy_curve[-1]:.3f} "
-                    f"abstain={abstention_curve[-1]:.3f}"
+            for tensor, label in pass_samples:
+                tensor = self._prepare_tensor(tensor)
+                fired_indices, concept, confidence, abstained_flag = self._step_pool(
+                    tensor,
+                    allow_recruit=True,
                 )
+                prediction = None if abstained_flag else self._recognition_label(concept, fired_indices)
+
+                processed += 1
+                if label is not None:
+                    labeled += 1
+                    correct += int(prediction == label)
+                abstained += int(abstained_flag)
+
+                if not abstained_flag and label is not None:
+                    self.label_bank.update(int(label), concept)
+                self._record_ccc_activity(fired_indices, label, confidence)
+
+                pool_stats = self._pool_stats()
+                accuracy_curve.append(correct / max(labeled, 1))
+                utilization_curve.append(int(pool_stats["num_committed"]) / self.config.max_pool_size)
+                abstention_curve.append(abstained / processed)
+
+                if processed % progress_interval == 0 or processed == effective_target:
+                    pass_tag = f"p{pass_index + 1}/{num_passes} " if num_passes > 1 else ""
+                    print(
+                        f"[train] {pass_tag}{processed}/{effective_target} "
+                        f"cccs={int(pool_stats['num_committed'])} "
+                        f"acc={accuracy_curve[-1]:.3f} "
+                        f"abstain={abstention_curve[-1]:.3f}"
+                    )
 
         result = {
             "processed_samples": processed,
             "raw_samples_seen": len(samples),
             "warmup_samples": warmup_samples,
+            "num_passes": num_passes,
             "accuracy": correct / max(labeled, 1),
             "abstention_rate": abstained / max(processed, 1),
             "committed_cccs": int(self._pool_stats()["num_committed"]),
