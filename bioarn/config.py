@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -29,6 +30,22 @@ class MarginGateConfig:
 
 
 @dataclass
+class STDPConfig:
+    """Spike-timing-dependent plasticity parameters."""
+
+    tau_plus: float = 20.0
+    tau_minus: float = 40.0
+    A_plus: float = 0.05
+    A_minus: float = 0.06
+
+    def __post_init__(self) -> None:
+        self.tau_plus = float(self.tau_plus)
+        self.tau_minus = float(self.tau_minus)
+        self.A_plus = float(self.A_plus)
+        self.A_minus = float(self.A_minus)
+
+
+@dataclass
 class CCCConfig:
     """Concept Cell Cluster parameters."""
     input_dim: int = 784         # Dimensionality of input (e.g., 28×28 for MNIST)
@@ -39,6 +56,11 @@ class CCCConfig:
     slow_lr: float = 0.01        # Hebbian tuning rate (gradual refinement)
     feedback_lr: float = 0.01    # Feedback weight learning rate
     max_pool_size: int = 1000    # Maximum number of CCCs in the pool
+    stdp: STDPConfig | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.stdp, Mapping):
+            self.stdp = STDPConfig(**self.stdp)
 
 
 @dataclass

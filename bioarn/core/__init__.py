@@ -13,6 +13,7 @@ from bioarn.core.spiking import (
     rate_encode,
     spike_count,
 )
+from bioarn.core.stdp import STDPRule
 
 __all__ = [
     "CCCOutput",
@@ -25,6 +26,7 @@ __all__ = [
     "MarginGateOutput",
     "ResonanceOutput",
     "SurrogateSpike",
+    "STDPRule",
     "delta_encode",
     "firing_rate",
     "interspike_interval",

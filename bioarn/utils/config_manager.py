@@ -19,6 +19,7 @@ from bioarn.config import (
     RewardConfig,
     SDMConfig,
     SpikingConfig,
+    STDPConfig,
 )
 
 _NESTED_CONFIGS = {
@@ -303,6 +304,13 @@ class ConfigManager:
         cls._require(config.ccc.slow_lr >= 0.0, "ccc.slow_lr must be >= 0.")
         cls._require(config.ccc.feedback_lr >= 0.0, "ccc.feedback_lr must be >= 0.")
         cls._require(config.ccc.max_pool_size > 0, "ccc.max_pool_size must be positive.")
+        if config.ccc.stdp is not None:
+            if isinstance(config.ccc.stdp, dict):
+                config.ccc.stdp = STDPConfig(**config.ccc.stdp)
+            cls._require(config.ccc.stdp.tau_plus > 0.0, "ccc.stdp.tau_plus must be positive.")
+            cls._require(config.ccc.stdp.tau_minus > 0.0, "ccc.stdp.tau_minus must be positive.")
+            cls._require(config.ccc.stdp.A_plus >= 0.0, "ccc.stdp.A_plus must be >= 0.")
+            cls._require(config.ccc.stdp.A_minus >= 0.0, "ccc.stdp.A_minus must be >= 0.")
 
         cls._require(config.sdm.address_dim > 0, "sdm.address_dim must be positive.")
         cls._require(0 <= config.sdm.hamming_radius <= config.sdm.address_dim, "sdm.hamming_radius must be between 0 and address_dim.")

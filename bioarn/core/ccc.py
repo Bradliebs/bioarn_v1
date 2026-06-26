@@ -11,6 +11,7 @@ from torch import nn
 from bioarn.config import CCCConfig, MarginGateConfig
 from bioarn.core.margin_gate import MarginGate, MarginGateOutput, ResonanceOutput
 from bioarn.core.math_utils import normalize, sparse_top_k
+from bioarn.core.stdp import STDPRule
 
 
 @dataclass
@@ -45,6 +46,11 @@ class ConceptCellCluster(nn.Module):
     def __init__(self, config: CCCConfig, margin_config: MarginGateConfig):
         super().__init__()
         self.config = config
+        self.stdp_rule = (
+            STDPRule(config.stdp, num_pre=config.num_f1_features, num_post=config.concept_dim)
+            if config.stdp is not None
+            else None
+        )
 
         self.f1_layer = nn.Linear(config.input_dim, config.num_f1_features)
         for parameter in self.f1_layer.parameters():
@@ -89,6 +95,14 @@ class ConceptCellCluster(nn.Module):
     @staticmethod
     def _normalize_feedback_rows(x: torch.Tensor) -> torch.Tensor:
         return normalize(x)
+
+    @staticmethod
+    def _pre_spikes_from_f1(f1_batch: torch.Tensor) -> torch.Tensor:
+        return (f1_batch > 0).to(torch.float32).amax(dim=0)
+
+    @staticmethod
+    def _post_activity_from_f2(f2_batch: torch.Tensor) -> torch.Tensor:
+        return f2_batch.to(torch.float32).clamp_min(0.0).mean(dim=0)
 
     @staticmethod
     def _prepare_batch_vector(x: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -209,6 +223,7 @@ class ConceptCellCluster(nn.Module):
         gate_output = self.margin_gate(f2_batch, self.concept_direction)
         fired = bool(gate_output.fired.any().item())
         abstained = bool(gate_output.abstained.all().item())
+        pre_spikes = self._pre_spikes_from_f1(f1_batch) if self.stdp_rule is not None else None
 
         prediction: torch.Tensor | None = None
         resonance: ResonanceOutput | None = None
@@ -217,8 +232,16 @@ class ConceptCellCluster(nn.Module):
             prediction = self._ensure_batch(self.generate_prediction(gate_output.output))[0]
             resonance = self.margin_gate.check_resonance(prediction, f1_batch)
             if bool(resonance.resonated.any().item()):
-                self.learn_slow(raw_batch, f1_batch, resonance)
+                self.learn_slow(raw_batch, f1_batch, resonance, timestep=timestep)
+            elif self.stdp_rule is not None and pre_spikes is not None:
+                self.stdp_rule.observe_pre_spikes(pre_spikes, timestep=timestep)
+                self.stdp_rule.observe_post_spike(
+                    self._post_activity_from_f2(gate_output.output),
+                    timestep=timestep,
+                )
             self.last_fired.fill_(int(timestep))
+        elif self.stdp_rule is not None and pre_spikes is not None:
+            self.stdp_rule.observe_pre_spikes(pre_spikes, timestep=timestep)
 
         formatted_gate = self._format_gate_output(gate_output, squeeze=squeeze)
         formatted_resonance = (
@@ -259,6 +282,8 @@ class ConceptCellCluster(nn.Module):
         raw_input: torch.Tensor,
         f1_output: torch.Tensor,
         resonance: ResonanceOutput,
+        *,
+        timestep: int | None = None,
     ) -> None:
         """Apply local Hebbian refinement after resonance."""
 
@@ -271,8 +296,19 @@ class ConceptCellCluster(nn.Module):
         learn_signal = self._prepare_batch_vector(
             resonance.learn_signal, f2_batch.shape[0]
         ).to(f2_batch.dtype)
+        stdp_signal = torch.zeros(self.config.concept_dim, dtype=f2_batch.dtype, device=f2_batch.device)
+        stdp_update = torch.zeros_like(self.feedback_weights)
+        if self.stdp_rule is not None and timestep is not None:
+            stdp_update = self.stdp_rule.step(
+                self._pre_spikes_from_f1(f1_batch),
+                post_spike=True,
+                post_activity=self._post_activity_from_f2(f2_batch),
+                timestep=timestep,
+            ).to(self.feedback_weights.dtype)
+            stdp_signal = stdp_update.mean(dim=0).to(f2_batch.dtype)
 
         concept_delta = (f2_batch * learn_signal.unsqueeze(-1)).mean(dim=0)
+        concept_delta = concept_delta + stdp_signal
         updated_direction = self.concept_direction + (self.config.slow_lr * concept_delta)
         self.concept_direction.copy_(self._normalize_vector(updated_direction))
 
@@ -280,6 +316,8 @@ class ConceptCellCluster(nn.Module):
         residual = (f1_batch - prediction) * learn_signal.unsqueeze(-1)
         hebbian_update = residual.transpose(0, 1) @ f2_batch
         hebbian_update /= max(f1_batch.shape[0], 1)
+        if self.stdp_rule is not None and timestep is not None:
+            hebbian_update = hebbian_update + stdp_update
         self.feedback_weights.add_(self.config.feedback_lr * hebbian_update)
         self.feedback_weights.copy_(self._normalize_feedback_rows(self.feedback_weights))
 
