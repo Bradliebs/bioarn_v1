@@ -31,6 +31,16 @@ DOCS_URL = "https://github.com/bioarn/bioarn/tree/main/docs"
 PAPER_URL = "https://github.com/bioarn/bioarn/blob/main/BioARN_Architecture.md"
 REPORTED_EFFICIENCY_X = 278.0
 EDGE_BATTERY_WH = 20.0
+_TEXT_TRAINER_REQUIRED_ATTRS = (
+    "ngram_cache",
+    "quality_metrics",
+    "repetition_penalty",
+    "sequence_memory",
+    "_runtime_token_history",
+    "_runtime_concept_history",
+    "recurrent_context",
+    "enable_generation_context",
+)
 
 
 def _cache_path(name: str) -> Path:
@@ -53,6 +63,13 @@ def _load_cached(name: str) -> Any | None:
     if payload.get("version") != CACHE_VERSION:
         return None
     return payload.get("bundle")
+
+
+def _text_bundle_is_compatible(bundle: Any) -> bool:
+    trainer = getattr(bundle, "trainer", None)
+    if trainer is None:
+        return False
+    return all(hasattr(trainer, attr) for attr in _TEXT_TRAINER_REQUIRED_ATTRS)
 
 
 def _clone_with_torch(obj: Any) -> Any:
@@ -710,7 +727,7 @@ def get_text_model() -> TextDemoModel:
     """Return a TextGenerationTrainer pre-trained on built-in corpus."""
 
     cached = _load_cached("text_demo")
-    if cached is not None:
+    if cached is not None and _text_bundle_is_compatible(cached):
         return cached
     bundle = _build_text_bundle()
     _save_cached("text_demo", bundle)
