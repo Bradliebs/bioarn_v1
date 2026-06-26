@@ -12,11 +12,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import gradio as gr
+try:
+    import gradio as gr
+except Exception:  # pragma: no cover - exercised only when demo extras are absent
+    gr = None
 
 from demo.models import (
     DOCS_URL,
     PAPER_URL,
+    get_architecture_diagram_html,
+    get_multimodal_binding_snapshot,
     create_live_learning_session,
     format_token_html,
     format_top_matches,
@@ -28,13 +33,22 @@ from demo.models import (
     image_tensor_to_array,
 )
 from demo.visualizations import (
+    binding_strength_heatmap,
     ccc_activation_map,
     confidence_bar_chart,
     energy_comparison_chart,
+    ood_score_chart,
+    recruitment_timeline_chart,
     spike_raster_plot,
 )
 
 APP_LIVE_SESSION = create_live_learning_session()
+APP_RECRUITMENT_HISTORY: list[dict[str, object]] = []
+
+
+def _require_gradio() -> None:
+    if gr is None:
+        raise RuntimeError("Gradio is optional. Install demo extras with `pip install .[demo]` to launch the app.")
 
 
 def _pick_image(drawn_image, uploaded_image):
@@ -105,6 +119,7 @@ def _text_demo(prompt: str, max_tokens: int, temperature: float, method: str):
 
 
 def _toggle_cross_mode(mode: str):
+    _require_gradio()
     show_image = mode == "Image→Text"
     show_text = mode == "Text→Image"
     return gr.update(visible=show_image), gr.update(visible=show_text)
@@ -133,10 +148,20 @@ def _cross_modal_demo(mode: str, image_input, text_input: str):
 
 def _teach_live_pattern(image_input, label: str):
     outcome = APP_LIVE_SESSION.teach(_pick_image(image_input, None), label)
+    APP_RECRUITMENT_HISTORY.append(
+        {
+            "label": label.strip().lower() or "unknown",
+            "committed": int(outcome.pool_stats["committed"]),
+            "activated": int(outcome.activated_cccs),
+            "recruited_ccc_id": outcome.recruited_ccc_id,
+            "retention_ok": all(outcome.retention.values()),
+        }
+    )
     retention_lines = "\n".join(
         f"- **{name}**: {'kept ✅' if kept else 'missed ❌'}"
         for name, kept in sorted(outcome.retention.items())
     )
+    latest_summary = APP_RECRUITMENT_HISTORY[-1]
     return (
         outcome.message,
         (
@@ -146,6 +171,13 @@ def _teach_live_pattern(image_input, label: str):
         ),
         f"**Immediate recognition:** {outcome.recognized_label}",
         retention_lines,
+        recruitment_timeline_chart(APP_RECRUITMENT_HISTORY),
+        (
+            f"**Latest recruitment:** CCC #{latest_summary['recruited_ccc_id']} for "
+            f"`{latest_summary['label']}`  \n"
+            f"**Concepts activated:** {latest_summary['activated']}  \n"
+            f"**No-forgetting check:** {'pass ✅' if latest_summary['retention_ok'] else 'watch ⚠️'}"
+        ),
     )
 
 
@@ -153,14 +185,45 @@ def _recognize_live_pattern(image_input):
     return APP_LIVE_SESSION.recognize(_pick_image(image_input, None))
 
 
+def _ood_demo(uploaded_image):
+    assessment = get_mnist_model().assess_ood(uploaded_image)
+    summary = (
+        f"**Prediction:** {assessment.prediction_text}  \n"
+        f"**Top confidence:** {assessment.confidence:.3f}  \n"
+        f"**Novelty score:** {assessment.novelty_score:.3f}  \n"
+        f"**OOD score:** {assessment.ood_score:.3f}  \n"
+        f"{assessment.reasoning}"
+    )
+    return (
+        assessment.prediction_text,
+        confidence_bar_chart(assessment.class_scores),
+        ood_score_chart(assessment.ood_score),
+        summary,
+    )
+
+
+def _binding_summary_markdown() -> str:
+    snapshot = get_multimodal_binding_snapshot()
+    strongest_label, strongest_strength = snapshot.strongest_binding
+    return (
+        f"**Bound pairs:** {snapshot.bound_pairs}  \n"
+        f"**Shared-CCC pairs:** {snapshot.shared_ccc_pairs}  \n"
+        f"**Strongest binding:** {strongest_label} ({strongest_strength:.2f})  \n"
+        "Diagonal hotspots show where image and text land in the same shared concept neighborhood."
+    )
+
+
 def create_app(*, load_models: bool = True) -> gr.Blocks:
+    _require_gradio()
     if load_models:
         get_mnist_model()
         get_text_model()
         get_multimodal_model()
         get_energy_dashboard_data()
+        get_multimodal_binding_snapshot()
 
     dashboard = get_energy_dashboard_data() if load_models else None
+    binding_snapshot = get_multimodal_binding_snapshot() if load_models else None
     with gr.Blocks(title="Bio-ARN 2.0 Interactive Demo") as demo:
         gr.Markdown(_header_markdown())
 
@@ -306,6 +369,53 @@ def create_app(*, load_models: bool = True) -> gr.Blocks:
                     ],
                 )
 
+            with gr.Tab("🛡️ OOD Detection"):
+                with gr.Row():
+                    with gr.Column():
+                        ood_image = gr.Image(
+                            image_mode="L",
+                            type="numpy",
+                            label="Upload a digit or a surprising pattern",
+                            height=280,
+                        )
+                        gr.Examples(
+                            examples=[
+                                [image_tensor_to_array(get_mnist_model().example_digits[3])],
+                                [image_tensor_to_array(get_multimodal_model().patterns["cross"])],
+                            ],
+                            inputs=ood_image,
+                            label="In-distribution vs unusual examples",
+                        )
+                        ood_button = gr.Button("Estimate OOD score", variant="primary")
+                    with gr.Column():
+                        ood_prediction = gr.Textbox(label="Model prediction")
+                        ood_confidence = gr.Plot(label="Confidence distribution")
+                        ood_score = gr.Plot(label="OOD score")
+                        ood_summary = gr.Markdown()
+
+                ood_button.click(
+                    _ood_demo,
+                    inputs=[ood_image],
+                    outputs=[ood_prediction, ood_confidence, ood_score, ood_summary],
+                )
+
+            with gr.Tab("🧬 Multimodal Binding"):
+                gr.Markdown(
+                    "See how image and text concepts bind into the same CCC fabric. "
+                    "High diagonal energy means the shared space preserved identity across modalities."
+                )
+                binding_plot = gr.Plot(
+                    value=(
+                        binding_strength_heatmap(binding_snapshot.binding_matrix, binding_snapshot.labels)
+                        if binding_snapshot is not None
+                        else None
+                    ),
+                    label="Shared CCC binding map",
+                )
+                binding_summary = gr.Markdown(
+                    value=_binding_summary_markdown() if binding_snapshot is not None else "Binding map loading..."
+                )
+
             with gr.Tab("🧠 Live Learning"):
                 with gr.Row():
                     with gr.Column():
@@ -328,11 +438,23 @@ def create_app(*, load_models: bool = True) -> gr.Blocks:
                         teach_pool = gr.Markdown()
                         teach_recognition = gr.Markdown()
                         forgetting_report = gr.Markdown()
+                        with gr.Accordion("CCC Recruitment Visualization", open=False):
+                            recruitment_plot = gr.Plot(value=recruitment_timeline_chart(APP_RECRUITMENT_HISTORY))
+                            recruitment_summary = gr.Markdown(
+                                "Teach a novel concept to watch CCC commitments grow in real time."
+                            )
 
                 teach_button.click(
                     _teach_live_pattern,
                     inputs=[teach_image, teach_label],
-                    outputs=[teach_message, teach_pool, teach_recognition, forgetting_report],
+                    outputs=[
+                        teach_message,
+                        teach_pool,
+                        teach_recognition,
+                        forgetting_report,
+                        recruitment_plot,
+                        recruitment_summary,
+                    ],
                 )
                 recognize_live_button.click(
                     _recognize_live_pattern,
@@ -372,6 +494,13 @@ def create_app(*, load_models: bool = True) -> gr.Blocks:
                     )
                     if dashboard is not None
                     else ""
+                )
+
+            with gr.Tab("🏗️ Architecture"):
+                gr.HTML(value=get_architecture_diagram_html())
+                gr.Markdown(
+                    "Bio-ARN keeps concepts sparse and explicit: CCC recruitment handles novelty, "
+                    "SDM stores associative traces, GNW broadcasts winners, and reward/novelty signals bias future learning."
                 )
 
     return demo

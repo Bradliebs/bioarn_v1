@@ -25,7 +25,7 @@ from bioarn.training.text_training import (
 )
 from bioarn.training.vision_training import VisionTrainConfig, VisionTrainer
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 CACHE_DIR = Path(__file__).with_name("cache")
 DOCS_URL = "https://github.com/bioarn/bioarn/tree/main/docs"
 PAPER_URL = "https://github.com/bioarn/bioarn/blob/main/BioARN_Architecture.md"
@@ -69,7 +69,24 @@ def _text_bundle_is_compatible(bundle: Any) -> bool:
     trainer = getattr(bundle, "trainer", None)
     if trainer is None:
         return False
-    return all(hasattr(trainer, attr) for attr in _TEXT_TRAINER_REQUIRED_ATTRS)
+    return all(hasattr(trainer, attr) for attr in _TEXT_TRAINER_REQUIRED_ATTRS) and _bundle_cccs_are_compatible(bundle)
+
+
+def _bundle_cccs_are_compatible(bundle: Any) -> bool:
+    pool = None
+    trainer = getattr(bundle, "trainer", None)
+    if trainer is not None:
+        system = getattr(trainer, "system", None)
+        core = getattr(system, "core", None)
+        pool = getattr(core, "ccc_pool", None) or getattr(system, "ccc_pool", None)
+    fusion = getattr(bundle, "fusion", None)
+    if pool is None and fusion is not None:
+        pool = getattr(fusion, "ccc_pool", None)
+    cccs = getattr(pool, "cccs", None)
+    if not cccs:
+        return True
+    first_ccc = cccs[0]
+    return hasattr(first_ccc, "stdp_rule")
 
 
 def _clone_with_torch(obj: Any) -> Any:
@@ -313,6 +330,8 @@ class LiveLearningOutcome:
     recognized_label: str
     pool_stats: dict[str, int]
     retention: dict[str, bool]
+    recruited_ccc_id: int | None = None
+    activated_cccs: int = 0
 
 
 @dataclass
@@ -321,6 +340,25 @@ class EnergyDashboardData:
     efficiency_callout_x: float
     battery_life_hours: float
     architecture_stats: dict[str, float | int]
+
+
+@dataclass
+class OODAssessmentResult:
+    prediction_text: str
+    class_scores: dict[int, float]
+    ood_score: float
+    novelty_score: float
+    confidence: float
+    reasoning: str
+
+
+@dataclass
+class MultimodalBindingSnapshot:
+    labels: list[str]
+    binding_matrix: torch.Tensor
+    shared_ccc_pairs: int
+    bound_pairs: int
+    strongest_binding: tuple[str, float]
 
 
 @dataclass
@@ -386,6 +424,50 @@ class MNISTDemoModel:
             sparsity_pct=float(stats["sparsity"]) * 100.0,
             ccc_activations=activations,
             input_spikes=coerce_image_tensor(image),
+        )
+
+    def assess_ood(self, image: Any) -> OODAssessmentResult:
+        result = self.classify(image)
+        image_tensor = coerce_image_tensor(image)
+        prototype_scores = torch.tensor(
+            [
+                _pattern_similarity(image_tensor, self.example_digits[digit])
+                for digit in sorted(self.example_digits)
+            ],
+            dtype=torch.float32,
+        )
+        prototype_alignment = float(prototype_scores.max().item()) if prototype_scores.numel() else 0.0
+        probabilities = torch.tensor(
+            [float(result.class_scores[digit]) for digit in sorted(result.class_scores)],
+            dtype=torch.float32,
+        ).clamp_min(1e-6)
+        entropy = float(
+            (-(probabilities * probabilities.log()).sum() / torch.log(torch.tensor(float(len(probabilities))))).item()
+        )
+        novelty_score = max(0.0, (1.0 - result.confidence) + (1.0 - prototype_alignment))
+        ood_score = min(
+            1.0,
+            max(
+                0.0,
+                (0.45 * (1.0 - result.confidence))
+                + (0.25 * (1.0 - prototype_alignment))
+                + (0.15 * entropy)
+                + (0.10 if result.abstained else 0.0)
+                + (0.05 if result.active_cccs == 0 else 0.0),
+            ),
+        )
+        reasoning = (
+            "Likely OOD — weak CCC support and diffuse class confidence."
+            if ood_score >= 0.55
+            else "Likely in-distribution — Bio-ARN found a compact CCC explanation."
+        )
+        return OODAssessmentResult(
+            prediction_text=result.label_text,
+            class_scores=result.class_scores,
+            ood_score=float(ood_score),
+            novelty_score=float(novelty_score),
+            confidence=float(result.confidence),
+            reasoning=reasoning,
         )
 
 
@@ -539,6 +621,8 @@ class LiveLearningSession:
                 "available": int(pool_stats["num_uncommitted"]),
             },
             retention=retention,
+            recruited_ccc_id=int(binding["visual_ccc_id"]),
+            activated_cccs=1 if binding["converged"] else 2,
         )
 
 
@@ -715,7 +799,7 @@ def get_mnist_model() -> MNISTDemoModel:
     """Return a BioARNCore pre-trained on 200 MNIST samples."""
 
     cached = _load_cached("mnist_demo")
-    if cached is not None:
+    if cached is not None and _bundle_cccs_are_compatible(cached):
         return cached
     bundle = _build_mnist_bundle()
     _save_cached("mnist_demo", bundle)
@@ -739,7 +823,7 @@ def get_multimodal_model() -> MultimodalDemoModel:
     """Return a MultimodalFusion pre-trained on 10 pattern categories."""
 
     cached = _load_cached("multimodal_demo")
-    if cached is not None:
+    if cached is not None and _bundle_cccs_are_compatible(cached):
         return cached
     bundle = _build_multimodal_bundle()
     _save_cached("multimodal_demo", bundle)
@@ -802,6 +886,56 @@ def get_demo_overview_stats() -> dict[str, float | int]:
     }
 
 
+@lru_cache(maxsize=1)
+def get_multimodal_binding_snapshot() -> MultimodalBindingSnapshot:
+    model = get_multimodal_model()
+    labels = sorted(model.patterns)
+    binding_matrix = torch.zeros((len(labels), len(labels)), dtype=torch.float32)
+    shared_ccc_pairs = 0
+    strongest_label = ""
+    strongest_strength = 0.0
+    for row, text_label in enumerate(labels):
+        text_ccc = model.fusion.label_to_ccc.get(("text", text_label))
+        for col, vision_label in enumerate(labels):
+            vision_ccc = model.fusion.label_to_ccc.get(("vision", vision_label))
+            strength = 0.0
+            if text_ccc is not None and vision_ccc is not None:
+                strength = float(model.fusion.explicit_bindings.get((int(text_ccc), int(vision_ccc)), 0.0))
+                if text_label == vision_label and int(text_ccc) == int(vision_ccc):
+                    shared_ccc_pairs += 1
+            binding_matrix[row, col] = strength
+            if strength > strongest_strength:
+                strongest_strength = strength
+                strongest_label = f"{text_label} ↔ {vision_label}"
+    bound_pairs = int((binding_matrix > 0).sum().item())
+    return MultimodalBindingSnapshot(
+        labels=labels,
+        binding_matrix=binding_matrix,
+        shared_ccc_pairs=shared_ccc_pairs,
+        bound_pairs=bound_pairs,
+        strongest_binding=(strongest_label or "n/a", float(strongest_strength)),
+    )
+
+
+def get_architecture_diagram_html() -> str:
+    return """
+<div style="border:1px solid #cbd5e1;border-radius:16px;padding:16px;background:linear-gradient(180deg,#f8fafc,#eff6ff);font-family:Inter,Segoe UI,sans-serif">
+  <h3 style="margin-top:0">Bio-ARN architecture at a glance</h3>
+  <div style="display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:12px;align-items:center">
+    <div style="padding:12px;border-radius:12px;background:#ffffff;border:1px solid #dbeafe"><b>Input</b><br/>image / text</div>
+    <div style="padding:12px;border-radius:12px;background:#ffffff;border:1px solid #dbeafe"><b>Encoders</b><br/>spikes + sparse features</div>
+    <div style="padding:12px;border-radius:12px;background:#dbeafe;border:1px solid #93c5fd"><b>CCC Pool</b><br/>concept recruitment</div>
+    <div style="padding:12px;border-radius:12px;background:#ffffff;border:1px solid #dbeafe"><b>SDM + GNW</b><br/>memory + broadcast</div>
+    <div style="padding:12px;border-radius:12px;background:#dcfce7;border:1px solid #86efac"><b>Output</b><br/>classification / retrieval / learning</div>
+  </div>
+  <p style="margin:14px 0 0 0;color:#334155">
+    Bio-ARN binds visual and linguistic inputs into shared concept cell clusters (CCCs), routes winners through sparse distributed
+    memory (SDM), then broadcasts the most useful concepts through the Global Neuronal Workspace (GNW) for reasoning, abstention, and continual learning.
+  </p>
+</div>
+"""
+
+
 def format_token_html(prompt: str, generated_tokens: list[str]) -> str:
     prompt_html = "".join(
         f"<span style='color:#94a3b8'>{html.escape(token)}</span>" for token in prompt
@@ -836,7 +970,9 @@ __all__ = [
     "LiveLearningOutcome",
     "LiveLearningSession",
     "MNISTDemoModel",
+    "MultimodalBindingSnapshot",
     "MultimodalDemoModel",
+    "OODAssessmentResult",
     "REPORTED_EFFICIENCY_X",
     "TextDemoModel",
     "TextGenerationDemoResult",
@@ -844,9 +980,11 @@ __all__ = [
     "create_live_learning_session",
     "format_token_html",
     "format_top_matches",
+    "get_architecture_diagram_html",
     "get_demo_overview_stats",
     "get_energy_dashboard_data",
     "get_mnist_model",
+    "get_multimodal_binding_snapshot",
     "get_multimodal_model",
     "get_text_model",
     "image_tensor_to_array",
