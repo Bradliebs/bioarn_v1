@@ -15,6 +15,7 @@ from bioarn.hierarchy.competition import CompetitiveLateralInhibition
 from bioarn.hierarchy.config import HierarchyConfig
 from bioarn.hierarchy.feature_binding import FeatureBinding
 from bioarn.hierarchy.receptive_fields import ReceptiveFieldExtractor
+from bioarn.predictive.hierarchy import PredictiveHierarchy
 from bioarn.scaling import AdaptiveCapacity, BatchedCCCPool
 
 
@@ -43,9 +44,21 @@ class HierarchyOutput:
     recruited: list[list[bool]]
     recruited_indices: list[list[int | None]]
     groupings: list[list[list[int]]] = field(default_factory=list)
+    predictive_states: list[torch.Tensor] = field(default_factory=list)
+    predictive_errors: list[torch.Tensor] = field(default_factory=list)
+    predictive_free_energy_trace: list[float] = field(default_factory=list)
+    predictive_converged: bool = False
 
     @property
     def final_features(self) -> torch.Tensor:
+        if self.predictive_states:
+            predictive = self.predictive_states[-1]
+            raw = self.layer_activations[-1].to(torch.float32)
+            if predictive.dim() == 1 and raw.dim() == 2:
+                predictive = predictive.unsqueeze(0)
+            if predictive.shape == raw.shape:
+                return normalize((raw + predictive.to(raw)).reshape(raw.shape[0], -1))
+            return predictive
         return self.layer_activations[-1]
 
 
@@ -435,6 +448,10 @@ class VisualHierarchy:
             if config.enable_binding
             else None
         )
+        self.predictive_hierarchy = None
+        if config.predictive is not None:
+            self.predictive_hierarchy = PredictiveHierarchy(list(config.concept_dims), config.predictive)
+            self._initialize_predictive_hierarchy()
         self.l4_label_counts: defaultdict[int, Counter[int]] = defaultdict(Counter)
         self.label_prototypes: dict[int, torch.Tensor] = {}
         self.label_counts: Counter[int] = Counter()
@@ -507,6 +524,105 @@ class VisualHierarchy:
         if float(feature.norm().item()) <= 1e-8:
             return torch.zeros_like(feature, dtype=torch.float32)
         return normalize(feature.reshape(1, -1).to(torch.float32)).squeeze(0)
+
+    @staticmethod
+    def _seed_predictive_weights(input_dim: int, output_dim: int) -> torch.Tensor:
+        weights = torch.zeros(output_dim, input_dim, dtype=torch.float32)
+        if input_dim <= 0 or output_dim <= 0:
+            return weights
+        lower_positions = torch.linspace(0, input_dim - 1, steps=output_dim).round().to(torch.long)
+        weights[torch.arange(output_dim), lower_positions] = 1.0
+        weights = weights + (0.01 * torch.randn_like(weights))
+        return normalize(weights)
+
+    def _initialize_predictive_hierarchy(self) -> None:
+        if self.predictive_hierarchy is None:
+            return
+        with torch.no_grad():
+            for layer in self.predictive_hierarchy.layers:
+                layer.W.copy_(
+                    self._seed_predictive_weights(
+                        input_dim=layer.input_dim,
+                        output_dim=layer.output_dim,
+                    )
+                )
+                layer.precision.fill_(float(layer.config.precision_init))
+                layer.state.zero_()
+
+    def _summarize_activations(
+        self,
+        activations: torch.Tensor,
+        confidences: torch.Tensor,
+        *,
+        target_dim: int,
+    ) -> torch.Tensor:
+        if activations.numel() == 0:
+            return torch.zeros(target_dim, dtype=torch.float32, device=activations.device)
+        batch = activations.to(torch.float32)
+        if batch.dim() == 1:
+            batch = batch.unsqueeze(0)
+        weights = confidences.to(device=batch.device, dtype=torch.float32).reshape(-1)
+        if weights.numel() != batch.shape[0]:
+            weights = torch.ones(batch.shape[0], device=batch.device, dtype=torch.float32)
+        weights = weights.clamp_min(0.0)
+        if float(weights.sum().item()) <= 1e-8:
+            weights = torch.ones_like(weights)
+        summary = (batch * weights.unsqueeze(-1)).sum(dim=0) / weights.sum()
+        return self._normalize_feature(summary)
+
+    def _predictive_signature(
+        self,
+        raw_signature: torch.Tensor,
+        states: list[torch.Tensor],
+        errors: list[torch.Tensor],
+    ) -> torch.Tensor:
+        parts: list[torch.Tensor] = [self._normalize_feature(raw_signature.reshape(-1))]
+        if states:
+            parts.append(self._normalize_feature(states[-1].reshape(-1)))
+            if len(states) > 1:
+                parts.append(self._normalize_feature(states[-2].reshape(-1)))
+        informative_errors = [error.reshape(-1) for error in errors[:-1] if float(error.norm().item()) > 1e-8]
+        if informative_errors:
+            parts.append(self._normalize_feature(torch.cat(informative_errors[:2], dim=0)))
+        return torch.cat(parts, dim=0)
+
+    def _raw_label_signature_from_output(self, output: HierarchyOutput) -> torch.Tensor:
+        parts = [
+            output.layer_inputs[0].reshape(-1),
+            output.layer_activations[1].reshape(-1),
+            output.layer_activations[2].reshape(-1),
+            output.layer_inputs[-1][0].reshape(-1),
+        ]
+        return torch.cat([part.to(torch.float32).reshape(-1) for part in parts], dim=0)
+
+    def _run_predictive_refinement(
+        self,
+        layer_results: list[LayerBatchResult],
+        *,
+        learn: bool,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[float], bool]:
+        if self.predictive_hierarchy is None:
+            return [], [], [], False
+
+        feedforward_states = [
+            self._summarize_activations(
+                result.activations,
+                result.confidences,
+                target_dim=layer.concept_dim,
+            )
+            for layer, result in zip(self.layers, layer_results, strict=False)
+        ]
+        predictive_output = self.predictive_hierarchy.settle_states(
+            feedforward_states,
+            num_iterations=max(1, int(self.config.predictive.settling_steps)),
+            learn=learn,
+        )
+        return (
+            predictive_output.states,
+            predictive_output.errors,
+            predictive_output.free_energy_trace,
+            predictive_output.converged,
+        )
 
     def _structure_score(self, image: torch.Tensor) -> float:
         frame = self.extractor._ensure_image(image)
@@ -678,13 +794,7 @@ class VisualHierarchy:
         return labels[best_index], float(similarities[best_index].item()), margin
 
     def _label_signature_from_output(self, output: HierarchyOutput) -> torch.Tensor:
-        parts = [
-            output.layer_inputs[0].reshape(-1),
-            output.layer_activations[1].reshape(-1),
-            output.layer_activations[2].reshape(-1),
-            output.layer_inputs[-1][0].reshape(-1),
-        ]
-        return torch.cat([part.to(torch.float32).reshape(-1) for part in parts], dim=0)
+        return self._raw_label_signature_from_output(output)
 
     def _predict_label(
         self,
@@ -693,7 +803,16 @@ class VisualHierarchy:
         final_confidence: float,
     ) -> tuple[int, float]:
         if not fired_indices:
-            return -1, 0.0
+            prototype_label, prototype_similarity, prototype_margin = self._prototype_prediction(
+                evidence_feature
+            )
+            if (
+                prototype_label is None
+                or prototype_similarity < 0.35
+                or prototype_margin < 0.005
+            ):
+                return -1, float(prototype_similarity)
+            return int(prototype_label), max(float(final_confidence), float(prototype_similarity))
 
         prototype_label, prototype_similarity, prototype_margin = self._prototype_prediction(
             evidence_feature
@@ -803,6 +922,13 @@ class VisualHierarchy:
                 l4_result.recruited[0] = True
                 l4_result.recruited_indices[0] = recruited.recruited_index
 
+        predictive_states, predictive_errors, predictive_free_energy_trace, predictive_converged = (
+            self._run_predictive_refinement(
+                [l1_result, l2_result, l3_result, l4_result],
+                learn=learn,
+            )
+        )
+
         output = HierarchyOutput(
             patches=patches,
             patch_grid=patch_grid,
@@ -838,6 +964,10 @@ class VisualHierarchy:
                 l4_result.recruited_indices,
             ],
             groupings=[grouping12, grouping23, grouping34],
+            predictive_states=predictive_states,
+            predictive_errors=predictive_errors,
+            predictive_free_energy_trace=predictive_free_energy_trace,
+            predictive_converged=predictive_converged,
         )
 
         if learn:

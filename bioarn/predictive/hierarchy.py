@@ -124,6 +124,30 @@ class PredictiveHierarchy(PCStack):
             states.append(state.expand(batch_size, -1).clone())
         return states
 
+    def _prepare_states(
+        self,
+        sensory_batch: torch.Tensor,
+        initial_states: list[torch.Tensor] | None = None,
+    ) -> list[torch.Tensor]:
+        if initial_states is None:
+            return self._initial_states(sensory_batch)
+        if len(initial_states) != len(self.layer_dims):
+            raise ValueError("initial_states must match the predictive hierarchy depth.")
+
+        states = [sensory_batch]
+        for level, (state, expected_dim) in enumerate(
+            zip(initial_states[1:], self.layer_dims[1:], strict=False),
+            start=1,
+        ):
+            state_batch, _ = _as_batch(state.to(device=sensory_batch.device, dtype=sensory_batch.dtype))
+            state_batch = _match_batch(state_batch, sensory_batch.shape[0])
+            if state_batch.shape[-1] != expected_dim:
+                raise ValueError(
+                    f"Hierarchy state at level {level} has dim {state_batch.shape[-1]}, expected {expected_dim}."
+                )
+            states.append(state_batch.clone())
+        return states
+
     def _evaluate_states(
         self, states: list[torch.Tensor]
     ) -> tuple[list[torch.Tensor], list[torch.Tensor], float]:
@@ -162,6 +186,7 @@ class PredictiveHierarchy(PCStack):
         for idx, layer in enumerate(self.layers):
             with torch.no_grad():
                 layer.state.copy_(states[idx + 1].detach().mean(dim=0))
+            layer.update_weights(errors[idx], states[idx + 1])
             layer.update_precision(errors[idx])
 
     def _store_last_state(self, states: list[torch.Tensor], errors: list[torch.Tensor], squeeze: bool) -> None:
@@ -192,18 +217,30 @@ class PredictiveHierarchy(PCStack):
         return float(mean_precision / (1.0 + mean_precision))
 
     def forward(
-        self, sensory_input: torch.Tensor, num_iterations: int = 10
+        self,
+        sensory_input: torch.Tensor,
+        num_iterations: int = 10,
+        learn: bool = True,
     ) -> HierarchyPerceptionOutput:
-        return self.perceive(sensory_input=sensory_input, num_iterations=num_iterations)
+        return self.perceive(
+            sensory_input=sensory_input,
+            num_iterations=num_iterations,
+            learn=learn,
+        )
 
     def perceive(
-        self, sensory_input: torch.Tensor, num_iterations: int = 10
+        self,
+        sensory_input: torch.Tensor,
+        num_iterations: int = 10,
+        *,
+        learn: bool = True,
+        initial_states: list[torch.Tensor] | None = None,
     ) -> HierarchyPerceptionOutput:
         if num_iterations < 1:
             raise ValueError("num_iterations must be at least 1.")
 
         sensory_batch, squeeze = _as_batch(sensory_input.to(torch.float32))
-        states = self._initial_states(sensory_batch)
+        states = self._prepare_states(sensory_batch, initial_states=initial_states)
         free_energy_trace: list[float] = []
         converged = False
         final_errors: list[torch.Tensor] = [torch.zeros_like(state) for state in states]
@@ -243,7 +280,8 @@ class PredictiveHierarchy(PCStack):
                 break
             previous_energy = accepted_energy
 
-        self._commit_states(states, final_errors)
+        if learn:
+            self._commit_states(states, final_errors)
         self._store_last_state(states, final_errors, squeeze=squeeze)
 
         surprise = (
@@ -258,6 +296,26 @@ class PredictiveHierarchy(PCStack):
             converged=converged,
             iterations_used=len(free_energy_trace),
             surprise=surprise,
+        )
+
+    def settle_states(
+        self,
+        states: list[torch.Tensor],
+        *,
+        num_iterations: int | None = None,
+        learn: bool = False,
+    ) -> HierarchyPerceptionOutput:
+        if len(states) != len(self.layer_dims):
+            raise ValueError("states must match the predictive hierarchy depth.")
+        return self.perceive(
+            sensory_input=states[0],
+            num_iterations=(
+                int(num_iterations)
+                if num_iterations is not None
+                else max(1, int(self.config.settling_steps))
+            ),
+            learn=learn,
+            initial_states=states,
         )
 
     def generate(

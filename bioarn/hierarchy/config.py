@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from bioarn.config import PredictiveConfig
+
 
 @dataclass
 class HierarchyConfig:
@@ -37,6 +39,7 @@ class HierarchyConfig:
     capacity_prune_interval: int = 256
     capacity_prune_min_presentations: int = 96
     capacity_prune_max_fire_count: int = 0
+    predictive: PredictiveConfig | None = None
 
     def __post_init__(self) -> None:
         height, width, channels = (int(value) for value in self.image_size)
@@ -84,6 +87,11 @@ class HierarchyConfig:
             raise ValueError("The first patch_size must evenly divide the image dimensions.")
         if any(max_size < pool_size for max_size, pool_size in zip(self.max_pool_sizes, self.pool_sizes, strict=False)):
             raise ValueError("Each max_pool_size must be greater than or equal to its pool_size.")
+        if self.predictive is not None:
+            self.predictive.num_levels = int(self.predictive.num_levels)
+            self.predictive.settling_steps = int(max(1, self.predictive.settling_steps))
+            if self.predictive.num_levels != self.num_layers:
+                raise ValueError("predictive.num_levels must match the hierarchy num_layers.")
 
     @property
     def height(self) -> int:

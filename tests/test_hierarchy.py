@@ -71,6 +71,27 @@ def test_hierarchy_free_energy_decreases() -> None:
     assert output.free_energy_trace[-1] <= output.free_energy_trace[0]
 
 
+def test_hierarchy_settle_states_is_pure_inference_when_disabled_learning() -> None:
+    hierarchy = make_identity_hierarchy()
+    original_weights = [layer.W.detach().clone() for layer in hierarchy.layers]
+
+    output = hierarchy.settle_states(
+        [
+            torch.tensor([0.9, 0.2, 0.1, 0.0]),
+            torch.tensor([0.8, 0.1, 0.0, 0.0]),
+            torch.tensor([0.7, 0.1, 0.0, 0.0]),
+            torch.tensor([0.6, 0.0, 0.0, 0.0]),
+        ],
+        num_iterations=4,
+        learn=False,
+    )
+
+    assert len(output.states) == 4
+    assert output.free_energy_trace[-1] <= output.free_energy_trace[0]
+    for before, layer in zip(original_weights, hierarchy.layers, strict=False):
+        assert torch.allclose(before, layer.W)
+
+
 def test_hierarchy_convergence() -> None:
     hierarchy = make_identity_hierarchy()
 
@@ -258,6 +279,33 @@ def test_hierarchy_process_shape() -> None:
     assert output.layer_activations[1].shape == (4, 20)
     assert output.layer_activations[2].shape == (1, 28)
     assert output.layer_activations[3].shape == (1, 14)
+
+
+def test_visual_hierarchy_predictive_refinement_opt_in() -> None:
+    hierarchy = VisualHierarchy(
+        HierarchyConfig(
+            pool_sizes=[20, 28, 36, 20],
+            concept_dims=[12, 20, 28, 14],
+            thresholds=[0.2, 0.28, 0.34, 0.4],
+            learning_rates=[0.05, 0.04, 0.03, 0.02],
+            predictive=PredictiveConfig(
+                gamma=0.15,
+                eta=0.01,
+                precision_init=1.0,
+                error_threshold=0.0,
+                settling_steps=4,
+            ),
+        )
+    )
+    for index in range(12):
+        hierarchy.learn(make_structured_visual_image(index % 3, index), label=index % 3)
+
+    output = hierarchy.process(make_structured_visual_image(2, 77))
+
+    assert output.predictive_states
+    assert output.predictive_errors
+    assert output.predictive_free_energy_trace[-1] <= output.predictive_free_energy_trace[0]
+    assert output.final_features.shape == (1, 14)
 
 
 def test_l1_patches_correct() -> None:
