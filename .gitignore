@@ -6,7 +6,8 @@ build/
 .eggs/
 *.egg
 .pytest_cache/
-data/
+/data/
+!bioarn/data/
 models/
 .coverage
 htmlcov/
