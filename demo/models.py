@@ -82,6 +82,10 @@ def _bundle_cccs_are_compatible(bundle: Any) -> bool:
     fusion = getattr(bundle, "fusion", None)
     if pool is None and fusion is not None:
         pool = getattr(fusion, "ccc_pool", None)
+    if pool is None:
+        return False
+    if not hasattr(pool, "initial_capacity") or not hasattr(pool, "max_capacity"):
+        return False
     cccs = getattr(pool, "cccs", None)
     if not cccs:
         return True
