@@ -23,12 +23,50 @@ class HierarchyConfig:
     include_position: bool = True
     class_count: int = 10
     min_input_norm: float = 1e-4
+    init_seed: int | None = 7
+    enable_spatial_attention: bool = True
+    attention_gain_strength: float = 0.35
+    attention_center_bias: float = 0.2
+    enable_lateral_inhibition: bool = True
+    inhibition_similarity_threshold: float = 0.9
+    enable_adaptive_capacity: bool = True
+    max_pool_sizes: list[int] | None = None
+    capacity_growth_factor: float = 1.35
+    capacity_abstention_window: int = 24
+    capacity_abstention_threshold: float = 0.35
+    capacity_prune_interval: int = 256
+    capacity_prune_min_presentations: int = 96
+    capacity_prune_max_fire_count: int = 0
 
     def __post_init__(self) -> None:
         height, width, channels = (int(value) for value in self.image_size)
         if height <= 0 or width <= 0 or channels <= 0:
             raise ValueError("image_size must contain positive integers.")
         self.image_size = (height, width, channels)
+        self.init_seed = None if self.init_seed is None else int(self.init_seed)
+        self.enable_spatial_attention = bool(self.enable_spatial_attention)
+        self.enable_lateral_inhibition = bool(self.enable_lateral_inhibition)
+        self.enable_adaptive_capacity = bool(self.enable_adaptive_capacity)
+        self.attention_gain_strength = float(max(0.0, self.attention_gain_strength))
+        self.attention_center_bias = float(max(0.0, self.attention_center_bias))
+        self.inhibition_similarity_threshold = float(self.inhibition_similarity_threshold)
+        self.capacity_growth_factor = float(max(1.1, self.capacity_growth_factor))
+        self.capacity_abstention_window = int(max(4, self.capacity_abstention_window))
+        self.capacity_abstention_threshold = float(
+            max(0.0, min(1.0, self.capacity_abstention_threshold))
+        )
+        self.capacity_prune_interval = int(max(0, self.capacity_prune_interval))
+        self.capacity_prune_min_presentations = int(max(1, self.capacity_prune_min_presentations))
+        self.capacity_prune_max_fire_count = int(max(0, self.capacity_prune_max_fire_count))
+
+        if self.max_pool_sizes is None:
+            growth_schedule = (1.5, 1.5, 1.5, 3.0)
+            self.max_pool_sizes = [
+                max(int(pool_size) + 4, int(round(float(pool_size) * growth_factor)))
+                for pool_size, growth_factor in zip(self.pool_sizes, growth_schedule, strict=False)
+            ]
+        else:
+            self.max_pool_sizes = [int(size) for size in self.max_pool_sizes]
 
         expected_lengths = (
             len(self.patch_sizes),
@@ -36,6 +74,7 @@ class HierarchyConfig:
             len(self.concept_dims),
             len(self.thresholds),
             len(self.learning_rates),
+            len(self.max_pool_sizes),
         )
         if any(length != self.num_layers for length in expected_lengths):
             raise ValueError("All per-layer lists must match num_layers.")
@@ -43,6 +82,8 @@ class HierarchyConfig:
             raise ValueError("VisualHierarchy currently supports exactly 4 layers.")
         if self.height % self.patch_size != 0 or self.width % self.patch_size != 0:
             raise ValueError("The first patch_size must evenly divide the image dimensions.")
+        if any(max_size < pool_size for max_size, pool_size in zip(self.max_pool_sizes, self.pool_sizes, strict=False)):
+            raise ValueError("Each max_pool_size must be greater than or equal to its pool_size.")
 
     @property
     def height(self) -> int:

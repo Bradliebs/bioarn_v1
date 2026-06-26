@@ -10,10 +10,12 @@ import torch.nn.functional as F
 
 from bioarn.config import CCCConfig, MarginGateConfig
 from bioarn.core.math_utils import cosine_similarity, normalize
+from bioarn.hierarchy.attention import SpatialAttention
+from bioarn.hierarchy.competition import CompetitiveLateralInhibition
 from bioarn.hierarchy.config import HierarchyConfig
 from bioarn.hierarchy.feature_binding import FeatureBinding
 from bioarn.hierarchy.receptive_fields import ReceptiveFieldExtractor
-from bioarn.scaling import BatchedCCCPool
+from bioarn.scaling import AdaptiveCapacity, BatchedCCCPool
 
 
 @dataclass
@@ -80,9 +82,42 @@ class HierarchyPool:
         margin_config: MarginGateConfig,
         *,
         min_input_norm: float = 1e-4,
+        max_capacity: int | None = None,
+        growth_factor: float = 1.35,
+        abstention_window: int = 24,
+        abstention_threshold: float = 0.35,
+        prune_interval: int = 256,
+        prune_min_presentations: int = 96,
+        prune_max_fire_count: int = 0,
+        enable_lateral_inhibition: bool = True,
+        inhibition_similarity_threshold: float = 0.9,
     ) -> None:
-        self.core = BatchedCCCPool(config, margin_config)
         self.min_input_norm = float(min_input_norm)
+        self.max_capacity = int(max_capacity or config.max_pool_size)
+        self.capacity_controller: AdaptiveCapacity | None = None
+        if self.max_capacity > int(config.max_pool_size):
+            self.capacity_controller = AdaptiveCapacity(
+                initial_size=int(config.max_pool_size),
+                max_size=self.max_capacity,
+                config=config,
+                margin_config=margin_config,
+                growth_factor=growth_factor,
+                abstention_window=abstention_window,
+                abstention_threshold=abstention_threshold,
+            )
+            self.core = self.capacity_controller.pool
+        else:
+            self.core = BatchedCCCPool(config, margin_config)
+        self.prune_interval = int(max(0, prune_interval))
+        self.prune_min_presentations = int(max(1, prune_min_presentations))
+        self.prune_max_fire_count = int(max(0, prune_max_fire_count))
+        self.inhibition = (
+            CompetitiveLateralInhibition(
+                similarity_threshold=inhibition_similarity_threshold,
+            )
+            if enable_lateral_inhibition
+            else None
+        )
 
     @property
     def config(self) -> CCCConfig:
@@ -97,7 +132,54 @@ class HierarchyPool:
         return self.core.concept_directions
 
     def get_pool_stats(self) -> dict[str, float | int]:
-        return self.core.get_pool_stats()
+        stats = self.core.get_pool_stats()
+        if self.capacity_controller is not None:
+            stats["current_capacity"] = int(self.core.config.max_pool_size)
+            stats["max_capacity"] = int(self.max_capacity)
+        return stats
+
+    def _sync_core(self) -> None:
+        if self.capacity_controller is not None and self.core is not self.capacity_controller.pool:
+            self.core = self.capacity_controller.pool
+
+    def _observe_abstention(self, abstained: bool) -> None:
+        if self.capacity_controller is None:
+            return
+        if abstained and self.capacity_controller.utilization() < 0.85:
+            return
+        self.capacity_controller.observe_abstention(abstained)
+        self._sync_core()
+
+    def _maybe_grow_or_prune(self) -> None:
+        if self.capacity_controller is None:
+            return
+        if self.core._first_uncommitted_index() is not None:
+            return
+        previous_size = int(self.core.config.max_pool_size)
+        self.capacity_controller.grow()
+        self._sync_core()
+        if int(self.core.config.max_pool_size) > previous_size:
+            return
+        self.capacity_controller.prune_dead_cccs(
+            min_presentations=self.prune_min_presentations,
+            max_fire_count=self.prune_max_fire_count,
+        )
+        self._sync_core()
+
+    def _maybe_prune(self, timestep: int) -> None:
+        if (
+            self.capacity_controller is None
+            or self.prune_interval <= 0
+            or timestep <= 0
+            or timestep % self.prune_interval != 0
+            or self.capacity_controller.utilization() < 0.85
+        ):
+            return
+        self.capacity_controller.prune_dead_cccs(
+            min_presentations=self.prune_min_presentations,
+            max_fire_count=self.prune_max_fire_count,
+        )
+        self._sync_core()
 
     @staticmethod
     def _ensure_batch(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -121,8 +203,8 @@ class HierarchyPool:
         concept = normalize((directions * weights).sum(dim=0, keepdim=True)).squeeze(0)
         return concept, float(weights.max().item())
 
-    @staticmethod
     def _select_winners(
+        self,
         indices: list[int],
         confidences: torch.Tensor,
         *,
@@ -130,6 +212,13 @@ class HierarchyPool:
     ) -> tuple[list[int], torch.Tensor]:
         if not indices:
             return [], torch.empty(0, dtype=torch.float32, device=confidences.device)
+        if self.inhibition is not None and len(indices) > 1:
+            return self.inhibition.select(
+                indices,
+                confidences.to(torch.float32),
+                self.core.concept_directions,
+                limit=limit,
+            )
         top_k = min(max(int(limit), 1), len(indices))
         values, order = torch.topk(confidences.to(torch.float32), k=top_k)
         selected_indices = [int(indices[position]) for position in order.tolist()]
@@ -144,6 +233,7 @@ class HierarchyPool:
     ) -> tuple[torch.Tensor, list[list[int]], torch.Tensor]:
         """Infer concept activations without mutating the pool."""
 
+        self._sync_core()
         batch, _ = self._ensure_batch(raw_input)
         device = batch.device
         concepts = torch.zeros(
@@ -218,6 +308,7 @@ class HierarchyPool:
     ) -> _LayerSampleResult:
         """Run one online learning step for a single input vector."""
 
+        self._sync_core()
         batch, _ = self._ensure_batch(raw_input)
         if float(batch.norm().item()) <= self.min_input_norm:
             return _LayerSampleResult(
@@ -231,10 +322,12 @@ class HierarchyPool:
         state = self.core._vectorized_state(batch, timestep=timestep)
         fired_mask = state.fired.squeeze(-1)
         fired_indices = fired_mask.nonzero(as_tuple=False).reshape(-1).tolist()
+        self._observe_abstention(not fired_indices)
 
         recruited = False
         recruited_index: int | None = None
         if allow_recruit and not fired_indices:
+            self._maybe_grow_or_prune()
             recruited_index, recruited_output = self.core.recruit(batch, timestep=timestep)
             if recruited_index is not None and recruited_output is not None:
                 recruited = True
@@ -258,6 +351,7 @@ class HierarchyPool:
                 limit=winner_limit,
             )
 
+        self._maybe_prune(timestep)
         concept, confidence = self._aggregate(
             [int(index) for index in fired_indices],
             winner_confidences,
@@ -280,9 +374,11 @@ class HierarchyPool:
     ) -> _LayerSampleResult | None:
         """Force a new concept recruitment for supervised specialization."""
 
+        self._sync_core()
         batch, _ = self._ensure_batch(raw_input)
         if float(batch.norm().item()) <= self.min_input_norm:
             return None
+        self._maybe_grow_or_prune()
         recruited_index, recruited_output = self.core.recruit(batch, timestep=timestep)
         if recruited_index is None or recruited_output is None:
             return None
@@ -310,9 +406,20 @@ class VisualHierarchy:
 
     def __init__(self, config: HierarchyConfig):
         self.config = config
+        if self.config.init_seed is not None:
+            torch.manual_seed(int(self.config.init_seed))
         self.extractor = ReceptiveFieldExtractor(
             config.image_size,
             include_position=config.include_position,
+        )
+        self.attention = (
+            SpatialAttention(
+                config.image_size,
+                gain_strength=config.attention_gain_strength,
+                center_bias=config.attention_center_bias,
+            )
+            if config.enable_spatial_attention
+            else None
         )
         self.layers = [
             self._build_layer("V1", config.l1_input_dim, config.concept_dims[0], 0),
@@ -320,8 +427,11 @@ class VisualHierarchy:
             self._build_layer("V4", 4 * config.concept_dims[1], config.concept_dims[2], 2),
             self._build_layer("IT", config.concept_dims[2], config.concept_dims[3], 3),
         ]
+        binding_pool_sizes = (
+            config.max_pool_sizes if config.enable_adaptive_capacity else config.pool_sizes
+        )
         self.binding = (
-            FeatureBinding(config.pool_sizes, binding_strength=config.binding_strength)
+            FeatureBinding(binding_pool_sizes, binding_strength=config.binding_strength)
             if config.enable_binding
             else None
         )
@@ -366,6 +476,19 @@ class VisualHierarchy:
                 ccc_config,
                 margin_config,
                 min_input_norm=self.config.min_input_norm,
+                max_capacity=(
+                    int(self.config.max_pool_sizes[layer_index])
+                    if self.config.enable_adaptive_capacity
+                    else int(self.config.pool_sizes[layer_index])
+                ),
+                growth_factor=self.config.capacity_growth_factor,
+                abstention_window=self.config.capacity_abstention_window,
+                abstention_threshold=self.config.capacity_abstention_threshold,
+                prune_interval=self.config.capacity_prune_interval,
+                prune_min_presentations=self.config.capacity_prune_min_presentations,
+                prune_max_fire_count=self.config.capacity_prune_max_fire_count,
+                enable_lateral_inhibition=self.config.enable_lateral_inhibition,
+                inhibition_similarity_threshold=self.config.inhibition_similarity_threshold,
             ),
             input_dim=int(input_dim),
             concept_dim=int(concept_dim),
@@ -621,6 +744,18 @@ class VisualHierarchy:
             patch_size=self.config.patch_size,
             stride=self.config.patch_size,
         )
+        if self.attention is not None and patches:
+            frame = self.extractor._ensure_image(image)
+            gains = self.attention.patch_gains(
+                frame,
+                self.extractor.last_patch_positions,
+                patch_size=self.config.patch_size,
+            )
+            patches = self.attention.apply_to_patches(
+                patches,
+                gains,
+                sensory_dim=self.config.patch_size * self.config.patch_size * self.config.channels,
+            )
         patch_grid = self.extractor.last_grid_shape
         l1_inputs = self._stack(patches, self.config.l1_input_dim)
         l1_result = (
