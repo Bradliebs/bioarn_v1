@@ -37,3 +37,36 @@
 - Waiting on Neo to wire modules into system.py
 - Text generation v3 (dual_processor) ready as baseline
 - Will feed results back to team for decision-making
+
+
+## Session 2026-06-25T18:56:46Z
+
+**Mission:** Recording post-fix comparison outcomes
+
+- Reran `improvement_comparison.py` and `real_cifar_comparison.py`
+- Added repo-root bootstrap so the synthetic comparison script runs from the repository root
+- Synthetic CIFAR-10 now shows ensemble OOD AUROC = 1.000, confirming the inversion fix
+- Real CIFAR-10 result snapshot: hierarchy 26.4% / 1.000 AUROC, ensemble 23.4% / 0.743, baseline 9.8% / 0.778
+- Key takeaway: hierarchy remains the strongest real-data path; ensemble still needs tuning despite the AUROC fix
+
+
+## Session 2026-06-25T23:43:17Z
+
+**Mission:** Recording CIFAR benchmark follow-up
+
+- Re-ran `experiments/cifar_tuning.py`; `hierarchy-control` remained best at 26.4% accuracy
+- Added `experiments/cifar_scaling.py` to test 5000 samples with interleaving and 3 passes
+- Best scaling result reached 24.4% accuracy / 1.000 OOD AUROC, below the 2k hierarchy benchmark
+- Committed `eb2ea53`
+- Team context: Morpheus improved ensemble real-data OOD AUROC to 0.861, but hierarchy still leads overall accuracy
+
+
+## Session 2026-06-26T10:30:40Z
+
+**Mission:** Recording multimodal validation and complementary-routing win
+
+- Validated the shared-CCC multimodal demo with retrieval_accuracy = 1.000 and 3/3 shared CCCs
+- Replaced abstention-only combination logic with calibrated complementary routing in `experiments/real_cifar_comparison.py`
+- Observed real CIFAR-10 results moved to hierarchy 29.0% / 1.000 AUROC and both 30.0% / 1.000
+- Committed `faaa60f`
+- Team context: Neo's hierarchy upgrades simultaneously raised the standalone hierarchy ceiling to 30.0%

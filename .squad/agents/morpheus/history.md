@@ -41,3 +41,36 @@ Recovery commit (d99976c) included sequence memory module, memory config, extend
 - Waiting on Neo for wired system.py
 - Switch must clear test suite blocker (venv, PyYAML, gradio)
 - Results will be measured in Trinity's comparison experiments
+
+
+## Session 2026-06-25T18:56:46Z
+
+**Mission:** Recording text generation v3 validation
+
+- Validated `experiments/text_gen_v3.py` against the char-only baseline
+- v3 produced prompt-aware phrases while the baseline collapsed into repetitive output
+- Metric snapshot: `real_word%` 53.6%, repetition 0.31 vs baseline 100.0% / 0.93
+- Targeted regression suites passed: 27/27
+- Follow-up: improve repo-root script usability and continue reducing awkward phrase splices while preserving diversity
+
+
+## Session 2026-06-25T23:43:17Z
+
+**Mission:** Recording real CIFAR ensemble tuning result
+
+- Tuned `bioarn/ensemble/voting.py` for conservative positive confidence and normalized vote-mass scoring
+- Real CIFAR-10 ensemble OOD AUROC improved from 0.743 to 0.861, beating the 0.778 baseline
+- Accuracy improved from 23.4% to 25.8%
+- Targeted suites passed: 44/44; committed `afec6d1`
+- Team context: Trinity's `hierarchy-control` run remains the current real-data accuracy benchmark at 26.4%
+
+
+## Session 2026-06-26T10:30:40Z
+
+**Mission:** Recording portable Loihi 2 export delivery
+
+- Added `bioarn.export` for CCC / hierarchy -> Loihi 2 graph export with an NIR sidecar
+- Export path avoids a hard Lava dependency while preserving round-trippable graph structure
+- Targeted export validation passed
+- Committed `0b4a32a`
+- Team context: the export path now complements the latest CIFAR and multimodal gains with a deployment-facing artifact story

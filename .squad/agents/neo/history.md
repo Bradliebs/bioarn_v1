@@ -36,3 +36,14 @@
 - Switch must confirm venv clean and dependencies restored (P0)
 - Must preserve all 411 passing tests as baseline
 - Results feeding into Trinity's comparison experiments
+
+
+## Session 2026-06-26T10:30:40Z
+
+**Mission:** Recording hierarchy breakthrough and sprint convergence
+
+- Broke the real CIFAR-10 hierarchy ceiling from 26.4% to 30.0% with spatial V1 attention gating, stronger competition/lateral inhibition, and adaptive IT capacity/pruning
+- Preserved 1.000 OOD AUROC on hierarchy and combined runs
+- Targeted validation passed: 67 tests
+- Committed `627e3e3`
+- Team context: Trinity's complementary routing now lets `both` edge hierarchy on observed runs (30.0% vs 29.0%)
