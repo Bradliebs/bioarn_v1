@@ -60,7 +60,11 @@ def _build_hierarchy() -> VisualHierarchy:
     )
 
 
-def _build_permuted_mnist_trainer() -> VisionTrainer:
+def _build_mnist_trainer(
+    *,
+    train_samples: int,
+    test_samples: int,
+) -> VisionTrainer:
     return VisionTrainer(
         VisionTrainConfig(
             input_dim=784,
@@ -70,9 +74,9 @@ def _build_permuted_mnist_trainer() -> VisionTrainer:
             use_batched=True,
             batch_size=32,
             learning_rate=0.02,
-            num_train_samples=1000,
-            num_test_samples=200,
-            preprocessing_warmup_samples=100,
+            num_train_samples=train_samples,
+            num_test_samples=test_samples,
+            preprocessing_warmup_samples=min(train_samples, max(50, train_samples // 3)),
         )
     )
 
@@ -274,6 +278,7 @@ def _run_continual_benchmark(
     *,
     name: str,
     data_source: str,
+    task_groups: Sequence[Sequence[int]] | None,
     train_by_task: Sequence[Sequence[tuple[torch.Tensor, int | None]]],
     test_by_task: Sequence[Sequence[tuple[torch.Tensor, int | None]]],
     random_baseline_fn: Callable[[int], float],
@@ -327,7 +332,7 @@ def _run_continual_benchmark(
     return ContinualResult(
         name=name,
         data_source=data_source,
-        task_groups=list(TASK_GROUPS),
+        task_groups=[tuple(int(label) for label in group) for group in (task_groups or TASK_GROUPS)],
         evaluation_matrix=matrix,
         stage_summaries=stage_summaries,
         forgetting_by_task=forgetting_by_task,
@@ -362,6 +367,7 @@ def run_split_cifar10(
     return _run_continual_benchmark(
         name="Split-CIFAR-10",
         data_source=data_source,
+        task_groups=TASK_GROUPS,
         train_by_task=train_by_task,
         test_by_task=test_by_task,
         random_baseline_fn=lambda _stage_index: 1.0 / len(TASK_GROUPS[0]),
@@ -399,6 +405,7 @@ def run_class_incremental_cifar10(
     return _run_continual_benchmark(
         name="Class-Incremental CIFAR-10",
         data_source=data_source,
+        task_groups=TASK_GROUPS,
         train_by_task=train_by_task,
         test_by_task=test_by_task,
         random_baseline_fn=lambda _stage_index: 1.0 / len(TASK_GROUPS[0]),
@@ -425,7 +432,10 @@ def run_permuted_mnist(
     num_tasks: int,
     seed: int,
 ) -> ContinualResult:
-    trainer = _build_permuted_mnist_trainer()
+    trainer = _build_mnist_trainer(
+        train_samples=train_samples,
+        test_samples=test_samples,
+    )
     train_stream = MNISTStream(split="train", data_dir="data", flatten=True, normalize=True, shuffle=True, seed=seed)
     test_stream = MNISTStream(split="test", data_dir="data", flatten=True, normalize=True, shuffle=False, seed=seed)
     base_train = take_samples(train_stream, train_samples)
@@ -470,6 +480,7 @@ def run_permuted_mnist(
     result = _run_continual_benchmark(
         name="Permuted-MNIST",
         data_source="mnist",
+        task_groups=task_groups,
         train_by_task=train_by_task,
         test_by_task=test_by_task,
         random_baseline_fn=lambda _stage_index: 0.1,
@@ -477,8 +488,114 @@ def run_permuted_mnist(
         eval_stage_fn=eval_stage,
         cumulative_eval_fn=None,
     )
-    result.task_groups = task_groups
     return result
+
+
+def _load_mnist_task_data(
+    *,
+    train_per_task: int,
+    test_per_task: int,
+    seed: int,
+) -> tuple[list[list[tuple[torch.Tensor, int | None]]], list[list[tuple[torch.Tensor, int | None]]]]:
+    train_stream = MNISTStream(
+        split="train",
+        data_dir="data",
+        flatten=True,
+        normalize=True,
+        shuffle=True,
+        seed=seed,
+    )
+    test_stream = MNISTStream(
+        split="test",
+        data_dir="data",
+        flatten=True,
+        normalize=True,
+        shuffle=False,
+        seed=seed,
+    )
+    train_by_task = [
+        take_samples(train_stream, train_per_task, allowed_labels=set(task_group))
+        for task_group in TASK_GROUPS
+    ]
+    test_by_task = [
+        take_samples(test_stream, test_per_task, allowed_labels=set(task_group))
+        for task_group in TASK_GROUPS
+    ]
+
+    for task_index, (train_samples_for_task, test_samples_for_task) in enumerate(
+        zip(train_by_task, test_by_task, strict=False)
+    ):
+        if len(train_samples_for_task) < train_per_task:
+            raise RuntimeError(
+                f"MNIST task {task_index + 1} only yielded {len(train_samples_for_task)} training samples."
+            )
+        if len(test_samples_for_task) < test_per_task:
+            raise RuntimeError(
+                f"MNIST task {task_index + 1} only yielded {len(test_samples_for_task)} test samples."
+            )
+
+    return train_by_task, test_by_task
+
+
+def run_split_mnist(
+    *,
+    train_samples: int,
+    test_samples: int,
+    seed: int,
+) -> ContinualResult:
+    trainer = _build_mnist_trainer(
+        train_samples=train_samples,
+        test_samples=test_samples,
+    )
+    train_by_task, test_by_task = _load_mnist_task_data(
+        train_per_task=train_samples,
+        test_per_task=test_samples,
+        seed=seed,
+    )
+
+    def train_stage(
+        stage_index: int,
+        task_samples: Sequence[tuple[torch.Tensor, int | None]],
+        stage_name: str,
+    ) -> list[int]:
+        del stage_index
+        print(
+            f"[{stage_name}] train_samples={len(task_samples)} "
+            f"task_classes={sorted({int(label) for _, label in task_samples if label is not None})}"
+        )
+        trainer.train_online(
+            list(task_samples),
+            num_samples=len(task_samples),
+            num_passes=1,
+            interleave_classes=True,
+        )
+        committed = int(trainer.get_ccc_analysis()["committed_cccs"])
+        print(f"[{stage_name}] committed_cccs={committed}")
+        return [committed]
+
+    def eval_stage(samples: Sequence[tuple[torch.Tensor, int | None]]) -> dict[str, float]:
+        metrics = trainer.evaluate(list(samples), num_samples=len(samples))
+        return {
+            "accuracy": float(metrics["accuracy"]),
+            "coverage": float(metrics["coverage"]),
+            "abstention_rate": float(metrics["abstention_rate"]),
+        }
+
+    def cumulative_eval(stage_index: int) -> float:
+        metrics = eval_stage(_combine_task_samples(test_by_task, upto=stage_index))
+        return float(metrics["accuracy"])
+
+    return _run_continual_benchmark(
+        name="Split-MNIST",
+        data_source="mnist",
+        task_groups=TASK_GROUPS,
+        train_by_task=train_by_task,
+        test_by_task=test_by_task,
+        random_baseline_fn=lambda _stage_index: 1.0 / len(TASK_GROUPS[0]),
+        train_stage_fn=train_stage,
+        eval_stage_fn=eval_stage,
+        cumulative_eval_fn=cumulative_eval,
+    )
 
 
 def _load_cifar_task_data(
