@@ -40,6 +40,23 @@ class RunResult:
     ood_auroc: float
 
 
+@dataclass(frozen=True)
+class HybridRoutingPolicy:
+    hierarchy_threshold: float
+    ensemble_override_margin: float
+    min_ensemble_agreement: float
+
+
+@dataclass(frozen=True)
+class HybridPredictionRecord:
+    label: int | None
+    hierarchy_prediction: int
+    hierarchy_confidence: float
+    ensemble_prediction: int
+    ensemble_confidence: float
+    ensemble_agreement: float
+
+
 def _auroc(id_scores: list[float], ood_scores: list[float]) -> float:
     """Trapezoidal AUROC with ID confidence as the positive class."""
 
@@ -96,6 +113,36 @@ def _interleave_by_class(
 def _make_ood_samples(num_samples: int, seed: int = OOD_SEED) -> list[torch.Tensor]:
     generator = torch.Generator().manual_seed(seed)
     return [torch.rand(3072, generator=generator) for _ in range(num_samples)]
+
+
+def _ensemble_signal_strength(result) -> float:
+    if result.abstained:
+        return 0.0
+    agreement_bonus = 0.7 + (0.3 * float(result.agreement))
+    abstention_penalty = 1.0 - (0.35 * float(result.abstention_fraction))
+    return float(max(0.0, min(1.0, float(result.confidence) * agreement_bonus * abstention_penalty)))
+
+
+def _collect_hybrid_records(
+    hierarchy: VisualHierarchy,
+    pool: EnsemblePool,
+    samples: list[tuple[torch.Tensor, int | None]],
+) -> list[HybridPredictionRecord]:
+    records: list[HybridPredictionRecord] = []
+    for tensor, label in samples:
+        hierarchy_prediction, hierarchy_confidence = hierarchy.classify(tensor)
+        ensemble_result = pool.classify(tensor)
+        records.append(
+            HybridPredictionRecord(
+                label=None if label is None else int(label),
+                hierarchy_prediction=int(hierarchy_prediction),
+                hierarchy_confidence=float(hierarchy_confidence),
+                ensemble_prediction=-1 if ensemble_result.abstained else int(ensemble_result.predicted_class),
+                ensemble_confidence=_ensemble_signal_strength(ensemble_result),
+                ensemble_agreement=float(ensemble_result.agreement),
+            )
+        )
+    return records
 
 
 def _base_train_config() -> VisionTrainConfig:
@@ -274,11 +321,17 @@ def run_both(
             hierarchy.learn(tensor, label=int(label))
 
     EnsembleTrainer(pool, log_every=max(1, len(interleaved_train) // 10)).train(interleaved_train)
+    calibration_records = _collect_hybrid_records(hierarchy, pool, interleaved_train[::6])
+    ood_records = _collect_hybrid_records(hierarchy, pool, [(tensor, None) for tensor in ood_samples[: min(100, len(ood_samples))]])
+    routing_policy = _calibrate_hybrid_policy(
+        calibration_records,
+        ood_records,
+    )
 
     total = correct = abstained = 0
     id_scores: list[float] = []
     for tensor, label in test_samples:
-        final_prediction, final_confidence = _classify_with_fallback(hierarchy, pool, tensor)
+        final_prediction, final_confidence = _classify_hybrid(hierarchy, pool, tensor, routing_policy)
         total += 1
         if final_prediction == -1:
             abstained += 1
@@ -289,7 +342,7 @@ def run_both(
             correct += 1
 
     ood_scores = [
-        _classify_with_fallback(hierarchy, pool, tensor)[1]
+        _classify_hybrid(hierarchy, pool, tensor, routing_policy)[1]
         for tensor in ood_samples
     ]
     return RunResult(
@@ -300,19 +353,111 @@ def run_both(
     )
 
 
-def _classify_with_fallback(
+def _classify_hybrid(
     hierarchy: VisualHierarchy,
     pool: EnsemblePool,
     tensor: torch.Tensor,
+    policy: HybridRoutingPolicy,
 ) -> tuple[int, float]:
     hierarchy_prediction, hierarchy_confidence = hierarchy.classify(tensor)
-    if hierarchy_prediction != -1:
-        return int(hierarchy_prediction), float(hierarchy_confidence)
-
     ensemble_result = pool.classify(tensor)
-    if ensemble_result.abstained:
-        return -1, 0.0
-    return int(ensemble_result.predicted_class), float(ensemble_result.confidence)
+    record = HybridPredictionRecord(
+        label=None,
+        hierarchy_prediction=int(hierarchy_prediction),
+        hierarchy_confidence=float(hierarchy_confidence),
+        ensemble_prediction=-1 if ensemble_result.abstained else int(ensemble_result.predicted_class),
+        ensemble_confidence=_ensemble_signal_strength(ensemble_result),
+        ensemble_agreement=float(ensemble_result.agreement),
+    )
+    return _classify_hybrid_record(record, policy)
+
+
+def _classify_hybrid_record(
+    record: HybridPredictionRecord,
+    policy: HybridRoutingPolicy,
+) -> tuple[int, float]:
+    if record.hierarchy_prediction == -1:
+        if record.ensemble_prediction == -1:
+            return -1, 0.0
+        return record.ensemble_prediction, record.ensemble_confidence
+
+    if record.ensemble_prediction == -1:
+        return record.hierarchy_prediction, record.hierarchy_confidence
+
+    if record.hierarchy_confidence < policy.hierarchy_threshold:
+        return record.ensemble_prediction, record.ensemble_confidence
+
+    if (
+        record.ensemble_prediction != record.hierarchy_prediction
+        and record.ensemble_agreement >= policy.min_ensemble_agreement
+        and record.ensemble_confidence > record.hierarchy_confidence + policy.ensemble_override_margin
+    ):
+        return record.ensemble_prediction, record.ensemble_confidence
+
+    return record.hierarchy_prediction, record.hierarchy_confidence
+
+
+def _calibrate_hybrid_policy(
+    calibration_records: list[HybridPredictionRecord],
+    ood_records: list[HybridPredictionRecord],
+) -> HybridRoutingPolicy:
+    candidate_thresholds = (0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9)
+    candidate_margins = (0.0, 0.05, 0.1, 0.15)
+    candidate_agreements = (0.5, 0.6, 0.7, 0.8, 1.0)
+
+    best_policy = HybridRoutingPolicy(
+        hierarchy_threshold=0.65,
+        ensemble_override_margin=0.05,
+        min_ensemble_agreement=0.7,
+    )
+    best_score = (-1.0, -1.0, -1.0)
+
+    for threshold in candidate_thresholds:
+        for margin in candidate_margins:
+            for min_agreement in candidate_agreements:
+                policy = HybridRoutingPolicy(
+                    hierarchy_threshold=threshold,
+                    ensemble_override_margin=margin,
+                    min_ensemble_agreement=min_agreement,
+                )
+                accuracy, auroc, ensemble_usage = _evaluate_hybrid_policy(
+                    calibration_records,
+                    ood_records,
+                    policy,
+                )
+                score = (accuracy, auroc, ensemble_usage)
+                if score > best_score:
+                    best_score = score
+                    best_policy = policy
+
+    return best_policy
+
+
+def _evaluate_hybrid_policy(
+    calibration_records: list[HybridPredictionRecord],
+    ood_records: list[HybridPredictionRecord],
+    policy: HybridRoutingPolicy,
+) -> tuple[float, float, float]:
+    total = correct = ensemble_routed = 0
+    id_scores: list[float] = []
+
+    for record in calibration_records:
+        predicted, confidence = _classify_hybrid_record(record, policy)
+        if predicted != record.hierarchy_prediction or abs(confidence - record.hierarchy_confidence) > 1e-6:
+            ensemble_routed += 1
+        total += 1
+        if predicted != -1:
+            id_scores.append(float(confidence))
+        else:
+            id_scores.append(0.0)
+        if record.label is not None and predicted == record.label:
+            correct += 1
+
+    ood_scores = [_classify_hybrid_record(record, policy)[1] for record in ood_records]
+    accuracy = correct / max(total, 1)
+    auroc = _auroc(id_scores, ood_scores)
+    usage_rate = ensemble_routed / max(total, 1)
+    return accuracy, auroc, usage_rate
 
 
 def _format_table(rows: list[RunResult]) -> str:
