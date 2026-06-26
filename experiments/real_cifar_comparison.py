@@ -176,7 +176,7 @@ def _workspace_config() -> GNWConfig:
     )
 
 
-def _build_hierarchy(*, predictive: bool = False) -> VisualHierarchy:
+def _build_hierarchy(*, predictive: bool = False, feedback_strength: float = 0.0) -> VisualHierarchy:
     return VisualHierarchy(
         HierarchyConfig(
             image_size=(32, 32, 3),
@@ -186,6 +186,7 @@ def _build_hierarchy(*, predictive: bool = False) -> VisualHierarchy:
             thresholds=[0.25, 0.3, 0.35, 0.4],
             learning_rates=[0.05, 0.03, 0.02, 0.01],
             class_count=10,
+            feedback_strength=feedback_strength,
             predictive=(
                 PredictiveConfig(
                     gamma=0.12,
@@ -309,8 +310,12 @@ def run_hierarchy(
     ood_samples: list[torch.Tensor],
     *,
     predictive: bool = False,
+    feedback_strength: float = 0.0,
 ) -> RunResult:
-    hierarchy = _build_hierarchy(predictive=predictive)
+    hierarchy = _build_hierarchy(
+        predictive=predictive,
+        feedback_strength=feedback_strength,
+    )
     interleaved_train = _interleave_by_class(train_samples)
     warmup_end = len(interleaved_train) // 3
 
@@ -334,8 +339,16 @@ def run_hierarchy(
             correct += 1
 
     ood_scores = [float(hierarchy.classify(tensor)[1]) for tensor in ood_samples]
+    if predictive and feedback_strength > 0.0:
+        name = "hierarchy+predictive+feedback"
+    elif predictive:
+        name = "hierarchy+predictive"
+    elif feedback_strength > 0.0:
+        name = "hierarchy+feedback"
+    else:
+        name = "hierarchy"
     return RunResult(
-        name="hierarchy+predictive" if predictive else "hierarchy",
+        name=name,
         accuracy=correct / max(total, 1),
         abstention_rate=abstained / max(total, 1),
         ood_auroc=_auroc(id_scores, ood_scores),
@@ -570,6 +583,10 @@ def run_experiment() -> list[RunResult]:
         ("baseline", run_baseline),
         ("workspace", run_workspace),
         ("hierarchy", run_hierarchy),
+        (
+            "hierarchy+feedback",
+            lambda tr, te, od: run_hierarchy(tr, te, od, feedback_strength=0.2),
+        ),
         ("hierarchy+predictive", lambda tr, te, od: run_hierarchy(tr, te, od, predictive=True)),
         ("ensemble", run_ensemble),
         ("both", run_both),

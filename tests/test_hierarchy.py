@@ -202,7 +202,7 @@ def test_generation_different_concepts() -> None:
     assert not torch.allclose(first, second)
 
 
-from bioarn.hierarchy import HierarchyConfig, VisualHierarchy
+from bioarn.hierarchy import HierarchyConfig, HierarchyOutput, VisualHierarchy
 from bioarn.training import VisionTrainConfig, VisionTrainer
 
 
@@ -261,6 +261,35 @@ def train_visual_hierarchy(
     return hierarchy
 
 
+def make_feedback_context_output(config: HierarchyConfig) -> HierarchyOutput:
+    return HierarchyOutput(
+        patches=[],
+        patch_grid=(4, 4),
+        layer_inputs=[
+            torch.zeros(16, config.l1_input_dim),
+            torch.zeros(4, 4 * config.concept_dims[0]),
+            torch.zeros(1, 4 * config.concept_dims[1]),
+            torch.zeros(1, config.concept_dims[2]),
+        ],
+        layer_activations=[
+            torch.ones(16, config.concept_dims[0]),
+            torch.ones(4, config.concept_dims[1]),
+            torch.ones(1, config.concept_dims[2]),
+            torch.ones(1, config.concept_dims[3]),
+        ],
+        fired_indices=[[[] for _ in range(16)], [[] for _ in range(4)], [[]], [[]]],
+        confidences=[
+            torch.zeros(16),
+            torch.zeros(4),
+            torch.zeros(1),
+            torch.zeros(1),
+        ],
+        recruited=[[False] * 16, [False] * 4, [False], [False]],
+        recruited_indices=[[None] * 16, [None] * 4, [None], [None]],
+        groupings=[],
+    )
+
+
 def test_hierarchy_init() -> None:
     hierarchy = VisualHierarchy(make_visual_hierarchy_config())
 
@@ -279,6 +308,47 @@ def test_hierarchy_process_shape() -> None:
     assert output.layer_activations[1].shape == (4, 20)
     assert output.layer_activations[2].shape == (1, 28)
     assert output.layer_activations[3].shape == (1, 14)
+
+
+def test_visual_hierarchy_feedback_modulates_lower_layers() -> None:
+    base_config = make_visual_hierarchy_config()
+    feedback_config = make_visual_hierarchy_config()
+    feedback_config.feedback_strength = 0.5
+
+    baseline = VisualHierarchy(base_config)
+    feedback = VisualHierarchy(feedback_config)
+    for index in range(8):
+        sample = make_structured_visual_image(index % 4, 700 + index)
+        baseline.learn(sample, label=index % 4)
+        feedback.learn(sample, label=index % 4)
+    feedback.feedback_v2_to_v1.fill_(1.0)
+    feedback.feedback_v4_to_v2.fill_(1.0)
+    feedback.feedback_it_to_v4.fill_(1.0)
+    feedback.last_output = make_feedback_context_output(feedback_config)
+
+    image = make_structured_visual_image(2, 71)
+    baseline_output = baseline.process(image)
+    feedback_output = feedback.process(image)
+
+    assert feedback_output.layer_activations[0].norm().item() > baseline_output.layer_activations[0].norm().item()
+    assert feedback_output.layer_activations[1].norm().item() > baseline_output.layer_activations[1].norm().item()
+    assert feedback_output.layer_activations[2].norm().item() > baseline_output.layer_activations[2].norm().item()
+
+
+def test_visual_hierarchy_feedback_connections_learn_locally() -> None:
+    config = make_visual_hierarchy_config()
+    config.feedback_strength = 0.3
+    hierarchy = VisualHierarchy(config)
+
+    before_v2 = hierarchy.feedback_v2_to_v1.clone()
+    before_v4 = hierarchy.feedback_v4_to_v2.clone()
+    before_it = hierarchy.feedback_it_to_v4.clone()
+
+    hierarchy.learn(make_structured_visual_image(3, 133), label=3)
+
+    assert not torch.allclose(hierarchy.feedback_v2_to_v1, before_v2)
+    assert not torch.allclose(hierarchy.feedback_v4_to_v2, before_v4)
+    assert not torch.allclose(hierarchy.feedback_it_to_v4, before_it)
 
 
 def test_visual_hierarchy_predictive_refinement_opt_in() -> None:

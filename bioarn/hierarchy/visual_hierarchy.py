@@ -452,6 +452,21 @@ class VisualHierarchy:
         if config.predictive is not None:
             self.predictive_hierarchy = PredictiveHierarchy(list(config.concept_dims), config.predictive)
             self._initialize_predictive_hierarchy()
+        self.feedback_v2_to_v1 = torch.zeros(
+            config.concept_dims[0],
+            config.concept_dims[1],
+            dtype=torch.float32,
+        )
+        self.feedback_v4_to_v2 = torch.zeros(
+            config.concept_dims[1],
+            config.concept_dims[2],
+            dtype=torch.float32,
+        )
+        self.feedback_it_to_v4 = torch.zeros(
+            config.concept_dims[2],
+            config.concept_dims[3],
+            dtype=torch.float32,
+        )
         self.l4_label_counts: defaultdict[int, Counter[int]] = defaultdict(Counter)
         self.label_prototypes: dict[int, torch.Tensor] = {}
         self.label_counts: Counter[int] = Counter()
@@ -585,6 +600,103 @@ class VisualHierarchy:
         if informative_errors:
             parts.append(self._normalize_feature(torch.cat(informative_errors[:2], dim=0)))
         return torch.cat(parts, dim=0)
+
+    def _summarize_layer_activity(self, activations: torch.Tensor, *, target_dim: int) -> torch.Tensor:
+        if activations.numel() == 0:
+            return torch.zeros(target_dim, dtype=torch.float32, device=activations.device)
+        batch = activations.to(torch.float32)
+        if batch.dim() == 1:
+            batch = batch.unsqueeze(0)
+        return self._normalize_feature(batch.mean(dim=0))
+
+    def _project_feedback(
+        self,
+        higher_activations: torch.Tensor,
+        projection: torch.Tensor,
+        *,
+        target_dim: int,
+    ) -> torch.Tensor:
+        if higher_activations.numel() == 0:
+            return torch.zeros(target_dim, dtype=torch.float32, device=projection.device)
+        higher_summary = self._summarize_layer_activity(
+            higher_activations,
+            target_dim=projection.shape[1],
+        ).to(device=projection.device, dtype=projection.dtype)
+        return torch.tanh(projection @ higher_summary)
+
+    def _previous_feedback_signals(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.config.feedback_strength <= 0.0 or self.last_output is None:
+            return (
+                torch.zeros(self.layers[0].concept_dim, dtype=torch.float32),
+                torch.zeros(self.layers[1].concept_dim, dtype=torch.float32),
+                torch.zeros(self.layers[2].concept_dim, dtype=torch.float32),
+            )
+        return (
+            self._project_feedback(
+                self.last_output.layer_activations[1],
+                self.feedback_v2_to_v1,
+                target_dim=self.layers[0].concept_dim,
+            ),
+            self._project_feedback(
+                self.last_output.layer_activations[2],
+                self.feedback_v4_to_v2,
+                target_dim=self.layers[1].concept_dim,
+            ),
+            self._project_feedback(
+                self.last_output.layer_activations[3],
+                self.feedback_it_to_v4,
+                target_dim=self.layers[2].concept_dim,
+            ),
+        )
+
+    def _apply_feedback_modulation(
+        self,
+        layer: HierarchyLayer,
+        result: LayerBatchResult,
+        feedback_signal: torch.Tensor,
+    ) -> LayerBatchResult:
+        if self.config.feedback_strength <= 0.0 or result.activations.numel() == 0:
+            return result
+        modulation = 1.0 + (
+            self.config.feedback_strength
+            * feedback_signal.to(device=result.activations.device, dtype=result.activations.dtype)
+        )
+        modulation = modulation.clamp_min(0.0)
+        result.activations = result.activations * modulation.unsqueeze(0)
+        layer.last_features = result.activations.detach().clone()
+        return result
+
+    def _update_feedback_connections(self, output: HierarchyOutput) -> None:
+        if self.config.feedback_strength <= 0.0:
+            return
+        updates = (
+            (
+                self.feedback_v2_to_v1,
+                self._summarize_layer_activity(output.layer_activations[0], target_dim=self.layers[0].concept_dim),
+                self._summarize_layer_activity(output.layer_activations[1], target_dim=self.layers[1].concept_dim),
+                float(self.config.learning_rates[0]),
+            ),
+            (
+                self.feedback_v4_to_v2,
+                self._summarize_layer_activity(output.layer_activations[1], target_dim=self.layers[1].concept_dim),
+                self._summarize_layer_activity(output.layer_activations[2], target_dim=self.layers[2].concept_dim),
+                float(self.config.learning_rates[1]),
+            ),
+            (
+                self.feedback_it_to_v4,
+                self._summarize_layer_activity(output.layer_activations[2], target_dim=self.layers[2].concept_dim),
+                self._summarize_layer_activity(output.layer_activations[3], target_dim=self.layers[3].concept_dim),
+                float(self.config.learning_rates[2]),
+            ),
+        )
+        for matrix, lower_summary, higher_summary, learning_rate in updates:
+            if (
+                float(lower_summary.norm().item()) <= 1e-8
+                or float(higher_summary.norm().item()) <= 1e-8
+            ):
+                continue
+            updated = matrix + (learning_rate * torch.outer(lower_summary, higher_summary).to(matrix))
+            matrix.copy_(normalize(updated))
 
     def _raw_label_signature_from_output(self, output: HierarchyOutput) -> torch.Tensor:
         parts = [
@@ -858,6 +970,7 @@ class VisualHierarchy:
         learn: bool,
         label: int | None = None,
     ) -> HierarchyOutput:
+        feedback_l1, feedback_l2, feedback_l3 = self._previous_feedback_signals()
         patches = self.extractor.extract_patches(
             image,
             patch_size=self.config.patch_size,
@@ -882,6 +995,7 @@ class VisualHierarchy:
             if learn
             else self._run_layer_infer(self.layers[0], l1_inputs)
         )
+        l1_result = self._apply_feedback_modulation(self.layers[0], l1_result, feedback_l1)
 
         l2_inputs, grouping12 = self._prepare_l2_inputs(l1_result.activations, patch_grid)
         l2_result = (
@@ -889,6 +1003,7 @@ class VisualHierarchy:
             if learn
             else self._run_layer_infer(self.layers[1], l2_inputs)
         )
+        l2_result = self._apply_feedback_modulation(self.layers[1], l2_result, feedback_l2)
 
         l3_inputs, grouping23 = self._prepare_l3_inputs(l2_result.activations)
         l3_result = (
@@ -896,6 +1011,7 @@ class VisualHierarchy:
             if learn
             else self._run_layer_infer(self.layers[2], l3_inputs)
         )
+        l3_result = self._apply_feedback_modulation(self.layers[2], l3_result, feedback_l3)
 
         l4_inputs, grouping34 = self._prepare_l4_inputs(l3_result.activations)
         allow_l4_recruit = learn and label is not None
@@ -972,6 +1088,7 @@ class VisualHierarchy:
 
         if learn:
             self._update_bindings(output)
+            self._update_feedback_connections(output)
             if label is not None and l4_result.activations.shape[0] > 0:
                 self._update_label_memory(
                     int(label),

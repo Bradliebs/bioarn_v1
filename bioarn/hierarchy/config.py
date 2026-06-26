@@ -39,6 +39,7 @@ class HierarchyConfig:
     capacity_prune_interval: int = 256
     capacity_prune_min_presentations: int = 96
     capacity_prune_max_fire_count: int = 0
+    feedback_strength: float = 0.0
     predictive: PredictiveConfig | None = None
 
     def __post_init__(self) -> None:
@@ -61,6 +62,7 @@ class HierarchyConfig:
         self.capacity_prune_interval = int(max(0, self.capacity_prune_interval))
         self.capacity_prune_min_presentations = int(max(1, self.capacity_prune_min_presentations))
         self.capacity_prune_max_fire_count = int(max(0, self.capacity_prune_max_fire_count))
+        self.feedback_strength = float(max(0.0, self.feedback_strength))
 
         if self.max_pool_sizes is None:
             growth_schedule = (1.5, 1.5, 1.5, 3.0)
