@@ -13,7 +13,7 @@ from typing import Iterable, Iterator
 
 import torch
 
-from bioarn.config import BioARNConfig, CCCConfig, MarginGateConfig, SDMConfig
+from bioarn.config import BioARNConfig, CCCConfig, GNWConfig, MarginGateConfig, SDMConfig
 from bioarn.core.math_utils import cosine_similarity, normalize
 from bioarn.data import CIFAR10Stream, DataSample, StreamingDataSource
 from bioarn.preprocessing import PreprocessingPipeline
@@ -33,6 +33,7 @@ class VisionTrainConfig:
     num_train_samples: int = 5000
     num_test_samples: int = 1000
     preprocessing_warmup_samples: int = 200
+    workspace: GNWConfig | None = None
 
 
 class SyntheticCIFAR10Stream(StreamingDataSource):
@@ -296,6 +297,7 @@ class VisionTrainer:
     @staticmethod
     def _build_system(config: VisionTrainConfig, *, input_dim: int) -> BioARNCore:
         ccc_features = 64 if input_dim >= 1024 else max(16, min(64, input_dim))
+        workspace_config = copy.deepcopy(config.workspace)
         bio_config = BioARNConfig(
             ccc=CCCConfig(
                 input_dim=input_dim,
@@ -320,6 +322,8 @@ class VisionTrainer:
                 decay_rate=0.999,
                 stdp_window=10,
             ),
+            gnw=copy.deepcopy(workspace_config) if workspace_config is not None else GNWConfig(),
+            workspace=workspace_config,
             seed=42,
         )
         return ScaledBioARN(bio_config, use_optimized=config.use_batched)
@@ -398,7 +402,64 @@ class VisionTrainer:
         concept = normalize((directions * weights).sum(dim=0, keepdim=True)).squeeze(0)
         return concept, float(weights.squeeze(-1).max().item())
 
+    def _workspace_consensus(
+        self,
+        fired_indices: list[int],
+        winner_confidences: torch.Tensor,
+    ) -> tuple[torch.Tensor, float, bool]:
+        active_cccs: list[tuple[int, torch.Tensor, float]] = []
+        for position, index in enumerate(fired_indices):
+            confidence = (
+                float(winner_confidences[position].item())
+                if position < winner_confidences.numel()
+                else 0.0
+            )
+            active_cccs.append((index, self._ccc_direction(index), confidence))
+
+        thought = self.system.stream.think_step(active_cccs, timestep=self.system.timestep)
+        self.system.last_thought = thought
+        focused_cccs = self.system._workspace_focus_candidates(active_cccs, thought.broadcast)
+        vote_result = self.system.fabric.vote(focused_cccs)
+        vote_result = self.system._workspace_bias_vote(vote_result, thought.broadcast)
+        concept_direction = vote_result.winning_direction.detach().clone()
+        return concept_direction, float(vote_result.confidence), vote_result.voter_count == 0
+
     def _step_pool(self, tensor: torch.Tensor, *, allow_recruit: bool) -> tuple[list[int], torch.Tensor, float, bool]:
+        if getattr(self.system.config, "workspace", None) is not None:
+            pool = self.system.ccc_pool
+            if hasattr(pool, "_vectorized_state") and hasattr(pool, "_ensure_batch"):
+                raw_batch, _ = pool._ensure_batch(tensor)
+                state = pool._vectorized_state(raw_batch, timestep=self.system.timestep)
+                fired_mask = state.fired.any(dim=-1)
+                fired_indices = fired_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
+                winner_confidences = (
+                    state.confidence.index_select(0, torch.tensor(fired_indices, device=state.confidence.device)).mean(dim=-1)
+                    if fired_indices
+                    else torch.empty(0, dtype=torch.float32, device=state.confidence.device)
+                )
+
+                if allow_recruit and not state.any_fired:
+                    recruit_index, recruit_output = pool.recruit(raw_batch, timestep=self.system.timestep)
+                    if recruit_index is not None and recruit_output is not None:
+                        fired_indices = [int(recruit_index)]
+                        winner_confidences = torch.tensor(
+                            [float(recruit_output.confidence.reshape(-1).mean().item())],
+                            dtype=torch.float32,
+                            device=state.confidence.device,
+                        )
+            else:
+                pool_output = self.system._run_pool(tensor, allow_recruit=allow_recruit)
+                fired_indices = list(pool_output.fired_indices)
+                winner_confidences = pool_output.winner_confidences
+
+            concept, confidence, abstained = self._workspace_consensus(
+                fired_indices,
+                winner_confidences.to(torch.float32),
+            )
+            self.system.timestep += 1
+            self.last_fired_indices = fired_indices
+            return fired_indices, concept, float(confidence), bool(abstained)
+
         pool = self.system.ccc_pool
         if hasattr(pool, "_vectorized_state") and hasattr(pool, "_ensure_batch"):
             raw_batch, _ = pool._ensure_batch(tensor)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from bioarn.config import CCCConfig, MarginGateConfig
+from bioarn.config import CCCConfig, GNWConfig, MarginGateConfig
 from bioarn.core.ccc import CCCPool
 from bioarn.core.math_utils import normalize
 from bioarn.loop import SensorimotorLoop
@@ -17,6 +17,7 @@ def make_config(
     num_test_samples: int = 120,
     use_batched: bool = True,
     margin_threshold: float = 0.55,
+    workspace: GNWConfig | None = None,
 ) -> VisionTrainConfig:
     return VisionTrainConfig(
         input_dim=3072,
@@ -28,6 +29,7 @@ def make_config(
         learning_rate=0.01,
         num_train_samples=num_train_samples,
         num_test_samples=num_test_samples,
+        workspace=workspace,
     )
 
 
@@ -183,6 +185,29 @@ def test_evaluation_metrics() -> None:
         "mean_firing_fraction",
         "total_samples",
     }.issubset(metrics.keys())
+
+
+def test_workspace_training_path_runs() -> None:
+    trainer = VisionTrainer(
+        make_config(
+            num_train_samples=80,
+            num_test_samples=40,
+            workspace=GNWConfig(
+                capacity=5,
+                broadcast_gain=2.2,
+                fatigue_rate=0.08,
+                fatigue_threshold=0.18,
+                competition_temp=0.45,
+                context_size=48,
+            ),
+        )
+    )
+    trainer.train_online(make_stream(80, seed=21), num_samples=80)
+    metrics = trainer.evaluate(make_stream(40, seed=22, shuffle=False), num_samples=40)
+
+    assert trainer.system.config.workspace is not None
+    assert metrics["accuracy"] >= 0.0
+    assert metrics["abstention_rate"] >= 0.0
 
 
 def test_batched_vs_sequential() -> None:

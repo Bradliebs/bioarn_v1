@@ -60,6 +60,7 @@ class PredictiveConfig:
     eta: float = 0.01            # Weight learning rate (local Hebbian)
     precision_init: float = 1.0  # Initial precision weighting
     error_threshold: float = 0.01  # Below this, errors are suppressed (PCL)
+    settling_steps: int = 6      # Iterative inference steps for resonance/settling
 
 
 @dataclass
@@ -102,6 +103,7 @@ class BioARNConfig:
     sdm: SDMConfig = field(default_factory=SDMConfig)
     predictive: PredictiveConfig = field(default_factory=PredictiveConfig)
     gnw: GNWConfig = field(default_factory=GNWConfig)
+    workspace: GNWConfig | None = None
     reward: RewardConfig = field(default_factory=RewardConfig)
 
     # Optional module configs — when set, enable hierarchy preprocessing and

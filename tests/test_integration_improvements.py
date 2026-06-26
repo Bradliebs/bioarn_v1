@@ -98,9 +98,13 @@ def _batch_for(index: int, repeats: int = 3) -> torch.Tensor:
     return _concept(index).repeat(repeats, 1)
 
 
-def _identity_core() -> BioARNCore:
+def _identity_core(*, workspace: GNWConfig | None = None) -> BioARNCore:
     """Minimal BioARNCore with identity-initialised weights for deterministic tests."""
-    core = BioARNCore(_minimal_config())
+    config = _minimal_config()
+    if workspace is not None:
+        config.workspace = workspace
+        config.gnw = workspace
+    core = BioARNCore(config)
     with torch.no_grad():
         for ccc in core.ccc_pool.cccs:
             ccc.f1_layer.weight.copy_(torch.eye(4))
@@ -215,6 +219,32 @@ def test_hierarchy_features_feed_into_bioarncore() -> None:
 
     assert perception.timestep == 0
     assert perception.num_fired >= 0
+
+
+def test_workspace_opt_in_biases_recognition_confidence() -> None:
+    plain_core = _identity_core()
+    workspace_core = _identity_core(
+        workspace=GNWConfig(
+            capacity=3,
+            broadcast_gain=2.2,
+            fatigue_rate=0.1,
+            fatigue_threshold=0.2,
+            competition_temp=0.45,
+            context_size=32,
+            context_top_k=3,
+        )
+    )
+
+    plain_core.forward(_concept(0), learn=True)
+    workspace_core.forward(_concept(0), learn=True)
+
+    plain_recognition = plain_core.recognize(_concept(0))
+    workspace_recognition = workspace_core.recognize(_concept(0))
+
+    assert workspace_core.last_perception is not None
+    assert workspace_core.last_perception.broadcast.context_vector is not None
+    assert workspace_recognition.abstained is False
+    assert workspace_recognition.confidence >= plain_recognition.confidence
 
 
 def test_hierarchy_learn_then_classify_shape() -> None:

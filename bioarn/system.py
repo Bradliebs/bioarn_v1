@@ -80,7 +80,9 @@ class BioARNCore(nn.Module):
         self.config = config
         self.ccc_pool = CCCPool(config.ccc, config.margin_gate)
         self.fabric = AssociativeFabric(config.sdm, config.ccc)
-        gnw_config = replace(config.gnw, concept_dim=int(config.ccc.concept_dim))
+        self.workspace_enabled = config.workspace is not None
+        workspace_source = config.workspace if self.workspace_enabled else config.gnw
+        gnw_config = replace(workspace_source, concept_dim=int(config.ccc.concept_dim))
         self.gnw: GlobalNeuronalWorkspace = EnhancedGNW(gnw_config)
         self.stream = StreamOfConsciousness(self.gnw, gnw_config)
         self.timestep = 0
@@ -182,6 +184,132 @@ class BioARNCore(nn.Module):
         winning_indices = {index for index, _ in inhibited_winners}
         return [activation for activation in active_cccs if activation[0] in winning_indices]
 
+    @staticmethod
+    def _normalized_direction(direction: torch.Tensor) -> torch.Tensor:
+        flattened = direction.detach().reshape(-1).to(torch.float32)
+        if float(flattened.norm().item()) <= 1e-8:
+            return torch.zeros_like(flattened)
+        return normalize(flattened.unsqueeze(0)).squeeze(0)
+
+    def _workspace_query(self, candidates: list[tuple[int, torch.Tensor, float]]) -> torch.Tensor:
+        if not candidates:
+            return torch.zeros(self.config.ccc.concept_dim, dtype=torch.float32)
+
+        directions = torch.stack(
+            [self._normalized_direction(direction) for _, direction, _ in candidates],
+            dim=0,
+        )
+        weights = torch.tensor(
+            [max(float(confidence), 1e-6) for _, _, confidence in candidates],
+            dtype=directions.dtype,
+            device=directions.device,
+        )
+        return normalize((directions * weights.unsqueeze(-1)).sum(dim=0, keepdim=True)).squeeze(0)
+
+    def _positive_similarity(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor | None,
+    ) -> float:
+        if right is None:
+            return 0.0
+        left_normalized = self._normalized_direction(left)
+        right_normalized = self._normalized_direction(right)
+        if float(left_normalized.norm().item()) <= 1e-8 or float(right_normalized.norm().item()) <= 1e-8:
+            return 0.0
+        similarity = float(
+            cosine_similarity(
+                left_normalized.unsqueeze(0).to(right_normalized),
+                right_normalized.unsqueeze(0),
+            ).item()
+        )
+        return max(0.0, min(1.0, similarity))
+
+    def _workspace_focus_candidates(
+        self,
+        candidates: list[tuple[int, torch.Tensor, float]],
+        broadcast: BroadcastOutput,
+    ) -> list[tuple[int, torch.Tensor, float]]:
+        if not self.workspace_enabled or not candidates:
+            return candidates
+
+        broadcast_indices = set(broadcast.indices)
+        activation_map = {
+            index: float(activation)
+            for index, activation in zip(broadcast.indices, broadcast.activations, strict=False)
+        }
+        max_activation = max(activation_map.values(), default=0.0)
+        query = self._workspace_query(candidates)
+        attended_context = (
+            self.gnw.attend_context(query).detach().clone()
+            if hasattr(self.gnw, "attend_context") and float(query.norm().item()) > 0.0
+            else None
+        )
+
+        focus_threshold = max(0.1, float(self.config.margin_gate.theta_margin) * 0.5)
+        focused: list[tuple[int, torch.Tensor, float]] = []
+        for ccc_index, direction, confidence in candidates:
+            base_confidence = max(0.0, float(confidence))
+            slot_support = (
+                activation_map.get(ccc_index, 0.0) / max(max_activation, 1e-6)
+                if ccc_index in activation_map
+                else 0.0
+            )
+            context_support = max(
+                self._positive_similarity(direction, broadcast.context_vector),
+                self._positive_similarity(direction, attended_context),
+            )
+            in_focus = ccc_index in broadcast_indices
+            suppression = 1.0 if in_focus else 0.45
+            adjusted_confidence = min(
+                1.0,
+                base_confidence
+                * suppression
+                * (1.0 + (0.85 * slot_support) + (0.35 * context_support)),
+            )
+            if in_focus or adjusted_confidence >= focus_threshold:
+                focused.append((ccc_index, direction, adjusted_confidence))
+
+        return focused or candidates
+
+    def _workspace_bias_vote(
+        self,
+        vote_result: VoteResult,
+        broadcast: BroadcastOutput,
+    ) -> VoteResult:
+        if not self.workspace_enabled or vote_result.voter_count == 0:
+            return vote_result
+
+        broadcast_support = (
+            max(
+                self._positive_similarity(vote_result.winning_direction, direction)
+                for direction in broadcast.directions
+            )
+            if broadcast.directions
+            else 0.0
+        )
+        context_support = self._positive_similarity(
+            vote_result.winning_direction,
+            broadcast.context_vector,
+        )
+        attention_support = max(broadcast.attention_weights, default=0.0)
+        occupancy = (
+            broadcast.num_occupied / max(1.0, float(self.gnw.config.capacity))
+            if broadcast.num_occupied > 0
+            else 0.0
+        )
+        confidence = min(
+            1.0,
+            float(vote_result.confidence)
+            * (1.0 + (0.40 * broadcast_support) + (0.25 * context_support) + (0.15 * attention_support))
+            * (0.85 + (0.15 * occupancy)),
+        )
+        agreement = min(
+            1.0,
+            float(vote_result.agreement_score) + (0.05 * broadcast_support) + (0.05 * context_support),
+        )
+        return replace(vote_result, confidence=float(confidence), agreement_score=float(agreement))
+
     def _learning_occurred(self, perception: PerceptionOutput) -> bool:
         if perception.pool_output.recruited:
             return True
@@ -216,12 +344,17 @@ class BioARNCore(nn.Module):
             else []
         )
         surviving_cccs = self._surviving_cccs(active_cccs, inhibited_winners)
-        vote_result = self.fabric.vote(surviving_cccs)
         self.last_thought = self.stream.think_step(surviving_cccs, timestep=self.timestep)
+        focused_cccs = self._workspace_focus_candidates(
+            surviving_cccs,
+            self.last_thought.broadcast,
+        )
+        vote_result = self.fabric.vote(focused_cccs)
+        vote_result = self._workspace_bias_vote(vote_result, self.last_thought.broadcast)
 
         associations = (
             self.fabric.retrieve_associates(vote_result.winning_direction, k=5)
-            if surviving_cccs
+            if focused_cccs
             else self._empty_associations()
         )
 

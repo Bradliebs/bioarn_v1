@@ -216,8 +216,10 @@ class ConfigManager:
             name: _NESTED_CONFIGS[name](**merged[name])
             for name in _NESTED_CONFIGS
         }
+        workspace_config = merged.get("workspace")
         config = BioARNConfig(
             **nested_kwargs,
+            workspace=GNWConfig(**workspace_config) if isinstance(workspace_config, Mapping) else None,
             device=str(merged["device"]),
             dtype=str(merged["dtype"]),
             seed=int(merged["seed"]),
@@ -320,6 +322,12 @@ class ConfigManager:
         cls._require(0.0 <= config.gnw.fatigue_rate < 1.0, "gnw.fatigue_rate must be in [0, 1).")
         cls._require(0.0 <= config.gnw.fatigue_threshold <= 1.0, "gnw.fatigue_threshold must be in [0, 1].")
         cls._require(config.gnw.competition_temp > 0.0, "gnw.competition_temp must be positive.")
+        if config.workspace is not None:
+            cls._require(config.workspace.capacity > 0, "workspace.capacity must be positive.")
+            cls._require(config.workspace.broadcast_gain > 0.0, "workspace.broadcast_gain must be positive.")
+            cls._require(0.0 <= config.workspace.fatigue_rate < 1.0, "workspace.fatigue_rate must be in [0, 1).")
+            cls._require(0.0 <= config.workspace.fatigue_threshold <= 1.0, "workspace.fatigue_threshold must be in [0, 1].")
+            cls._require(config.workspace.competition_temp > 0.0, "workspace.competition_temp must be positive.")
 
         cls._require(config.reward.intrinsic_scale >= 0.0, "reward.intrinsic_scale must be >= 0.")
         cls._require(config.reward.novelty_threshold > 0.0, "reward.novelty_threshold must be positive.")
