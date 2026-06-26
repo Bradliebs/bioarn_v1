@@ -24,9 +24,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from statistics import fmean
+import sys
 
 import torch
+
+if __package__ is None or __package__ == "":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 from bioarn.config import BioARNConfig
 from bioarn.ensemble import DiversityManager, EnsembleConfig, EnsemblePool
