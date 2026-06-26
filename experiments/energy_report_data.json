@@ -42,7 +42,18 @@
       "broadcast_gain": 2.0,
       "fatigue_rate": 0.1,
       "fatigue_threshold": 0.3,
-      "competition_temp": 1.0
+      "competition_temp": 1.0,
+      "concept_dim": 256,
+      "context_size": 128,
+      "context_decay": 0.95,
+      "context_eviction_threshold": 0.05,
+      "context_update_rate": 0.2,
+      "attention_heads": 4,
+      "context_top_k": 5,
+      "recurrent_integration_rate": 0.1,
+      "context_bias_gain": 0.35,
+      "repetition_window": 20,
+      "repetition_novelty_threshold": 0.8
     },
     "reward": {
       "intrinsic_scale": 1.0,
@@ -51,6 +62,8 @@
       "novelty_decay": 0.95,
       "curiosity_weight": 0.5
     },
+    "hierarchy": null,
+    "ensemble": null,
     "device": "cpu",
     "dtype": "float32",
     "seed": 42
@@ -112,7 +125,7 @@
         "active_units": 342.40000000000003,
         "total_units": 1344.0,
         "spike_count": 346.0,
-        "time_ms": 12.301039998419583,
+        "time_ms": 13.186620001215488,
         "sparsity": 0.7452380952380953,
         "savings": 11.047873256414672
       },
@@ -123,7 +136,7 @@
         "active_units": 0.0,
         "total_units": 4600.0,
         "spike_count": 0.0,
-        "time_ms": 137.49337999615818,
+        "time_ms": 177.01792002189904,
         "sparsity": 1.0,
         "savings": 2.3138345864661654
       },
@@ -134,7 +147,7 @@
         "active_units": 995.0,
         "total_units": 1888.0,
         "spike_count": 995.0,
-        "time_ms": 18.041860009543598,
+        "time_ms": 24.526420002803206,
         "sparsity": 0.4729872881355932,
         "savings": 2.4527927994048433
       },
@@ -145,7 +158,7 @@
         "active_units": 3.6,
         "total_units": 7.0,
         "spike_count": 3.6,
-        "time_ms": 1.109879999421537,
+        "time_ms": 10.735660011414438,
         "sparsity": 0.48571428571428565,
         "savings": 2.615168539325843
       },
@@ -156,7 +169,7 @@
         "active_units": 141.4,
         "total_units": 640.0,
         "spike_count": 13.4,
-        "time_ms": 10.791939997579902,
+        "time_ms": 20.620999997481704,
         "sparsity": 0.7790625,
         "savings": 2.0416386836803224
       }
@@ -168,12 +181,12 @@
       "active_units": 1482.4,
       "total_units": 8479.0,
       "spike_count": 1358.0,
-      "time_ms": 179.7381000011228,
+      "time_ms": 246.08762003481388,
       "sparsity": 0.8251680622714943,
       "savings": 2.3450944248329746
     },
-    "total_wall_ms": 184.41699999384582,
-    "sensory_ms": 4.179780004778877,
+    "total_wall_ms": 253.3960800152272,
+    "sensory_ms": 6.314440001733601,
     "sensory_suppression": 0.0009259223937988281,
     "visual_event_count": 186.4,
     "active_cccs": 3.6,
@@ -196,7 +209,7 @@
         "active_units": 80.0,
         "total_units": 192.0,
         "spike_count": 81.0,
-        "time_ms": 4.614499997114763,
+        "time_ms": 6.95109999505803,
         "sparsity": 0.5833333333333333,
         "savings": 4.888
       },
@@ -207,7 +220,7 @@
         "active_units": 0.0,
         "total_units": 2000.0,
         "spike_count": 0.0,
-        "time_ms": 28.409120003925636,
+        "time_ms": 48.20949999848381,
         "sparsity": 1.0,
         "savings": 1.006015037593985
       },
@@ -218,7 +231,7 @@
         "active_units": 970.2,
         "total_units": 1888.0,
         "spike_count": 970.2,
-        "time_ms": 14.174559997627512,
+        "time_ms": 25.928860006388277,
         "sparsity": 0.4861228813559322,
         "savings": 2.4193094080452355
       },
@@ -229,7 +242,7 @@
         "active_units": 1.0,
         "total_units": 7.0,
         "spike_count": 1.0,
-        "time_ms": 0.8034800062887371,
+        "time_ms": 6.5287800040096045,
         "sparsity": 0.8571428571428572,
         "savings": 9.882352941176471
       },
@@ -240,7 +253,7 @@
         "active_units": 143.6,
         "total_units": 640.0,
         "spike_count": 15.600000000000001,
-        "time_ms": 12.811080005485564,
+        "time_ms": 18.902540009003133,
         "sparsity": 0.775625,
         "savings": 2.0320855614973263
       }
@@ -252,12 +265,12 @@
       "active_units": 1194.8,
       "total_units": 4727.0,
       "spike_count": 1067.8,
-      "time_ms": 60.81274001044221,
+      "time_ms": 106.52078001294285,
       "sparsity": 0.747239263803681,
       "savings": 1.0563054088361985
     },
-    "total_wall_ms": 64.97315999586135,
-    "sensory_ms": 3.481479996116832,
+    "total_wall_ms": 112.64749999390915,
+    "sensory_ms": 5.606519989669323,
     "sensory_suppression": 0.05493431091308594,
     "visual_event_count": 782.6,
     "active_cccs": 1.0,

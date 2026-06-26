@@ -7,20 +7,20 @@ Key takeaways:
 - Sparse activation: only 3.6 CCCs fire on average out of 7.0 committed concepts.
 - PCL suppression: 47.3% of predictive-hierarchy activity is zeroed by precision-weighted error suppression.
 - Local learning: projected Loihi online learning is 8,050x cheaper than transformer batch training on A100.
-- Caveat: current PyTorch CPU inference is slower than the dense MLP/transformer baselines (184.42 ms vs 0.012 / 0.071 ms) because SDM address math and Python orchestration dominate.
+- Caveat: current PyTorch CPU inference is slower than the dense MLP/transformer baselines (253.40 ms vs 0.012 / 0.071 ms) because SDM address math and Python orchestration dominate.
 
 ## Measured Computation Profile (PyTorch CPU)
 
 | Component | FLOPs (Dense) | FLOPs (Sparse) | Sparsity | Time (ms) |
 |---|---:|---:|---:|---:|
-| CCC Pool | 1,642,368 | 148,659 | 74.5% | 12.30 |
-| SDM Retrieval | 98,476,800 | 42,560,000 | 100.0% | 137.49 |
-| PE Hierarchy | 2,940,928 | 1,199,012 | 47.3% | 18.04 |
-| GNW | 745 | 285 | 48.6% | 1.11 |
-| Motor Stream | 622,592 | 304,947 | 77.9% | 10.79 |
-| **TOTAL** | **103,683,433** | **44,212,903** | **82.5%** | **179.74** |
+| CCC Pool | 1,642,368 | 148,659 | 74.5% | 13.19 |
+| SDM Retrieval | 98,476,800 | 42,560,000 | 100.0% | 177.02 |
+| PE Hierarchy | 2,940,928 | 1,199,012 | 47.3% | 24.53 |
+| GNW | 745 | 285 | 48.6% | 10.74 |
+| Motor Stream | 622,592 | 304,947 | 77.9% | 20.62 |
+| **TOTAL** | **103,683,433** | **44,212,903** | **82.5%** | **246.09** |
 
-Measured wall-clock per inference: 184.42 ms total (4.18 ms in the visual front-end, excluded from the table above).
+Measured wall-clock per inference: 253.40 ms total (6.31 ms in the visual front-end, excluded from the table above).
 
 ## Projected Energy Per Inference
 
@@ -63,7 +63,7 @@ Reference dense MLP energy on A100: 50.00 mJ per inference. Because the MLP is t
 
 ## Learning Profile
 
-Fresh-loop recruitment steps average 44,130,055 sparse FLOPs and 64.97 ms. They are cheaper than warmed-loop inference on this CPU prototype because one-shot learning touches fewer already-committed CCCs and less accumulated SDM state (82,848 fewer sparse FLOPs, 119.44 ms faster). Recruitment occurred on 100.0% of profiled novel samples.
+Fresh-loop recruitment steps average 44,130,055 sparse FLOPs and 112.65 ms. They are cheaper than warmed-loop inference on this CPU prototype because one-shot learning touches fewer already-committed CCCs and less accumulated SDM state (82,848 fewer sparse FLOPs, 140.75 ms faster). Recruitment occurred on 100.0% of profiled novel samples.
 
 ## Limitations
 

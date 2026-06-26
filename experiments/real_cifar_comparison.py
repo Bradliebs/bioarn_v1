@@ -14,6 +14,7 @@ if __package__ is None or __package__ == "":
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
+from bioarn.config import GNWConfig, PredictiveConfig
 from bioarn.ensemble import DiversityManager, EnsembleConfig, EnsemblePool
 from bioarn.hierarchy import HierarchyConfig, VisualHierarchy
 from bioarn.training import (
@@ -160,7 +161,22 @@ def _base_train_config() -> VisionTrainConfig:
     )
 
 
-def _build_hierarchy() -> VisualHierarchy:
+def _workspace_config() -> GNWConfig:
+    return GNWConfig(
+        capacity=5,
+        broadcast_gain=2.2,
+        fatigue_rate=0.08,
+        fatigue_threshold=0.18,
+        competition_temp=0.45,
+        context_size=192,
+        context_decay=0.97,
+        context_update_rate=0.25,
+        attention_heads=4,
+        context_top_k=6,
+    )
+
+
+def _build_hierarchy(*, predictive: bool = False) -> VisualHierarchy:
     return VisualHierarchy(
         HierarchyConfig(
             image_size=(32, 32, 3),
@@ -170,6 +186,17 @@ def _build_hierarchy() -> VisualHierarchy:
             thresholds=[0.25, 0.3, 0.35, 0.4],
             learning_rates=[0.05, 0.03, 0.02, 0.01],
             class_count=10,
+            predictive=(
+                PredictiveConfig(
+                    gamma=0.12,
+                    eta=0.008,
+                    precision_init=1.0,
+                    error_threshold=0.02,
+                    settling_steps=6,
+                )
+                if predictive
+                else None
+            ),
         )
     )
 
@@ -236,12 +263,54 @@ def run_baseline(
     )
 
 
-def run_hierarchy(
+def run_workspace(
     train_samples: list[tuple[torch.Tensor, int | None]],
     test_samples: list[tuple[torch.Tensor, int | None]],
     ood_samples: list[torch.Tensor],
 ) -> RunResult:
-    hierarchy = _build_hierarchy()
+    train_config = _base_train_config()
+    train_config.workspace = _workspace_config()
+    trainer = VisionTrainer(train_config)
+    trainer.train_online(
+        train_samples,
+        num_samples=TRAIN_N,
+        interleave_classes=True,
+        num_passes=NUM_PASSES,
+    )
+    eval_metrics = trainer.evaluate(test_samples, num_samples=TEST_N)
+
+    id_scores: list[float] = []
+    for tensor, _ in test_samples:
+        _, _, confidence, _ = trainer._step_pool(  # noqa: SLF001
+            trainer._prepare_tensor(tensor),  # noqa: SLF001
+            allow_recruit=False,
+        )
+        id_scores.append(float(confidence))
+
+    ood_scores: list[float] = []
+    for tensor in ood_samples:
+        _, _, confidence, _ = trainer._step_pool(  # noqa: SLF001
+            trainer._prepare_tensor(tensor),  # noqa: SLF001
+            allow_recruit=False,
+        )
+        ood_scores.append(float(confidence))
+
+    return RunResult(
+        name="workspace",
+        accuracy=float(eval_metrics["accuracy"]),
+        abstention_rate=float(eval_metrics["abstention_rate"]),
+        ood_auroc=_auroc(id_scores, ood_scores),
+    )
+
+
+def run_hierarchy(
+    train_samples: list[tuple[torch.Tensor, int | None]],
+    test_samples: list[tuple[torch.Tensor, int | None]],
+    ood_samples: list[torch.Tensor],
+    *,
+    predictive: bool = False,
+) -> RunResult:
+    hierarchy = _build_hierarchy(predictive=predictive)
     interleaved_train = _interleave_by_class(train_samples)
     warmup_end = len(interleaved_train) // 3
 
@@ -266,7 +335,7 @@ def run_hierarchy(
 
     ood_scores = [float(hierarchy.classify(tensor)[1]) for tensor in ood_samples]
     return RunResult(
-        name="hierarchy",
+        name="hierarchy+predictive" if predictive else "hierarchy",
         accuracy=correct / max(total, 1),
         abstention_rate=abstained / max(total, 1),
         ood_auroc=_auroc(id_scores, ood_scores),
@@ -499,7 +568,9 @@ def run_experiment() -> list[RunResult]:
 
     runners = (
         ("baseline", run_baseline),
+        ("workspace", run_workspace),
         ("hierarchy", run_hierarchy),
+        ("hierarchy+predictive", lambda tr, te, od: run_hierarchy(tr, te, od, predictive=True)),
         ("ensemble", run_ensemble),
         ("both", run_both),
     )
