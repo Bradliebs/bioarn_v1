@@ -17,6 +17,7 @@ def make_config(
     num_test_samples: int = 120,
     use_batched: bool = True,
     margin_threshold: float = 0.55,
+    curiosity_weight: float = 0.0,
     workspace: GNWConfig | None = None,
 ) -> VisionTrainConfig:
     return VisionTrainConfig(
@@ -29,6 +30,7 @@ def make_config(
         learning_rate=0.01,
         num_train_samples=num_train_samples,
         num_test_samples=num_test_samples,
+        curiosity_weight=curiosity_weight,
         workspace=workspace,
     )
 
@@ -111,6 +113,33 @@ def test_train_online_runs() -> None:
 
     assert result["processed_samples"] == 100
     assert result["committed_cccs"] > 0
+
+
+def test_curiosity_replays_novel_samples() -> None:
+    baseline = VisionTrainer(make_config(num_train_samples=80, curiosity_weight=0.0))
+    baseline_result = baseline.train_online(make_stream(80, seed=31), num_samples=80)
+    curious = VisionTrainer(make_config(num_train_samples=80, curiosity_weight=0.8))
+    curious_result = curious.train_online(make_stream(80, seed=31), num_samples=80)
+
+    assert baseline_result["processed_samples"] == 80
+    assert curious_result["processed_samples"] > baseline_result["processed_samples"]
+    assert curious_result["curiosity_replays"] > 0
+    assert curious_result["mean_novelty"] > 0.0
+
+
+def test_curiosity_improves_small_sample_convergence() -> None:
+    baseline = VisionTrainer(make_config(num_train_samples=40, num_test_samples=120, curiosity_weight=0.0))
+    curious = VisionTrainer(make_config(num_train_samples=40, num_test_samples=120, curiosity_weight=0.8))
+
+    baseline_result = baseline.train_online(make_stream(40, seed=41), num_samples=40)
+    curious_result = curious.train_online(make_stream(40, seed=41), num_samples=40)
+    baseline_metrics = baseline.evaluate(make_stream(120, seed=42, shuffle=False), num_samples=120)
+    curious_metrics = curious.evaluate(make_stream(120, seed=42, shuffle=False), num_samples=120)
+
+    assert len(baseline_result["raw_accuracy_curve"]) == 40
+    assert len(curious_result["raw_accuracy_curve"]) == 40
+    assert curious_result["accuracy"] > baseline_result["accuracy"]
+    assert curious_metrics["accuracy"] >= baseline_metrics["accuracy"]
 
 
 def test_accuracy_above_chance() -> None:
@@ -238,4 +267,5 @@ def test_cifar_config_correct_dims() -> None:
 
     assert config.input_dim == 3072
     assert config.concept_dim == 256
+    assert config.curiosity_weight == 0.0
     assert SensorimotorLoop._infer_visual_shape(config.input_dim) == (3, 32, 32)
