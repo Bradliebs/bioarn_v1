@@ -364,6 +364,9 @@ class HierarchyPool:
                 limit=winner_limit,
             )
 
+        update_importance = getattr(self.core, "update_importance", None)
+        if callable(update_importance):
+            update_importance(fired_indices)
         self._maybe_prune(timestep)
         concept, confidence = self._aggregate(
             [int(index) for index in fired_indices],
@@ -395,6 +398,9 @@ class HierarchyPool:
         recruited_index, recruited_output = self.core.recruit(batch, timestep=timestep)
         if recruited_index is None or recruited_output is None:
             return None
+        update_importance = getattr(self.core, "update_importance", None)
+        if callable(update_importance):
+            update_importance([int(recruited_index)])
         winner_confidences = torch.tensor(
             [float(recruited_output.confidence.reshape(-1).mean().item())],
             dtype=torch.float32,
@@ -935,7 +941,6 @@ class VisualHierarchy:
             and prototype_margin >= 0.01
         ):
             return int(prototype_label), max(float(final_confidence), float(prototype_similarity))
-
         votes: defaultdict[int, float] = defaultdict(float)
         for fired_index in fired_indices:
             counts = self.l4_label_counts.get(int(fired_index))
@@ -1014,12 +1019,10 @@ class VisualHierarchy:
         l3_result = self._apply_feedback_modulation(self.layers[2], l3_result, feedback_l3)
 
         l4_inputs, grouping34 = self._prepare_l4_inputs(l3_result.activations)
-        allow_l4_recruit = learn and label is not None
-        l4_result = (
-            self._run_layer_learn(self.layers[3], l4_inputs, allow_recruit=allow_l4_recruit)
-            if learn
-            else self._run_layer_infer(self.layers[3], l4_inputs)
-        )
+        if learn and label is not None:
+            l4_result = self._run_layer_learn(self.layers[3], l4_inputs, allow_recruit=True)
+        else:
+            l4_result = self._run_layer_infer(self.layers[3], l4_inputs)
         if (
             learn
             and label is not None

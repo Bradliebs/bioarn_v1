@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from bioarn.config import CCCConfig, MarginGateConfig
+from bioarn.core.consolidation import SynapticConsolidation
 from bioarn.core.margin_gate import MarginGate, MarginGateOutput, ResonanceOutput
 from bioarn.core.math_utils import normalize, sparse_top_k
 from bioarn.core.stdp import STDPRule
@@ -71,6 +73,7 @@ class ConceptCellCluster(nn.Module):
         self.register_buffer("is_committed", torch.tensor(False, dtype=torch.bool))
         self.register_buffer("age", torch.tensor(0, dtype=torch.long))
         self.register_buffer("last_fired", torch.tensor(-1, dtype=torch.long))
+        self.register_buffer("importance", torch.tensor(0.0, dtype=torch.float32))
 
     @staticmethod
     def _ensure_batch(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -95,6 +98,13 @@ class ConceptCellCluster(nn.Module):
     @staticmethod
     def _normalize_feedback_rows(x: torch.Tensor) -> torch.Tensor:
         return normalize(x)
+
+    def _effective_lr(self, base_lr: float) -> float:
+        scale = max(
+            0.0,
+            1.0 - (float(self.config.consolidation_strength) * float(self.importance.item())),
+        )
+        return float(base_lr) * scale
 
     @staticmethod
     def _pre_spikes_from_f1(f1_batch: torch.Tensor) -> torch.Tensor:
@@ -309,7 +319,8 @@ class ConceptCellCluster(nn.Module):
 
         concept_delta = (f2_batch * learn_signal.unsqueeze(-1)).mean(dim=0)
         concept_delta = concept_delta + stdp_signal
-        updated_direction = self.concept_direction + (self.config.slow_lr * concept_delta)
+        concept_lr = self._effective_lr(self.config.slow_lr)
+        updated_direction = self.concept_direction + (concept_lr * concept_delta)
         self.concept_direction.copy_(self._normalize_vector(updated_direction))
 
         prediction = self._ensure_batch(self.generate_prediction(f2_batch))[0]
@@ -318,7 +329,8 @@ class ConceptCellCluster(nn.Module):
         hebbian_update /= max(f1_batch.shape[0], 1)
         if self.stdp_rule is not None and timestep is not None:
             hebbian_update = hebbian_update + stdp_update
-        self.feedback_weights.add_(self.config.feedback_lr * hebbian_update)
+        feedback_lr = self._effective_lr(self.config.feedback_lr)
+        self.feedback_weights.add_(feedback_lr * hebbian_update)
         self.feedback_weights.copy_(self._normalize_feedback_rows(self.feedback_weights))
 
     @torch.no_grad()
@@ -340,13 +352,63 @@ class CCCPool(nn.Module):
     def __init__(self, config: CCCConfig, margin_config: MarginGateConfig):
         super().__init__()
         self.config = config
+        self.margin_config = margin_config
+        self.initial_capacity = int(config.max_pool_size)
+        self.max_capacity = max(
+            self.initial_capacity,
+            int(math.ceil(self.initial_capacity * float(config.max_growth_factor))),
+        )
         self.cccs = nn.ModuleList(
-            [ConceptCellCluster(config, margin_config) for _ in range(config.max_pool_size)]
+            [ConceptCellCluster(config, margin_config) for _ in range(self.initial_capacity)]
         )
         if self.cccs:
             shared_f1 = self.cccs[0].f1_layer
             for ccc in self.cccs[1:]:
                 ccc.f1_layer = shared_f1
+        self.consolidation = SynapticConsolidation(
+            len(self.cccs),
+            strength=self.config.consolidation_strength,
+        )
+        self._sync_importance_buffers()
+
+    def _sync_importance_buffers(self) -> None:
+        self.consolidation.ensure_capacity(len(self.cccs))
+        for index, ccc in enumerate(self.cccs):
+            ccc.importance.copy_(self.consolidation.importance[index].to(ccc.importance))
+
+    def grow(self, min_extra_slots: int = 1) -> int:
+        current_size = len(self.cccs)
+        if current_size >= self.max_capacity:
+            return current_size
+
+        growth_target = max(
+            current_size + int(max(1, min_extra_slots)),
+            int(math.ceil(current_size * 1.5)),
+        )
+        target_size = min(self.max_capacity, growth_target)
+        if target_size <= current_size:
+            return current_size
+
+        shared_f1 = self.cccs[0].f1_layer if self.cccs else None
+        for _ in range(target_size - current_size):
+            ccc = ConceptCellCluster(self.config, self.margin_config)
+            if shared_f1 is None:
+                shared_f1 = ccc.f1_layer
+            else:
+                ccc.f1_layer = shared_f1
+            self.cccs.append(ccc)
+        self.consolidation.ensure_capacity(target_size)
+        self.config.max_pool_size = target_size
+        self._sync_importance_buffers()
+        return target_size
+
+    def update_importance(self, fired_indices: list[int] | torch.Tensor) -> torch.Tensor:
+        scores = self.consolidation.update_importance(
+            fired_indices,
+            current_size=len(self.cccs),
+        )
+        self._sync_importance_buffers()
+        return scores
 
     @staticmethod
     def _confidence_score(confidence: torch.Tensor) -> torch.Tensor:
@@ -373,6 +435,15 @@ class CCCPool(nn.Module):
         recruited_index: int | None = None
         if not any(output.fired for output in outputs):
             recruited_index = self._first_uncommitted_index()
+            if recruited_index is None:
+                previous_size = len(self.cccs)
+                new_size = self.grow()
+                if new_size > previous_size:
+                    outputs.extend(
+                        self.cccs[index].empty_output(raw_input)
+                        for index in range(previous_size, new_size)
+                    )
+                    recruited_index = self._first_uncommitted_index()
             if recruited_index is not None:
                 recruited = True
                 recruited_ccc = self.cccs[recruited_index]
@@ -433,6 +504,9 @@ class CCCPool(nn.Module):
             "mean_confidence": float(mean_confidence),
             "fire_rate": float(fire_rate),
             "total_concepts": len(self.cccs),
+            "initial_capacity": self.initial_capacity,
+            "max_capacity": self.max_capacity,
+            "mean_importance": float(self.consolidation.importance[: len(self.cccs)].mean().item()),
         }
 
 

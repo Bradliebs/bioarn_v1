@@ -255,6 +255,39 @@ def test_batched_vs_sequential() -> None:
     assert_pool_outputs_match(original_output, optimized_output)
 
 
+def test_batched_pool_growth_preserves_committed_concepts() -> None:
+    config = make_ccc_config(max_pool_size=2)
+    config.max_growth_factor = 2.0
+    pool = BatchedCCCPool(config, make_margin_config())
+
+    with torch.no_grad():
+        pool.committed_mask[:2].fill_(True)
+        pool.concept_directions[0].copy_(normalize(torch.tensor([[1.0, 0.0, 0.0, 0.0]])).squeeze(0))
+        pool.concept_directions[1].copy_(normalize(torch.tensor([[0.0, 1.0, 0.0, 0.0]])).squeeze(0))
+
+    grown = pool.grow()
+
+    assert grown is not pool
+    assert grown.config.max_pool_size == 3
+    assert torch.equal(grown.committed_mask[:2], pool.committed_mask[:2])
+    assert torch.allclose(grown.concept_directions[:2], pool.concept_directions[:2])
+
+
+def test_consolidation_slows_important_cccs() -> None:
+    config = make_ccc_config(max_pool_size=3)
+    config.consolidation_strength = 0.8
+    pool = BatchedCCCPool(config, make_margin_config())
+
+    pool.update_importance([0, 0, 0, 0])
+    pool.update_importance([0, 0, 0, 0])
+
+    important_lr = pool.consolidation.effective_lr(config.slow_lr, 0)
+    fresh_lr = pool.consolidation.effective_lr(config.slow_lr, 2)
+
+    assert important_lr < fresh_lr
+    assert fresh_lr == config.slow_lr
+
+
 def test_no_backprop_cifar() -> None:
     trainer = VisionTrainer(make_config(num_train_samples=120))
     trainer.train_online(make_stream(120, seed=13), num_samples=120)

@@ -27,10 +27,12 @@ class VisionTrainConfig:
     input_dim: int = 3072
     concept_dim: int = 256
     max_pool_size: int = 1000
+    max_growth_factor: float = 3.0
     margin_threshold: float = 0.4
     use_batched: bool = True
     batch_size: int = 32
     learning_rate: float = 0.01
+    consolidation_strength: float = 0.0
     num_train_samples: int = 5000
     num_test_samples: int = 1000
     preprocessing_warmup_samples: int = 200
@@ -311,6 +313,8 @@ class VisionTrainer:
                 slow_lr=config.learning_rate,
                 feedback_lr=config.learning_rate,
                 max_pool_size=config.max_pool_size,
+                max_growth_factor=config.max_growth_factor,
+                consolidation_strength=config.consolidation_strength,
             ),
             margin_gate=MarginGateConfig(
                 theta_margin=config.margin_threshold,
@@ -399,6 +403,28 @@ class VisionTrainer:
     def _pool_stats(self) -> dict[str, float | int]:
         return self.system.ccc_pool.get_pool_stats()
 
+    def _current_pool_capacity(self) -> int:
+        return int(self._pool_stats()["total_concepts"])
+
+    def _ensure_pool_growth(self, pool) -> object:
+        first_uncommitted = getattr(pool, "_first_uncommitted_index", None)
+        grow = getattr(pool, "grow", None)
+        if not callable(first_uncommitted) or not callable(grow):
+            return pool
+        if first_uncommitted() is not None:
+            return pool
+        grown_pool = grow()
+        if grown_pool is pool or grown_pool is None:
+            return pool
+        self.system.ccc_pool = grown_pool
+        self.system.config.ccc = grown_pool.config
+        return grown_pool
+
+    def _update_pool_importance(self, fired_indices: list[int]) -> None:
+        update_importance = getattr(self.system.ccc_pool, "update_importance", None)
+        if callable(update_importance):
+            update_importance(fired_indices)
+
     def _ccc_direction(self, index: int) -> torch.Tensor:
         if hasattr(self.system.ccc_pool, "concept_directions"):
             return self.system.ccc_pool.concept_directions[index].detach().clone()
@@ -456,6 +482,7 @@ class VisionTrainer:
                 )
 
                 if allow_recruit and not state.any_fired:
+                    pool = self._ensure_pool_growth(pool)
                     recruit_index, recruit_output = pool.recruit(raw_batch, timestep=self.system.timestep)
                     if recruit_index is not None and recruit_output is not None:
                         fired_indices = [int(recruit_index)]
@@ -490,6 +517,7 @@ class VisionTrainer:
             )
 
             if allow_recruit and not state.any_fired:
+                pool = self._ensure_pool_growth(pool)
                 recruit_index, recruit_output = pool.recruit(raw_batch, timestep=self.system.timestep)
                 if recruit_index is not None and recruit_output is not None:
                     fired_indices = [int(recruit_index)]
@@ -582,6 +610,7 @@ class VisionTrainer:
         prediction = None if abstained_flag else self._recognition_label(concept, fired_indices)
         if not abstained_flag and label is not None:
             self.label_bank.update(int(label), concept)
+        self._update_pool_importance(fired_indices)
         self._record_ccc_activity(fired_indices, label, confidence)
         recruited = int(self._pool_stats()["num_committed"]) > before_committed
         return prediction, bool(abstained_flag), recruited, float(confidence)
@@ -687,10 +716,11 @@ class VisionTrainer:
                         queue.append((tensor.detach().clone(), label, replay_depth + 1))
 
                 pool_stats = self._pool_stats()
+                current_capacity = max(int(pool_stats["total_concepts"]), 1)
                 accuracy_curve.append(correct / max(labeled, 1))
                 if replay_depth == 0:
                     raw_accuracy_curve.append(correct / max(labeled, 1))
-                utilization_curve.append(int(pool_stats["num_committed"]) / self.config.max_pool_size)
+                utilization_curve.append(int(pool_stats["num_committed"]) / current_capacity)
                 abstention_curve.append(abstained / processed)
 
                 if processed % progress_interval == 0 or processed == effective_target:
@@ -764,6 +794,7 @@ class VisionTrainer:
                 per_class_correct[int(label)] += int(prediction == label)
 
         committed = max(int(self._pool_stats()["num_committed"]), 1)
+        current_capacity = max(self._current_pool_capacity(), 1)
         per_class_accuracy = {
             label: per_class_correct[label] / max(per_class_totals[label], 1)
             for label in sorted(per_class_totals)
@@ -774,7 +805,7 @@ class VisionTrainer:
             "abstention_rate": abstained / max(total, 1),
             "coverage": covered / max(total, 1),
             "per_class_accuracy": per_class_accuracy,
-            "pool_utilization": committed / self.config.max_pool_size,
+            "pool_utilization": committed / current_capacity,
             "mean_firing_count": firing_sum / max(total, 1),
             "mean_firing_fraction": firing_sum / max(total * committed, 1),
             "total_samples": total,
@@ -823,10 +854,12 @@ class VisionTrainer:
                 input_dim=self.config.input_dim,
                 concept_dim=self.config.concept_dim,
                 max_pool_size=self.config.max_pool_size,
+                max_growth_factor=self.config.max_growth_factor,
                 margin_threshold=max(self.config.margin_threshold, 0.55),
                 use_batched=self.config.use_batched,
                 batch_size=self.config.batch_size,
                 learning_rate=self.config.learning_rate,
+                consolidation_strength=self.config.consolidation_strength,
                 num_train_samples=self.config.num_train_samples,
                 num_test_samples=self.config.num_test_samples,
                 preprocessing_warmup_samples=self.config.preprocessing_warmup_samples,

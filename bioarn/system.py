@@ -460,6 +460,11 @@ class BioARNCore(nn.Module):
 
         recruit_index = self.ccc_pool._first_uncommitted_index()
         if recruit_index is None:
+            grow = getattr(self.ccc_pool, "grow", None)
+            if callable(grow):
+                grow()
+                recruit_index = self.ccc_pool._first_uncommitted_index()
+        if recruit_index is None:
             return
 
         recruited_ccc = self.ccc_pool.cccs[recruit_index]

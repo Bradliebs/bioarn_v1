@@ -13,6 +13,7 @@ from torch import nn
 
 from bioarn.config import BioARNConfig, CCCConfig, MarginGateConfig, SDMConfig
 from bioarn.core.ccc import CCCOutput, CCCPool, CCCPoolOutput
+from bioarn.core.consolidation import SynapticConsolidation
 from bioarn.core.margin_gate import MarginGateOutput, ResonanceOutput
 from bioarn.core.math_utils import cosine_similarity, normalize
 from bioarn.memory.associative_fabric import AssociativeFabric
@@ -132,6 +133,12 @@ def _copy_batched_pool_slice(
     target.avg_confidence_when_abstained[target_slice].copy_(
         source.avg_confidence_when_abstained[source_slice]
     )
+    target.consolidation.copy_slice_from(
+        source.consolidation,
+        source_start=source_start,
+        target_start=target_start,
+        length=length,
+    )
 
 
 @dataclass
@@ -156,8 +163,14 @@ class BatchedCCCPool(nn.Module):
         super().__init__()
         self.config = config
         self.margin_config = margin_config
+        self.initial_capacity = int(config.max_pool_size)
+        self.max_capacity = max(
+            self.initial_capacity,
+            int(math.ceil(self.initial_capacity * float(config.max_growth_factor))),
+        )
+        self.base_config = replace(config, max_pool_size=self.initial_capacity)
 
-        num_cccs = int(config.max_pool_size)
+        num_cccs = self.initial_capacity
         shared_f1 = nn.Linear(config.input_dim, config.num_f1_features)
 
         self.register_buffer(
@@ -214,6 +227,12 @@ class BatchedCCCPool(nn.Module):
             "avg_confidence_when_abstained",
             torch.zeros(num_cccs, dtype=torch.float32),
         )
+        self.consolidation = SynapticConsolidation(
+            num_cccs,
+            strength=self.config.consolidation_strength,
+            device=self.concept_directions.device,
+            dtype=torch.float32,
+        )
 
     @staticmethod
     def _ensure_batch(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -232,6 +251,32 @@ class BatchedCCCPool(nn.Module):
     @staticmethod
     def _confidence_score(confidence: torch.Tensor) -> torch.Tensor:
         return confidence.reshape(-1).mean()
+
+    def grow(self, new_size: int | None = None) -> "BatchedCCCPool":
+        current_size = int(self.config.max_pool_size)
+        if current_size >= self.max_capacity:
+            return self
+
+        target = new_size or max(current_size + 1, int(math.ceil(current_size * 1.5)))
+        target = min(self.max_capacity, int(target))
+        if target <= current_size:
+            return self
+
+        grown = BatchedCCCPool(
+            replace(self.base_config, max_pool_size=target),
+            self.margin_config,
+        )
+        grown.initial_capacity = self.initial_capacity
+        grown.max_capacity = self.max_capacity
+        grown.base_config = self.base_config
+        _copy_batched_pool_slice(self, grown, length=current_size)
+        return grown
+
+    def update_importance(self, fired_indices: list[int] | torch.Tensor) -> torch.Tensor:
+        return self.consolidation.update_importance(
+            fired_indices,
+            current_size=int(self.config.max_pool_size),
+        )
 
     def _row_f1_encode(self, index: int, raw_batch: torch.Tensor) -> torch.Tensor:
         projected = (
@@ -308,7 +353,13 @@ class BatchedCCCPool(nn.Module):
 
         learning_mask = learn_signal.to(f2_activation.dtype).unsqueeze(-1)
         concept_delta = (f2_activation * learning_mask).mean(dim=1)
-        updated_direction = self.concept_directions + (self.config.slow_lr * concept_delta)
+        lr_scale = self.consolidation.learning_rate_scales(
+            current_size=int(self.config.max_pool_size),
+            device=f2_activation.device,
+            dtype=f2_activation.dtype,
+        )
+        concept_lr = float(self.config.slow_lr) * lr_scale
+        updated_direction = self.concept_directions + (concept_lr.unsqueeze(-1) * concept_delta)
         normalized_update = normalize(updated_direction)
         self.concept_directions.copy_(
             torch.where(active_learning.unsqueeze(-1), normalized_update, self.concept_directions)
@@ -318,7 +369,8 @@ class BatchedCCCPool(nn.Module):
         residual = (f1_output - prediction_full) * learning_mask.to(f1_output.dtype)
         hebbian = torch.matmul(residual.transpose(1, 2), f2_activation)
         hebbian = hebbian / max(f1_output.shape[1], 1)
-        updated_feedback = self.feedback_weights + (self.config.feedback_lr * hebbian)
+        feedback_lr = float(self.config.feedback_lr) * lr_scale
+        updated_feedback = self.feedback_weights + (feedback_lr.view(-1, 1, 1) * hebbian)
         normalized_feedback = normalize(updated_feedback)
         self.feedback_weights.copy_(
             torch.where(
@@ -456,14 +508,16 @@ class BatchedCCCPool(nn.Module):
     ) -> None:
         learn_signal = resonance.learn_signal.reshape(-1).to(f2_batch.dtype)
         concept_delta = (f2_batch * learn_signal.unsqueeze(-1)).mean(dim=0)
-        updated_direction = self.concept_directions[index] + (self.config.slow_lr * concept_delta)
+        concept_lr = self.consolidation.effective_lr(self.config.slow_lr, index)
+        updated_direction = self.concept_directions[index] + (concept_lr * concept_delta)
         self.concept_directions[index].copy_(normalize(updated_direction.unsqueeze(0)).squeeze(0))
 
         prediction = self._row_predict(index, f2_batch)
         residual = (f1_batch - prediction) * learn_signal.unsqueeze(-1)
         hebbian = residual.transpose(0, 1) @ f2_batch
         hebbian /= max(f1_batch.shape[0], 1)
-        updated_feedback = self.feedback_weights[index] + (self.config.feedback_lr * hebbian)
+        feedback_lr = self.consolidation.effective_lr(self.config.feedback_lr, index)
+        updated_feedback = self.feedback_weights[index] + (feedback_lr * hebbian)
         self.feedback_weights[index].copy_(normalize(updated_feedback))
 
     def _single_forward_index(
@@ -754,6 +808,11 @@ class BatchedCCCPool(nn.Module):
             "mean_confidence": float(mean_confidence),
             "fire_rate": float(fire_rate),
             "total_concepts": int(self.config.max_pool_size),
+            "initial_capacity": self.initial_capacity,
+            "max_capacity": self.max_capacity,
+            "mean_importance": float(
+                self.consolidation.importance[: int(self.config.max_pool_size)].mean().item()
+            ),
         }
 
     @torch.no_grad()
@@ -774,6 +833,7 @@ class BatchedCCCPool(nn.Module):
             self.total_abstentions.copy_(pool.total_abstentions)
             self.avg_confidence_when_fired.copy_(pool.avg_confidence_when_fired)
             self.avg_confidence_when_abstained.copy_(pool.avg_confidence_when_abstained)
+            self.consolidation.copy_from(pool.consolidation)
             return self
 
         for index, ccc in enumerate(pool.cccs):
@@ -796,6 +856,9 @@ class BatchedCCCPool(nn.Module):
             self.avg_confidence_when_abstained[index].copy_(
                 ccc.margin_gate.avg_confidence_when_abstained.detach()
             )
+            self.consolidation.importance[index].copy_(ccc.importance.detach())
+        if hasattr(pool, "consolidation"):
+            self.consolidation.copy_from(pool.consolidation)
         return self
 
 
@@ -1986,6 +2049,17 @@ class ScaledBioARN(BioARNCore):
             active_cccs.append((index, direction, self._mean_confidence(pool_output.outputs[index])))
         return active_cccs
 
+    def _ensure_growth_capacity(self) -> None:
+        if not self.use_optimized or not isinstance(self.ccc_pool, BatchedCCCPool):
+            return
+        if self.ccc_pool._first_uncommitted_index() is not None:
+            return
+        grown_pool = self.ccc_pool.grow()
+        if grown_pool is self.ccc_pool:
+            return
+        self.ccc_pool = grown_pool
+        self.config.ccc = grown_pool.config
+
     @torch.no_grad()
     def learn_from_perception(self, perception, raw_input: torch.Tensor) -> None:  # type: ignore[override]
         if not self.use_optimized:
@@ -1994,6 +2068,7 @@ class ScaledBioARN(BioARNCore):
         if perception.pool_output.recruited or perception.pool_output.fired_indices:
             return
 
+        self._ensure_growth_capacity()
         recruit_index, _ = self.ccc_pool.recruit(raw_input, timestep=self.timestep)
         if recruit_index is None:
             return

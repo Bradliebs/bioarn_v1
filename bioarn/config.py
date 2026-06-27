@@ -56,11 +56,16 @@ class CCCConfig:
     slow_lr: float = 0.01        # Hebbian tuning rate (gradual refinement)
     feedback_lr: float = 0.01    # Feedback weight learning rate
     max_pool_size: int = 1000    # Maximum number of CCCs in the pool
+    max_growth_factor: float = 3.0  # Allow the pool to grow beyond its initial size
+    consolidation_strength: float = 0.0  # Penalize updates to highly active CCCs
     stdp: STDPConfig | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.stdp, Mapping):
             self.stdp = STDPConfig(**self.stdp)
+        self.max_pool_size = int(max(1, self.max_pool_size))
+        self.max_growth_factor = float(max(1.0, self.max_growth_factor))
+        self.consolidation_strength = float(max(0.0, self.consolidation_strength))
 
 
 @dataclass
