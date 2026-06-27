@@ -16,6 +16,7 @@ from bioarn.training.text_training import (
     TrainingMetrics,
     build_builtin_corpus,
 )
+from bioarn.training.curriculum import CurriculumScheduler
 from bioarn.training.vision_training import (
     SyntheticCIFAR10Stream,
     VisionTrainConfig,
@@ -53,6 +54,7 @@ __all__ = [
     "VisionTrainConfig",
     "VisionTrainer",
     "build_builtin_corpus",
+    "CurriculumScheduler",
     "load_cifar10_or_synthetic",
     "take_samples",
 ]

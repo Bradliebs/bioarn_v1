@@ -177,23 +177,25 @@ def _workspace_config() -> GNWConfig:
     )
 
 
-def _default_predictive_config() -> PredictiveConfig:
+def _default_predictive_config(*, mode: str = "error_gating") -> PredictiveConfig:
     return PredictiveConfig(
         gamma=0.12,
         eta=0.008,
         precision_init=1.0,
         error_threshold=0.02,
         settling_steps=6,
+        mode=mode,
     )
 
 
-def _tuned_predictive_config() -> PredictiveConfig:
+def _tuned_predictive_config(*, mode: str = "error_gating") -> PredictiveConfig:
     return PredictiveConfig(
         gamma=0.16,
         eta=0.006,
         precision_init=2.4,
         error_threshold=0.01,
         settling_steps=14,
+        mode=mode,
     )
 
 
@@ -257,19 +259,19 @@ def run_baseline(
 
     id_scores: list[float] = []
     for tensor, _ in test_samples:
-        _, _, confidence, _ = trainer._step_pool(  # noqa: SLF001
+        step_result = trainer._step_pool(  # noqa: SLF001
             trainer._prepare_tensor(tensor),  # noqa: SLF001
             allow_recruit=False,
         )
-        id_scores.append(float(confidence))
+        id_scores.append(float(step_result.confidence))
 
     ood_scores: list[float] = []
     for tensor in ood_samples:
-        _, _, confidence, _ = trainer._step_pool(  # noqa: SLF001
+        step_result = trainer._step_pool(  # noqa: SLF001
             trainer._prepare_tensor(tensor),  # noqa: SLF001
             allow_recruit=False,
         )
-        ood_scores.append(float(confidence))
+        ood_scores.append(float(step_result.confidence))
 
     return RunResult(
         name="baseline",
@@ -297,22 +299,64 @@ def run_workspace(
 
     id_scores: list[float] = []
     for tensor, _ in test_samples:
-        _, _, confidence, _ = trainer._step_pool(  # noqa: SLF001
+        step_result = trainer._step_pool(  # noqa: SLF001
             trainer._prepare_tensor(tensor),  # noqa: SLF001
             allow_recruit=False,
         )
-        id_scores.append(float(confidence))
+        id_scores.append(float(step_result.confidence))
 
     ood_scores: list[float] = []
     for tensor in ood_samples:
-        _, _, confidence, _ = trainer._step_pool(  # noqa: SLF001
+        step_result = trainer._step_pool(  # noqa: SLF001
             trainer._prepare_tensor(tensor),  # noqa: SLF001
             allow_recruit=False,
         )
-        ood_scores.append(float(confidence))
+        ood_scores.append(float(step_result.confidence))
 
     return RunResult(
         name="workspace",
+        accuracy=float(eval_metrics["accuracy"]),
+        abstention_rate=float(eval_metrics["abstention_rate"]),
+        ood_auroc=_auroc(id_scores, ood_scores),
+    )
+
+
+def run_curriculum_curiosity(
+    train_samples: list[tuple[torch.Tensor, int | None]],
+    test_samples: list[tuple[torch.Tensor, int | None]],
+    ood_samples: list[torch.Tensor],
+) -> RunResult:
+    train_config = _base_train_config()
+    train_config.curiosity_weight = 0.8
+    train_config.curriculum = True
+    train_config.contrastive_curiosity = True
+    trainer = VisionTrainer(train_config)
+    trainer.train_online(
+        train_samples,
+        num_samples=TRAIN_N,
+        interleave_classes=True,
+        num_passes=NUM_PASSES,
+    )
+    eval_metrics = trainer.evaluate(test_samples, num_samples=TEST_N)
+
+    id_scores: list[float] = []
+    for tensor, _ in test_samples:
+        step_result = trainer._step_pool(  # noqa: SLF001
+            trainer._prepare_tensor(tensor),  # noqa: SLF001
+            allow_recruit=False,
+        )
+        id_scores.append(float(step_result.confidence))
+
+    ood_scores: list[float] = []
+    for tensor in ood_samples:
+        step_result = trainer._step_pool(  # noqa: SLF001
+            trainer._prepare_tensor(tensor),  # noqa: SLF001
+            allow_recruit=False,
+        )
+        ood_scores.append(float(step_result.confidence))
+
+    return RunResult(
+        name="curriculum+curiosity",
         accuracy=float(eval_metrics["accuracy"]),
         abstention_rate=float(eval_metrics["abstention_rate"]),
         ood_auroc=_auroc(id_scores, ood_scores),
@@ -613,39 +657,51 @@ def run_experiment() -> list[RunResult]:
     runners = (
         ("baseline", run_baseline),
         ("workspace", run_workspace),
+        ("curriculum+curiosity", run_curriculum_curiosity),
         ("hierarchy", run_hierarchy),
         (
             "hierarchy+feedback",
             lambda tr, te, od: run_hierarchy(tr, te, od, feedback_strength=0.2),
         ),
         (
-            "hierarchy+predictive",
+            "hierarchy+settling",
             lambda tr, te, od: run_hierarchy(
                 tr,
                 te,
                 od,
-                predictive_config=_default_predictive_config(),
+                predictive_config=_default_predictive_config(mode="settling"),
+                predictive_tag="settling",
             ),
         ),
         (
-            "hierarchy+predictive+tuned",
+            "hierarchy+error_gated",
             lambda tr, te, od: run_hierarchy(
                 tr,
                 te,
                 od,
-                predictive_config=_tuned_predictive_config(),
-                predictive_tag="predictive+tuned",
+                predictive_config=_default_predictive_config(mode="error_gating"),
+                predictive_tag="error_gated",
             ),
         ),
         (
-            "hierarchy+predictive+tuned+feedback",
+            "hierarchy+settling+tuned",
             lambda tr, te, od: run_hierarchy(
                 tr,
                 te,
                 od,
-                predictive_config=_tuned_predictive_config(),
+                predictive_config=_tuned_predictive_config(mode="settling"),
+                predictive_tag="settling+tuned",
+            ),
+        ),
+        (
+            "hierarchy+settling+tuned+feedback",
+            lambda tr, te, od: run_hierarchy(
+                tr,
+                te,
+                od,
+                predictive_config=_tuned_predictive_config(mode="settling"),
                 feedback_strength=0.2,
-                predictive_tag="predictive+tuned",
+                predictive_tag="settling+tuned",
             ),
         ),
         ("ensemble", run_ensemble),

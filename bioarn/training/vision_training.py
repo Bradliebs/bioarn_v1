@@ -17,9 +17,10 @@ from bioarn.config import BioARNConfig, CCCConfig, GNWConfig, MarginGateConfig, 
 from bioarn.core.math_utils import cosine_similarity, normalize
 from bioarn.data import CIFAR10Stream, DataSample, StreamingDataSource
 from bioarn.preprocessing import PreprocessingPipeline
-from bioarn.reward import RewardSystem
+from bioarn.reward import NoveltySignal, RewardSystem
 from bioarn.scaling import ScaledBioARN
 from bioarn.system import BioARNCore
+from bioarn.training.curriculum import CurriculumScheduler
 
 
 @dataclass
@@ -33,11 +34,24 @@ class VisionTrainConfig:
     batch_size: int = 32
     learning_rate: float = 0.01
     consolidation_strength: float = 0.0
+    freeze_f1_after: int = 0
+    f1_adapter_dim: int = 16
     num_train_samples: int = 5000
     num_test_samples: int = 1000
     preprocessing_warmup_samples: int = 200
     curiosity_weight: float = 0.0
+    curriculum: bool = False
+    contrastive_curiosity: bool = False
     workspace: GNWConfig | None = None
+
+
+@dataclass
+class PoolStepResult:
+    fired_indices: list[int]
+    concept_direction: torch.Tensor
+    confidence: float
+    abstained: bool
+    winner_confidences: torch.Tensor
 
 
 class SyntheticCIFAR10Stream(StreamingDataSource):
@@ -293,6 +307,7 @@ class VisionTrainer:
         self.training_history: list[dict[str, object]] = []
         self.last_fired_indices: list[int] = []
         self.curiosity_system = self._build_curiosity_system()
+        self.curriculum_scheduler = CurriculumScheduler() if self.config.curriculum else None
 
     def _effective_input_dim(self) -> int:
         if self.preprocessing is None:
@@ -309,6 +324,8 @@ class VisionTrainer:
                 concept_dim=config.concept_dim,
                 num_f1_features=ccc_features,
                 f1_top_k=max(8, ccc_features // 4),
+                freeze_f1_after=config.freeze_f1_after,
+                f1_adapter_dim=config.f1_adapter_dim,
                 fast_lr=1.0,
                 slow_lr=config.learning_rate,
                 feedback_lr=config.learning_rate,
@@ -383,6 +400,28 @@ class VisionTrainer:
         self.preprocessing.fit(warmup_batch)
         return samples[warmup:], warmup
 
+    def _observe_pool_samples(self, sample_count: int) -> None:
+        observer = getattr(self.system.ccc_pool, "observe_samples", None)
+        if callable(observer):
+            observer(int(sample_count))
+
+    def _freeze_pool_f1_if_ready(self) -> None:
+        freezer = getattr(self.system.ccc_pool, "freeze_f1", None)
+        pool_config = getattr(self.system.config, "ccc", None)
+        if not callable(freezer) or pool_config is None:
+            return
+        if int(getattr(pool_config, "freeze_f1_after", 0)) <= 0:
+            return
+        freezer()
+
+    def start_new_task(self) -> None:
+        if int(getattr(self.system.config.ccc, "freeze_f1_after", 0)) <= 0:
+            return
+        self._freeze_pool_f1_if_ready()
+        creator = getattr(self.system.ccc_pool, "create_task_adapter", None)
+        if callable(creator):
+            creator()
+
     def _recognition_label(
         self,
         concept_direction: torch.Tensor,
@@ -420,10 +459,14 @@ class VisionTrainer:
         self.system.config.ccc = grown_pool.config
         return grown_pool
 
-    def _update_pool_importance(self, fired_indices: list[int]) -> None:
+    def _update_pool_importance(
+        self,
+        fired_indices: list[int],
+        winner_confidences: torch.Tensor | None = None,
+    ) -> None:
         update_importance = getattr(self.system.ccc_pool, "update_importance", None)
         if callable(update_importance):
-            update_importance(fired_indices)
+            update_importance(fired_indices, confidences=winner_confidences)
 
     def _ccc_direction(self, index: int) -> torch.Tensor:
         if hasattr(self.system.ccc_pool, "concept_directions"):
@@ -467,77 +510,49 @@ class VisionTrainer:
         concept_direction = vote_result.winning_direction.detach().clone()
         return concept_direction, float(vote_result.confidence), vote_result.voter_count == 0
 
-    def _step_pool(self, tensor: torch.Tensor, *, allow_recruit: bool) -> tuple[list[int], torch.Tensor, float, bool]:
-        if getattr(self.system.config, "workspace", None) is not None:
-            pool = self.system.ccc_pool
-            if hasattr(pool, "_vectorized_state") and hasattr(pool, "_ensure_batch"):
-                raw_batch, _ = pool._ensure_batch(tensor)
-                state = pool._vectorized_state(raw_batch, timestep=self.system.timestep)
-                fired_mask = state.fired.any(dim=-1)
-                fired_indices = fired_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
-                winner_confidences = (
-                    state.confidence.index_select(0, torch.tensor(fired_indices, device=state.confidence.device)).mean(dim=-1)
-                    if fired_indices
-                    else torch.empty(0, dtype=torch.float32, device=state.confidence.device)
-                )
+    def _step_pool(
+        self,
+        tensor: torch.Tensor,
+        *,
+        allow_recruit: bool,
+        learning_rate_multiplier: float = 1.0,
+        preview: bool = False,
+    ) -> PoolStepResult:
+        pool = self.system.ccc_pool
+        if preview:
+            if not hasattr(pool, "preview"):
+                raise AttributeError("CCC pool preview path is unavailable.")
+            pool_output = pool.preview(tensor)
+        else:
+            pool_output = self.system._run_pool(
+                tensor,
+                allow_recruit=allow_recruit,
+                learning_rate_multiplier=learning_rate_multiplier,
+            )
 
-                if allow_recruit and not state.any_fired:
-                    pool = self._ensure_pool_growth(pool)
-                    recruit_index, recruit_output = pool.recruit(raw_batch, timestep=self.system.timestep)
-                    if recruit_index is not None and recruit_output is not None:
-                        fired_indices = [int(recruit_index)]
-                        winner_confidences = torch.tensor(
-                            [float(recruit_output.confidence.reshape(-1).mean().item())],
-                            dtype=torch.float32,
-                            device=state.confidence.device,
-                        )
-            else:
-                pool_output = self.system._run_pool(tensor, allow_recruit=allow_recruit)
-                fired_indices = list(pool_output.fired_indices)
-                winner_confidences = pool_output.winner_confidences
+        fired_indices = list(pool_output.fired_indices)
+        winner_confidences = pool_output.winner_confidences.to(torch.float32)
 
+        if getattr(self.system.config, "workspace", None) is not None and not preview:
             concept, confidence, abstained = self._workspace_consensus(
                 fired_indices,
-                winner_confidences.to(torch.float32),
+                winner_confidences,
             )
-            self.system.timestep += 1
-            self.last_fired_indices = fired_indices
-            return fired_indices, concept, float(confidence), bool(abstained)
-
-        pool = self.system.ccc_pool
-        if hasattr(pool, "_vectorized_state") and hasattr(pool, "_ensure_batch"):
-            raw_batch, _ = pool._ensure_batch(tensor)
-            state = pool._vectorized_state(raw_batch, timestep=self.system.timestep)
-            fired_mask = state.fired.any(dim=-1)
-            fired_indices = fired_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
-            winner_confidences = (
-                state.confidence.index_select(0, torch.tensor(fired_indices, device=state.confidence.device)).mean(dim=-1)
-                if fired_indices
-                else torch.empty(0, dtype=torch.float32, device=state.confidence.device)
-            )
-
-            if allow_recruit and not state.any_fired:
-                pool = self._ensure_pool_growth(pool)
-                recruit_index, recruit_output = pool.recruit(raw_batch, timestep=self.system.timestep)
-                if recruit_index is not None and recruit_output is not None:
-                    fired_indices = [int(recruit_index)]
-                    winner_confidences = torch.tensor(
-                        [float(recruit_output.confidence.reshape(-1).mean().item())],
-                        dtype=torch.float32,
-                        device=state.confidence.device,
-                    )
-
-            self.system.timestep += 1
+        else:
             concept, confidence = self._pool_concept(fired_indices, winner_confidences)
-            self.last_fired_indices = fired_indices
-            return fired_indices, concept, confidence, len(fired_indices) == 0
+            abstained = len(fired_indices) == 0
 
-        pool_output = self.system._run_pool(tensor, allow_recruit=allow_recruit)
-        self.system.timestep += 1
-        fired_indices = list(pool_output.fired_indices)
-        concept, confidence = self._pool_concept(fired_indices, pool_output.winner_confidences)
-        self.last_fired_indices = fired_indices
-        return fired_indices, concept, confidence, len(fired_indices) == 0
+        if not preview:
+            self.system.timestep += 1
+            self.last_fired_indices = fired_indices
+
+        return PoolStepResult(
+            fired_indices=fired_indices,
+            concept_direction=concept,
+            confidence=float(confidence),
+            abstained=bool(abstained),
+            winner_confidences=winner_confidences.detach().clone(),
+        )
 
     def _record_ccc_activity(
         self,
@@ -573,6 +588,42 @@ class VisionTrainer:
             error += 0.35
         return float(error)
 
+    def _preview_novelty_signal(self, prediction_error: float) -> NoveltySignal | None:
+        if self.curiosity_system is None:
+            return None
+
+        prediction_error = abs(float(prediction_error))
+        system = self.curiosity_system
+        baseline = (
+            max(float(system.prediction_error_baseline.item()), system.eps)
+            if int(system._prediction_error_count.item()) > 0
+            else max(prediction_error, system.eps)
+        )
+        novelty_ratio = prediction_error / baseline
+        novelty_score = max(0.0, novelty_ratio - 1.0)
+        is_novel = bool(
+            prediction_error > 0.0
+            and novelty_ratio > float(system.config.novelty_threshold)
+        )
+        novelty_state = 1.0 if is_novel else float(system.novelty_state.item())
+        learning_boost = 1.0 + (
+            max(0.0, float(system.config.novelty_boost) - 1.0) * novelty_state
+        )
+        return NoveltySignal(
+            is_novel=is_novel,
+            novelty_score=float(novelty_score),
+            orienting_response=is_novel,
+            learning_boost=float(max(1.0, learning_boost)),
+            attention_disruption=float(max(0.0, min(1.0, novelty_state))),
+        )
+
+    @staticmethod
+    def _boundary_score(winner_confidences: torch.Tensor) -> float:
+        if winner_confidences.numel() < 2:
+            return 0.0
+        top_values, _ = torch.topk(winner_confidences.to(torch.float32), k=2)
+        return float(max(0.0, min(1.0, 1.0 - abs(float(top_values[0] - top_values[1])))))
+
     def _curiosity_replay_count(
         self,
         *,
@@ -582,6 +633,7 @@ class VisionTrainer:
         abstained: bool,
         recruited: bool,
         replay_depth: int,
+        boundary_score: float = 0.0,
     ) -> int:
         if self.curiosity_system is None or replay_depth > 0:
             return 0
@@ -592,28 +644,43 @@ class VisionTrainer:
             priority += 1.0
         if recruited:
             priority += 0.5
-        if priority * float(self.config.curiosity_weight) < 0.75:
+        effective_weight = float(self.config.curiosity_weight)
+        if self.config.contrastive_curiosity:
+            priority += max(0.0, boundary_score)
+            effective_weight *= 1.0 + max(0.0, boundary_score)
+        if priority * effective_weight < 0.75:
             return 0
-        return 1
+        replay_count = 1
+        if self.config.contrastive_curiosity and (boundary_score * effective_weight) >= 0.5:
+            replay_count += 1
+        return replay_count
 
     def _train_single_sample(
         self,
         tensor: torch.Tensor,
         label: int | None,
+        *,
+        learning_rate_multiplier: float = 1.0,
     ) -> tuple[int | None, bool, bool, float]:
         before_committed = int(self._pool_stats()["num_committed"])
         tensor = self._prepare_tensor(tensor)
-        fired_indices, concept, confidence, abstained_flag = self._step_pool(
+        self._observe_pool_samples(1)
+        step_result = self._step_pool(
             tensor,
             allow_recruit=True,
+            learning_rate_multiplier=learning_rate_multiplier,
         )
-        prediction = None if abstained_flag else self._recognition_label(concept, fired_indices)
-        if not abstained_flag and label is not None:
-            self.label_bank.update(int(label), concept)
-        self._update_pool_importance(fired_indices)
-        self._record_ccc_activity(fired_indices, label, confidence)
+        prediction = (
+            None
+            if step_result.abstained
+            else self._recognition_label(step_result.concept_direction, step_result.fired_indices)
+        )
+        if not step_result.abstained and label is not None:
+            self.label_bank.update(int(label), step_result.concept_direction)
+        self._update_pool_importance(step_result.fired_indices, step_result.winner_confidences)
+        self._record_ccc_activity(step_result.fired_indices, label, step_result.confidence)
         recruited = int(self._pool_stats()["num_committed"]) > before_committed
-        return prediction, bool(abstained_flag), recruited, float(confidence)
+        return prediction, bool(step_result.abstained), recruited, float(step_result.confidence)
 
     @torch.no_grad()
     def train_online(
@@ -646,14 +713,21 @@ class VisionTrainer:
         num_passes = max(1, int(num_passes))
         samples = self._materialize_samples(data_stream, target_samples)
         train_samples, warmup_samples = self._fit_preprocessing(samples)
+        if warmup_samples > 0:
+            self._observe_pool_samples(warmup_samples)
+            if warmup_samples >= int(getattr(self.system.config.ccc, "freeze_f1_after", 0)):
+                self._freeze_pool_f1_if_ready()
 
         if interleave_classes:
             train_samples = _interleave_by_class(train_samples)
 
         if self.curiosity_system is not None:
             self.curiosity_system.reset()
+        if self.curriculum_scheduler is not None:
+            self.curriculum_scheduler.difficulty_scores.clear()
 
-        effective_target = len(train_samples) * num_passes
+        indexed_train_samples = [(sample_id, tensor, label) for sample_id, (tensor, label) in enumerate(train_samples)]
+        effective_target = len(indexed_train_samples) * num_passes
         processed = 0
         correct = 0
         labeled = 0
@@ -665,22 +739,87 @@ class VisionTrainer:
         novelty_scores: list[float] = []
         prediction_errors: list[float] = []
         curiosity_drives: list[float] = []
+        boundary_scores: list[float] = []
+        learning_rate_multipliers: list[float] = []
         curiosity_replays = 0
         progress_interval = max(1, max(effective_target, 1) // 10)
 
         for pass_index in range(num_passes):
             if pass_index == 0:
-                pass_samples = train_samples
+                pass_samples = indexed_train_samples
+            elif self.curriculum_scheduler is not None:
+                ordered_ids = self.curriculum_scheduler.order_samples(
+                    [sample_id for sample_id, _, _ in indexed_train_samples]
+                )
+                sample_lookup = {
+                    sample_id: (tensor, label)
+                    for sample_id, tensor, label in indexed_train_samples
+                }
+                pass_samples = [
+                    (sample_id, *sample_lookup[sample_id])
+                    for sample_id in ordered_ids
+                ]
             else:
                 # Shuffle independently for each repeat pass so the system
                 # does not memorise a fixed sequence.
-                perm = torch.randperm(len(train_samples)).tolist()
-                pass_samples = [train_samples[i] for i in perm]
+                perm = torch.randperm(len(indexed_train_samples)).tolist()
+                pass_samples = [indexed_train_samples[i] for i in perm]
 
-            queue = deque((tensor, label, 0) for tensor, label in pass_samples)
+            queue = deque((sample_id, tensor, label, 0) for sample_id, tensor, label in pass_samples)
             while queue:
-                tensor, label, replay_depth = queue.popleft()
-                prediction, abstained_flag, recruited, confidence = self._train_single_sample(tensor, label)
+                sample_id, tensor, label, replay_depth = queue.popleft()
+                preview_result: PoolStepResult | None = None
+                preview_prediction: int | None = None
+                preview_abstained = False
+                preview_confidence = 0.0
+                prediction_error_preview = 0.0
+                boundary_score = 0.0
+                learning_rate_multiplier = 1.0
+
+                needs_preview = (
+                    self.curiosity_system is not None
+                    or self.curriculum_scheduler is not None
+                    or self.config.contrastive_curiosity
+                )
+                if needs_preview:
+                    preview_result = self._step_pool(
+                        self._prepare_tensor(tensor),
+                        allow_recruit=False,
+                        preview=True,
+                    )
+                    preview_abstained = preview_result.abstained
+                    preview_confidence = float(preview_result.confidence)
+                    preview_prediction = (
+                        None
+                        if preview_result.abstained
+                        else self._recognition_label(
+                            preview_result.concept_direction,
+                            preview_result.fired_indices,
+                        )
+                    )
+                    if self.curriculum_scheduler is not None and replay_depth == 0 and pass_index == 0:
+                        self.curriculum_scheduler.score_sample(sample_id, preview_confidence)
+                    if self.curiosity_system is not None:
+                        prediction_error_preview = self._estimate_prediction_error(
+                            prediction=preview_prediction,
+                            label=label,
+                            confidence=preview_confidence,
+                            abstained=preview_abstained,
+                            recruited=False,
+                        )
+                        novelty_signal = self._preview_novelty_signal(prediction_error_preview)
+                        if novelty_signal is not None:
+                            learning_rate_multiplier *= max(1.0, float(novelty_signal.learning_boost))
+                    if self.config.contrastive_curiosity:
+                        boundary_score = self._boundary_score(preview_result.winner_confidences)
+                        boundary_scores.append(boundary_score)
+                learning_rate_multipliers.append(float(learning_rate_multiplier))
+
+                prediction, abstained_flag, recruited, confidence = self._train_single_sample(
+                    tensor,
+                    label,
+                    learning_rate_multiplier=learning_rate_multiplier,
+                )
 
                 processed += 1
                 if label is not None:
@@ -710,10 +849,11 @@ class VisionTrainer:
                         abstained=abstained_flag,
                         recruited=recruited,
                         replay_depth=replay_depth,
+                        boundary_score=boundary_score,
                     )
                     curiosity_replays += replay_count
                     for _ in range(replay_count):
-                        queue.append((tensor.detach().clone(), label, replay_depth + 1))
+                        queue.append((sample_id, tensor.detach().clone(), label, replay_depth + 1))
 
                 pool_stats = self._pool_stats()
                 current_capacity = max(int(pool_stats["total_concepts"]), 1)
@@ -745,9 +885,15 @@ class VisionTrainer:
             "pool_utilization_curve": utilization_curve,
             "abstention_rate_curve": abstention_curve,
             "curiosity_enabled": self.curiosity_system is not None,
+            "curriculum_enabled": self.curriculum_scheduler is not None,
+            "contrastive_curiosity_enabled": bool(self.config.contrastive_curiosity),
             "curiosity_replays": curiosity_replays,
             "mean_prediction_error": sum(prediction_errors) / max(len(prediction_errors), 1),
             "mean_novelty": sum(novelty_scores) / max(len(novelty_scores), 1),
+            "mean_boundary_score": sum(boundary_scores) / max(len(boundary_scores), 1),
+            "mean_learning_rate_multiplier": (
+                sum(learning_rate_multipliers) / max(len(learning_rate_multipliers), 1)
+            ),
             "peak_curiosity_drive": max(curiosity_drives, default=0.0),
         }
         if self.curiosity_system is not None:
@@ -777,16 +923,20 @@ class VisionTrainer:
         for sample in islice(_iter_samples(test_stream), target_samples):
             tensor, label = _sample_to_tensor_and_label(sample)
             tensor = self._prepare_tensor(tensor)
-            fired_indices, concept, _, abstained_flag = self._step_pool(tensor, allow_recruit=False)
-            prediction = None if abstained_flag else self._recognition_label(concept, fired_indices)
+            step_result = self._step_pool(tensor, allow_recruit=False)
+            prediction = (
+                None
+                if step_result.abstained
+                else self._recognition_label(step_result.concept_direction, step_result.fired_indices)
+            )
 
             total += 1
             labeled += int(label is not None)
             correct += int(label is not None and prediction == label)
             covered += int(prediction is not None)
             covered_correct += int(label is not None and prediction == label and prediction is not None)
-            abstained += int(abstained_flag)
-            firing_sum += len(fired_indices)
+            abstained += int(step_result.abstained)
+            firing_sum += len(step_result.fired_indices)
             predictions.append(prediction)
             labels.append(label)
             if label is not None:
@@ -829,14 +979,14 @@ class VisionTrainer:
         mean_confidence = 0.0
         ood_threshold = max(self.config.margin_threshold + 0.15, 0.75)
         for sample in iterable:
-            fired_indices, _, confidence, abstained_flag = self._step_pool(
+            step_result = self._step_pool(
                 self._prepare_tensor(sample.to(torch.float32).reshape(-1)),
                 allow_recruit=False,
             )
             total += 1
-            abstained += int(abstained_flag or confidence < ood_threshold)
-            mean_firing += len(fired_indices)
-            mean_confidence += confidence
+            abstained += int(step_result.abstained or step_result.confidence < ood_threshold)
+            mean_firing += len(step_result.fired_indices)
+            mean_confidence += step_result.confidence
 
         return {
             "abstention_rate": abstained / max(total, 1),
@@ -860,10 +1010,14 @@ class VisionTrainer:
                 batch_size=self.config.batch_size,
                 learning_rate=self.config.learning_rate,
                 consolidation_strength=self.config.consolidation_strength,
+                freeze_f1_after=self.config.freeze_f1_after,
+                f1_adapter_dim=self.config.f1_adapter_dim,
                 num_train_samples=self.config.num_train_samples,
                 num_test_samples=self.config.num_test_samples,
                 preprocessing_warmup_samples=self.config.preprocessing_warmup_samples,
                 curiosity_weight=self.config.curiosity_weight,
+                curriculum=self.config.curriculum,
+                contrastive_curiosity=self.config.contrastive_curiosity,
             ),
             preprocessing=copy.deepcopy(self.preprocessing),
         )
@@ -874,12 +1028,14 @@ class VisionTrainer:
         old_classes = class_sets[0]
         old_train = take_samples(stream, stage_train_limits, allowed_labels=old_classes)
         old_eval = take_samples(stream, eval_limit, allowed_labels=old_classes)
+        shadow.start_new_task()
         shadow.train_online(old_train, num_samples=len(old_train))
         before = shadow.evaluate(old_eval, num_samples=len(old_eval))
 
         stage_metrics: list[dict[str, object]] = [before]
         for stage_labels in class_sets[1:]:
             stage_train = take_samples(stream, stage_train_limits, allowed_labels=stage_labels)
+            shadow.start_new_task()
             shadow.train_online(stage_train, num_samples=len(stage_train))
             stage_metrics.append(
                 shadow.evaluate(

@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from bioarn.config import BioARNConfig, CCCConfig, MarginGateConfig, SDMConfig
-from bioarn.core.ccc import CCCOutput, CCCPool, CCCPoolOutput
+from bioarn.core.ccc import CCCOutput, CCCPool, CCCPoolOutput, F1Adapter
 from bioarn.core.consolidation import SynapticConsolidation
 from bioarn.core.margin_gate import MarginGateOutput, ResonanceOutput
 from bioarn.core.math_utils import cosine_similarity, normalize
@@ -133,16 +133,19 @@ def _copy_batched_pool_slice(
     target.avg_confidence_when_abstained[target_slice].copy_(
         source.avg_confidence_when_abstained[source_slice]
     )
+    target.adapter_assignments[target_slice].copy_(source.adapter_assignments[source_slice])
     target.consolidation.copy_slice_from(
         source.consolidation,
         source_start=source_start,
         target_start=target_start,
         length=length,
     )
+    target._copy_shared_state_from(source)
 
 
 @dataclass
 class _BatchedForwardState:
+    base_f1_output: torch.Tensor
     f1_output: torch.Tensor
     f2_activation: torch.Tensor
     confidence: torch.Tensor
@@ -206,6 +209,7 @@ class BatchedCCCPool(nn.Module):
             torch.zeros(num_cccs, config.concept_dim, dtype=torch.float32),
         )
         self.register_buffer("committed_mask", torch.zeros(num_cccs, dtype=torch.bool))
+        self.register_buffer("adapter_assignments", torch.full((num_cccs,), -1, dtype=torch.long))
         self.register_buffer("age", torch.zeros(num_cccs, dtype=torch.long))
         self.register_buffer("last_fired", torch.full((num_cccs,), -1, dtype=torch.long))
         self.register_buffer(
@@ -233,6 +237,10 @@ class BatchedCCCPool(nn.Module):
             device=self.concept_directions.device,
             dtype=torch.float32,
         )
+        self.task_adapters = nn.ModuleList()
+        self.active_adapter_id = -1
+        self.register_buffer("f1_samples_seen", torch.tensor(0, dtype=torch.long))
+        self.register_buffer("f1_frozen", torch.tensor(False, dtype=torch.bool))
 
     @staticmethod
     def _ensure_batch(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -251,6 +259,78 @@ class BatchedCCCPool(nn.Module):
     @staticmethod
     def _confidence_score(confidence: torch.Tensor) -> torch.Tensor:
         return confidence.reshape(-1).mean()
+
+    @property
+    def current_adapter(self) -> F1Adapter | None:
+        if 0 <= self.active_adapter_id < len(self.task_adapters):
+            return self.task_adapters[self.active_adapter_id]
+        return None
+
+    def freeze_f1(self) -> None:
+        self.f1_frozen.fill_(True)
+
+    def observe_samples(self, sample_count: int) -> None:
+        count = int(max(0, sample_count))
+        if count <= 0:
+            return
+        self.f1_samples_seen.add_(count)
+        if (
+            not bool(self.f1_frozen.item())
+            and int(self.config.freeze_f1_after) > 0
+            and int(self.f1_samples_seen.item()) >= int(self.config.freeze_f1_after)
+        ):
+            self.freeze_f1()
+
+    def create_task_adapter(self) -> F1Adapter | None:
+        if int(self.config.freeze_f1_after) <= 0:
+            return None
+        self.freeze_f1()
+        current = self.current_adapter
+        if current is not None:
+            current.freeze()
+        adapter = F1Adapter(
+            self.config.num_f1_features,
+            adapter_dim=self.config.f1_adapter_dim,
+        )
+        adapter.unfreeze()
+        self.task_adapters.append(adapter)
+        self.active_adapter_id = len(self.task_adapters) - 1
+        return adapter
+
+    def _copy_shared_state_from(self, source: "BatchedCCCPool") -> None:
+        cloned_adapters = nn.ModuleList()
+        for adapter in source.task_adapters:
+            cloned = F1Adapter(source.config.num_f1_features, adapter_dim=source.config.f1_adapter_dim)
+            cloned.load_state_dict(adapter.state_dict())
+            if bool(adapter.is_frozen.item()):
+                cloned.freeze()
+            else:
+                cloned.unfreeze()
+            cloned_adapters.append(cloned)
+        self.task_adapters = cloned_adapters
+        self.active_adapter_id = int(source.active_adapter_id)
+        self.f1_samples_seen.copy_(source.f1_samples_seen)
+        self.f1_frozen.copy_(source.f1_frozen)
+
+    def _adapter_lr(self, base_lr: float) -> float:
+        return min(0.05, max(1e-3, float(base_lr)))
+
+    def _shared_f1_encode(self, raw_batch: torch.Tensor) -> torch.Tensor:
+        projected = (
+            raw_batch.to(self.f1_weights.dtype) @ self.f1_weights[0].transpose(0, 1)
+        ) + self.f1_bias[0]
+        activated = F.relu(projected)
+        top_k = min(self.config.f1_top_k, activated.shape[-1])
+        values, indices = torch.topk(activated, k=top_k, dim=-1)
+        return torch.zeros_like(activated).scatter(-1, indices, values)
+
+    def _apply_adapter(self, f1_batch: torch.Tensor, adapter_id: int) -> torch.Tensor:
+        if adapter_id < 0 or adapter_id >= len(self.task_adapters):
+            return f1_batch
+        adapted = self.task_adapters[adapter_id](f1_batch)
+        top_k = min(self.config.f1_top_k, adapted.shape[-1])
+        values, indices = torch.topk(F.relu(adapted), k=top_k, dim=-1)
+        return torch.zeros_like(adapted).scatter(-1, indices, values)
 
     def grow(self, new_size: int | None = None) -> "BatchedCCCPool":
         current_size = int(self.config.max_pool_size)
@@ -272,21 +352,21 @@ class BatchedCCCPool(nn.Module):
         _copy_batched_pool_slice(self, grown, length=current_size)
         return grown
 
-    def update_importance(self, fired_indices: list[int] | torch.Tensor) -> torch.Tensor:
+    def update_importance(
+        self,
+        fired_indices: list[int] | torch.Tensor,
+        *,
+        confidences: torch.Tensor | list[float] | None = None,
+    ) -> torch.Tensor:
         return self.consolidation.update_importance(
             fired_indices,
             current_size=int(self.config.max_pool_size),
+            confidences=confidences,
         )
 
     def _row_f1_encode(self, index: int, raw_batch: torch.Tensor) -> torch.Tensor:
-        projected = (
-            raw_batch.to(self.f1_weights.dtype) @ self.f1_weights[index].transpose(0, 1)
-        ) + self.f1_bias[index]
-        activated = F.relu(projected)
-        top_k = min(self.config.f1_top_k, activated.shape[-1])
-        values, indices = torch.topk(activated, k=top_k, dim=-1)
-        sparse = torch.zeros_like(activated)
-        return sparse.scatter(-1, indices, values)
+        base_f1 = self._shared_f1_encode(raw_batch)
+        return self._apply_adapter(base_f1, int(self.adapter_assignments[index].item()))
 
     def _row_f2_activate(self, index: int, f1_batch: torch.Tensor) -> torch.Tensor:
         return f1_batch.to(self.f2_weights.dtype) @ self.f2_weights[index].transpose(0, 1)
@@ -342,10 +422,12 @@ class BatchedCCCPool(nn.Module):
 
     def _apply_slow_learning(
         self,
+        base_f1_output: torch.Tensor,
         f1_output: torch.Tensor,
         f2_activation: torch.Tensor,
         resonated: torch.Tensor,
         learn_signal: torch.Tensor,
+        learning_rate_multiplier: float | torch.Tensor = 1.0,
     ) -> None:
         active_learning = resonated.any(dim=-1)
         if not bool(active_learning.any().item()):
@@ -358,7 +440,19 @@ class BatchedCCCPool(nn.Module):
             device=f2_activation.device,
             dtype=f2_activation.dtype,
         )
-        concept_lr = float(self.config.slow_lr) * lr_scale
+        if isinstance(learning_rate_multiplier, torch.Tensor):
+            lr_multiplier = learning_rate_multiplier.to(device=f2_activation.device, dtype=f2_activation.dtype).reshape(-1)
+            if lr_multiplier.numel() == 1:
+                lr_multiplier = lr_multiplier.expand(int(self.config.max_pool_size))
+        else:
+            lr_multiplier = torch.full(
+                (int(self.config.max_pool_size),),
+                float(learning_rate_multiplier),
+                device=f2_activation.device,
+                dtype=f2_activation.dtype,
+            )
+        lr_multiplier = lr_multiplier.clamp_min(0.0)
+        concept_lr = float(self.config.slow_lr) * lr_scale * lr_multiplier
         updated_direction = self.concept_directions + (concept_lr.unsqueeze(-1) * concept_delta)
         normalized_update = normalize(updated_direction)
         self.concept_directions.copy_(
@@ -369,7 +463,7 @@ class BatchedCCCPool(nn.Module):
         residual = (f1_output - prediction_full) * learning_mask.to(f1_output.dtype)
         hebbian = torch.matmul(residual.transpose(1, 2), f2_activation)
         hebbian = hebbian / max(f1_output.shape[1], 1)
-        feedback_lr = float(self.config.feedback_lr) * lr_scale
+        feedback_lr = float(self.config.feedback_lr) * lr_scale * lr_multiplier
         updated_feedback = self.feedback_weights + (feedback_lr.view(-1, 1, 1) * hebbian)
         normalized_feedback = normalize(updated_feedback)
         self.feedback_weights.copy_(
@@ -379,16 +473,41 @@ class BatchedCCCPool(nn.Module):
                 self.feedback_weights,
             )
         )
+        if not self.task_adapters:
+            return
+        for adapter_id in torch.unique(self.adapter_assignments[active_learning]).tolist():
+            adapter_id = int(adapter_id)
+            if adapter_id < 0 or adapter_id >= len(self.task_adapters):
+                continue
+            adapter_mask = active_learning & (self.adapter_assignments == adapter_id)
+            if not bool(adapter_mask.any().item()):
+                continue
+            adapter_signal = learn_signal[adapter_mask].amax(dim=0).to(base_f1_output.dtype)
+            self.task_adapters[adapter_id].hebbian_update(
+                base_f1_output,
+                learning_signal=adapter_signal,
+                lr=self._adapter_lr(self.config.slow_lr) * float(lr_multiplier[adapter_mask].mean().item()),
+            )
 
-    def _vectorized_state(self, raw_batch: torch.Tensor, timestep: int) -> _BatchedForwardState:
+    def _vectorized_state(
+        self,
+        raw_batch: torch.Tensor,
+        timestep: int,
+        *,
+        apply_learning: bool = True,
+        update_state: bool = True,
+        learning_rate_multiplier: float | torch.Tensor = 1.0,
+    ) -> _BatchedForwardState:
         inputs = raw_batch.to(self.f1_weights.dtype)
         num_cccs = int(self.config.max_pool_size)
         batch_size = raw_batch.shape[0]
         committed = self.committed_mask
-        self.age.add_(committed.to(self.age.dtype) * raw_batch.shape[0])
+        if update_state:
+            self.age.add_(committed.to(self.age.dtype) * raw_batch.shape[0])
         device = inputs.device
         dtype = inputs.dtype
 
+        base_f1_output = self._shared_f1_encode(raw_batch)
         f1_output = torch.zeros(
             num_cccs,
             batch_size,
@@ -420,72 +539,85 @@ class BatchedCCCPool(nn.Module):
 
         committed_indices = committed.nonzero(as_tuple=False).squeeze(-1)
         if committed_indices.numel() > 0:
-            shared_projection = inputs @ self.f1_weights[0].transpose(0, 1)
-            shared_projection = shared_projection + self.f1_bias[0]
-            shared_activated = F.relu(shared_projection)
-
-            top_k = min(self.config.f1_top_k, shared_activated.shape[-1])
-            top_values, top_indices = torch.topk(shared_activated, k=top_k, dim=-1)
-            shared_f1 = torch.zeros_like(shared_activated).scatter(-1, top_indices, top_values)
-
-            committed_count = committed_indices.numel()
-            committed_f1 = shared_f1.unsqueeze(0).expand(committed_count, -1, -1)
-            committed_f2_weights = self.f2_weights.index_select(0, committed_indices)
-            committed_f2 = torch.matmul(
-                committed_f2_weights,
-                shared_f1.transpose(0, 1),
-            ).transpose(1, 2)
             committed_directions = normalize(self.concept_directions.index_select(0, committed_indices)).unsqueeze(1)
-            committed_confidence = (
-                normalize(committed_f2).to(committed_directions.dtype) * committed_directions
-            ).sum(dim=-1)
-            committed_fired = committed_confidence > self.theta_margin.index_select(0, committed_indices).unsqueeze(-1)
-            committed_gate = torch.where(
-                committed_fired.unsqueeze(-1),
-                committed_f2,
-                torch.zeros_like(committed_f2),
-            )
-            committed_feedback = self.feedback_weights.index_select(0, committed_indices)
-            committed_prediction = torch.matmul(
-                committed_feedback,
-                committed_gate.transpose(1, 2),
-            ).transpose(1, 2)
-            committed_match = cosine_similarity(committed_prediction, committed_f1)
-            resonance_margin = self.theta_resonance.index_select(0, committed_indices).unsqueeze(-1)
-            committed_resonated = committed_fired & (committed_match > resonance_margin)
-            committed_learn = torch.where(
-                committed_resonated,
-                ((committed_match - resonance_margin) / (1.0 - resonance_margin).clamp_min(1e-6)).clamp(
-                    min=0.0,
-                    max=1.0,
-                ),
-                torch.zeros_like(committed_match),
-            )
+            committed_adapters = self.adapter_assignments.index_select(0, committed_indices)
+            for adapter_id in torch.unique(committed_adapters).tolist():
+                adapter_id = int(adapter_id)
+                adapter_mask = committed_adapters == adapter_id
+                adapter_indices = committed_indices[adapter_mask]
+                adapted_f1 = self._apply_adapter(base_f1_output, adapter_id)
+                committed_count = adapter_indices.numel()
+                committed_f1 = adapted_f1.unsqueeze(0).expand(committed_count, -1, -1)
+                committed_f2_weights = self.f2_weights.index_select(0, adapter_indices)
+                committed_f2 = torch.matmul(
+                    committed_f2_weights,
+                    adapted_f1.transpose(0, 1),
+                ).transpose(1, 2)
+                adapter_directions = committed_directions[adapter_mask]
+                committed_confidence = (
+                    normalize(committed_f2).to(adapter_directions.dtype) * adapter_directions
+                ).sum(dim=-1)
+                committed_fired = (
+                    committed_confidence
+                    > self.theta_margin.index_select(0, adapter_indices).unsqueeze(-1)
+                )
+                committed_gate = torch.where(
+                    committed_fired.unsqueeze(-1),
+                    committed_f2,
+                    torch.zeros_like(committed_f2),
+                )
+                committed_feedback = self.feedback_weights.index_select(0, adapter_indices)
+                committed_prediction = torch.matmul(
+                    committed_feedback,
+                    committed_gate.transpose(1, 2),
+                ).transpose(1, 2)
+                committed_match = cosine_similarity(committed_prediction, committed_f1)
+                resonance_margin = self.theta_resonance.index_select(0, adapter_indices).unsqueeze(-1)
+                committed_resonated = committed_fired & (committed_match > resonance_margin)
+                committed_learn = torch.where(
+                    committed_resonated,
+                    (
+                        (committed_match - resonance_margin)
+                        / (1.0 - resonance_margin).clamp_min(1e-6)
+                    ).clamp(min=0.0, max=1.0),
+                    torch.zeros_like(committed_match),
+                )
 
-            f1_output.index_copy_(0, committed_indices, committed_f1)
-            f2_activation.index_copy_(0, committed_indices, committed_f2)
-            confidence.index_copy_(0, committed_indices, committed_confidence)
-            fired.index_copy_(0, committed_indices, committed_fired)
-            abstained.index_copy_(0, committed_indices, ~committed_fired)
-            gate_output.index_copy_(0, committed_indices, committed_gate)
-            prediction.index_copy_(0, committed_indices, committed_prediction)
-            match_score.index_copy_(0, committed_indices, committed_match)
-            resonated.index_copy_(0, committed_indices, committed_resonated)
-            learn_signal.index_copy_(0, committed_indices, committed_learn)
+                f1_output.index_copy_(0, adapter_indices, committed_f1)
+                f2_activation.index_copy_(0, adapter_indices, committed_f2)
+                confidence.index_copy_(0, adapter_indices, committed_confidence)
+                fired.index_copy_(0, adapter_indices, committed_fired)
+                abstained.index_copy_(0, adapter_indices, ~committed_fired)
+                gate_output.index_copy_(0, adapter_indices, committed_gate)
+                prediction.index_copy_(0, adapter_indices, committed_prediction)
+                match_score.index_copy_(0, adapter_indices, committed_match)
+                resonated.index_copy_(0, adapter_indices, committed_resonated)
+                learn_signal.index_copy_(0, adapter_indices, committed_learn)
 
-        self._update_gate_stats(confidence, fired, committed)
-        self._apply_slow_learning(f1_output, f2_activation, resonated, learn_signal)
+        if update_state:
+            self._update_gate_stats(confidence, fired, committed)
+        if apply_learning:
+            self._apply_slow_learning(
+                base_f1_output,
+                f1_output,
+                f2_activation,
+                resonated,
+                learn_signal,
+                learning_rate_multiplier=learning_rate_multiplier,
+            )
 
         fired_any = fired.any(dim=-1)
-        self.last_fired.copy_(
-            torch.where(
-                fired_any,
-                torch.full_like(self.last_fired, int(timestep)),
-                self.last_fired,
+        if update_state:
+            self.last_fired.copy_(
+                torch.where(
+                    fired_any,
+                    torch.full_like(self.last_fired, int(timestep)),
+                    self.last_fired,
+                )
             )
-        )
 
         return _BatchedForwardState(
+            base_f1_output=base_f1_output,
             f1_output=f1_output,
             f2_activation=f2_activation,
             confidence=confidence,
@@ -502,13 +634,19 @@ class BatchedCCCPool(nn.Module):
     def _single_slow_learn(
         self,
         index: int,
+        raw_batch: torch.Tensor,
         f1_batch: torch.Tensor,
         f2_batch: torch.Tensor,
         resonance: ResonanceOutput,
+        learning_rate_multiplier: float | torch.Tensor = 1.0,
     ) -> None:
         learn_signal = resonance.learn_signal.reshape(-1).to(f2_batch.dtype)
         concept_delta = (f2_batch * learn_signal.unsqueeze(-1)).mean(dim=0)
-        concept_lr = self.consolidation.effective_lr(self.config.slow_lr, index)
+        lr_multiplier = max(
+            0.0,
+            float(torch.as_tensor(learning_rate_multiplier, dtype=torch.float32).mean().item()),
+        )
+        concept_lr = self.consolidation.effective_lr(self.config.slow_lr, index) * lr_multiplier
         updated_direction = self.concept_directions[index] + (concept_lr * concept_delta)
         self.concept_directions[index].copy_(normalize(updated_direction.unsqueeze(0)).squeeze(0))
 
@@ -516,9 +654,16 @@ class BatchedCCCPool(nn.Module):
         residual = (f1_batch - prediction) * learn_signal.unsqueeze(-1)
         hebbian = residual.transpose(0, 1) @ f2_batch
         hebbian /= max(f1_batch.shape[0], 1)
-        feedback_lr = self.consolidation.effective_lr(self.config.feedback_lr, index)
+        feedback_lr = self.consolidation.effective_lr(self.config.feedback_lr, index) * lr_multiplier
         updated_feedback = self.feedback_weights[index] + (feedback_lr * hebbian)
         self.feedback_weights[index].copy_(normalize(updated_feedback))
+        adapter_id = int(self.adapter_assignments[index].item())
+        if 0 <= adapter_id < len(self.task_adapters):
+            self.task_adapters[adapter_id].hebbian_update(
+                self._shared_f1_encode(raw_batch),
+                learning_signal=learn_signal,
+                lr=self._adapter_lr(self.config.slow_lr) * lr_multiplier,
+            )
 
     def _single_forward_index(
         self,
@@ -526,6 +671,8 @@ class BatchedCCCPool(nn.Module):
         raw_batch: torch.Tensor,
         squeeze: bool,
         timestep: int,
+        *,
+        learning_rate_multiplier: float | torch.Tensor = 1.0,
     ) -> CCCOutput:
         f1_batch = self._row_f1_encode(index, raw_batch)
         f2_batch = self._row_f2_activate(index, f1_batch)
@@ -585,9 +732,11 @@ class BatchedCCCPool(nn.Module):
             if bool(resonated.any().item()):
                 self._single_slow_learn(
                     index,
+                    raw_batch,
                     f1_batch,
                     f2_batch,
                     ResonanceOutput(match_score=match_score, resonated=resonated, learn_signal=learn_signal),
+                    learning_rate_multiplier=learning_rate_multiplier,
                 )
             self.last_fired[index].fill_(int(timestep))
 
@@ -685,7 +834,12 @@ class BatchedCCCPool(nn.Module):
         """Run compact vectorized inference without constructing per-CCC Python outputs."""
 
         raw_batch, _ = self._ensure_batch(raw_input)
-        state = self._vectorized_state(raw_batch, timestep=timestep)
+        state = self._vectorized_state(
+            raw_batch,
+            timestep=timestep,
+            apply_learning=False,
+            update_state=False,
+        )
         fired_mask = state.fired.any(dim=-1)
         fired_indices = fired_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
         winner_confidences = (
@@ -717,10 +871,35 @@ class BatchedCCCPool(nn.Module):
             mean_confidence=float(winner_confidences.mean().item()) if num_fired else 0.0,
         )
 
-    def _learn_fast_index(self, index: int, raw_batch: torch.Tensor, f1_batch: torch.Tensor) -> None:
-        del raw_batch
+    def _learn_fast_index(
+        self,
+        index: int,
+        raw_batch: torch.Tensor,
+        f1_batch: torch.Tensor,
+        *,
+        learning_rate_multiplier: float | torch.Tensor = 1.0,
+    ) -> None:
+        base_f1 = self._shared_f1_encode(raw_batch)
+        lr_multiplier = max(
+            0.0,
+            float(torch.as_tensor(learning_rate_multiplier, dtype=torch.float32).mean().item()),
+        )
+        adapter_id = int(self.adapter_assignments[index].item())
+        if 0 <= adapter_id < len(self.task_adapters):
+            self.task_adapters[adapter_id].hebbian_update(
+                base_f1,
+                learning_signal=torch.ones(
+                    base_f1.shape[0],
+                    device=base_f1.device,
+                    dtype=base_f1.dtype,
+                ),
+                lr=self._adapter_lr(self.config.fast_lr) * lr_multiplier,
+            )
+            f1_batch = self._apply_adapter(base_f1, adapter_id)
         prototype_f2 = self._row_f2_activate(index, f1_batch).mean(dim=0)
-        updated_direction = self.concept_directions[index] + (self.config.fast_lr * prototype_f2)
+        updated_direction = self.concept_directions[index] + (
+            (float(self.config.fast_lr) * lr_multiplier) * prototype_f2
+        )
         normalized_direction = normalize(updated_direction.unsqueeze(0)).squeeze(0)
         self.concept_directions[index].copy_(normalized_direction)
 
@@ -734,15 +913,60 @@ class BatchedCCCPool(nn.Module):
         self,
         raw_input: torch.Tensor,
         timestep: int = 0,
+        *,
+        learning_rate_multiplier: float | torch.Tensor = 1.0,
     ) -> tuple[int | None, CCCOutput | None]:
         recruit_index = self._first_uncommitted_index()
         if recruit_index is None:
             return None, None
 
         raw_batch, squeeze = self._ensure_batch(raw_input)
+        if self.current_adapter is not None:
+            self.adapter_assignments[recruit_index].fill_(int(self.active_adapter_id))
         f1_batch = self._row_f1_encode(recruit_index, raw_batch)
-        self._learn_fast_index(recruit_index, raw_batch, f1_batch)
-        return recruit_index, self._single_forward_index(recruit_index, raw_batch, squeeze, timestep)
+        self._learn_fast_index(
+            recruit_index,
+            raw_batch,
+            f1_batch,
+            learning_rate_multiplier=learning_rate_multiplier,
+        )
+        return recruit_index, self._single_forward_index(
+            recruit_index,
+            raw_batch,
+            squeeze,
+            timestep,
+            learning_rate_multiplier=learning_rate_multiplier,
+        )
+
+    @torch.no_grad()
+    def preview(self, raw_input: torch.Tensor) -> CCCPoolOutput:
+        """Run the batched pool read-only without recruitment or learning."""
+
+        raw_batch, squeeze = self._ensure_batch(raw_input)
+        state = self._vectorized_state(
+            raw_batch,
+            timestep=0,
+            apply_learning=False,
+            update_state=False,
+        )
+        outputs = self._pack_outputs(state, squeeze=squeeze)
+        fired_indices = [index for index, output in enumerate(outputs) if output.fired]
+        abstained_indices = [index for index, output in enumerate(outputs) if output.abstained]
+        winner_confidences = (
+            torch.stack(
+                [self._confidence_score(outputs[index].confidence) for index in fired_indices]
+            )
+            if fired_indices
+            else torch.empty(0, dtype=torch.float32, device=self.f1_weights.device)
+        )
+        return CCCPoolOutput(
+            outputs=outputs,
+            fired_indices=fired_indices,
+            abstained_indices=abstained_indices,
+            recruited=False,
+            recruited_index=None,
+            winner_confidences=winner_confidences,
+        )
 
     @torch.no_grad()
     def forward(
@@ -750,15 +974,26 @@ class BatchedCCCPool(nn.Module):
         raw_input: torch.Tensor,
         timestep: int = 0,
         allow_recruit: bool = True,
+        *,
+        learning_rate_multiplier: float | torch.Tensor = 1.0,
     ) -> CCCPoolOutput:
         raw_batch, squeeze = self._ensure_batch(raw_input)
-        state = self._vectorized_state(raw_batch, timestep=timestep)
+        self.observe_samples(raw_batch.shape[0])
+        state = self._vectorized_state(
+            raw_batch,
+            timestep=timestep,
+            learning_rate_multiplier=learning_rate_multiplier,
+        )
         outputs = self._pack_outputs(state, squeeze=squeeze)
 
         recruited = False
         recruited_index: int | None = None
         if allow_recruit and not state.any_fired:
-            recruited_index, recruited_output = self.recruit(raw_batch, timestep=timestep)
+            recruited_index, recruited_output = self.recruit(
+                raw_batch,
+                timestep=timestep,
+                learning_rate_multiplier=learning_rate_multiplier,
+            )
             if recruited_index is not None and recruited_output is not None:
                 recruited = True
                 outputs[recruited_index] = recruited_output
@@ -813,6 +1048,8 @@ class BatchedCCCPool(nn.Module):
             "mean_importance": float(
                 self.consolidation.importance[: int(self.config.max_pool_size)].mean().item()
             ),
+            "f1_frozen": bool(self.f1_frozen.item()),
+            "task_adapters": len(self.task_adapters),
         }
 
     @torch.no_grad()
@@ -824,6 +1061,7 @@ class BatchedCCCPool(nn.Module):
             self.feedback_weights.copy_(pool.feedback_weights)
             self.concept_directions.copy_(pool.concept_directions)
             self.committed_mask.copy_(pool.committed_mask)
+            self.adapter_assignments.copy_(pool.adapter_assignments)
             self.age.copy_(pool.age)
             self.last_fired.copy_(pool.last_fired)
             self.theta_margin.copy_(pool.theta_margin)
@@ -834,6 +1072,7 @@ class BatchedCCCPool(nn.Module):
             self.avg_confidence_when_fired.copy_(pool.avg_confidence_when_fired)
             self.avg_confidence_when_abstained.copy_(pool.avg_confidence_when_abstained)
             self.consolidation.copy_from(pool.consolidation)
+            self._copy_shared_state_from(pool)
             return self
 
         for index, ccc in enumerate(pool.cccs):
@@ -843,6 +1082,7 @@ class BatchedCCCPool(nn.Module):
             self.feedback_weights[index].copy_(ccc.feedback_weights.detach())
             self.concept_directions[index].copy_(ccc.concept_direction.detach())
             self.committed_mask[index].copy_(ccc.is_committed.detach())
+            self.adapter_assignments[index].fill_(int(getattr(ccc, "adapter_id", -1)))
             self.age[index].copy_(ccc.age.detach())
             self.last_fired[index].copy_(ccc.last_fired.detach())
             self.theta_margin[index].copy_(ccc.margin_gate.theta_margin.detach())
@@ -859,6 +1099,22 @@ class BatchedCCCPool(nn.Module):
             self.consolidation.importance[index].copy_(ccc.importance.detach())
         if hasattr(pool, "consolidation"):
             self.consolidation.copy_from(pool.consolidation)
+        if hasattr(pool, "task_adapters"):
+            cloned_adapters = nn.ModuleList()
+            for adapter in pool.task_adapters:
+                cloned = F1Adapter(pool.config.num_f1_features, adapter_dim=pool.config.f1_adapter_dim)
+                cloned.load_state_dict(adapter.state_dict())
+                if bool(adapter.is_frozen.item()):
+                    cloned.freeze()
+                else:
+                    cloned.unfreeze()
+                cloned_adapters.append(cloned)
+            self.task_adapters = cloned_adapters
+            self.active_adapter_id = int(getattr(pool, "active_adapter_id", -1))
+        if hasattr(pool, "f1_samples_seen"):
+            self.f1_samples_seen.copy_(pool.f1_samples_seen)
+        if hasattr(pool, "f1_frozen"):
+            self.f1_frozen.copy_(pool.f1_frozen)
         return self
 
 
@@ -1162,6 +1418,7 @@ class AdaptiveCapacity(nn.Module):
             self.pool.feedback_weights[index].zero_()
             self.pool.concept_directions[index].zero_()
             self.pool.committed_mask[index].fill_(False)
+            self.pool.adapter_assignments[index].fill_(-1)
             self.pool.age[index].zero_()
             self.pool.last_fired[index].fill_(-1)
             self.pool.total_presentations[index].zero_()
@@ -2035,10 +2292,25 @@ class ScaledBioARN(BioARNCore):
         self.fabric.sdm = optimized_sdm
         self.fabric.temporal_associator = TemporalAssociator(self.fabric.sdm, config.sdm)
 
-    def _run_pool(self, raw_input: torch.Tensor, *, allow_recruit: bool) -> CCCPoolOutput:
+    def _run_pool(
+        self,
+        raw_input: torch.Tensor,
+        *,
+        allow_recruit: bool,
+        learning_rate_multiplier: float | torch.Tensor = 1.0,
+    ) -> CCCPoolOutput:
         if not self.use_optimized:
-            return super()._run_pool(raw_input, allow_recruit=allow_recruit)
-        return self.ccc_pool(raw_input, timestep=self.timestep, allow_recruit=allow_recruit)
+            return super()._run_pool(
+                raw_input,
+                allow_recruit=allow_recruit,
+                learning_rate_multiplier=learning_rate_multiplier,
+            )
+        return self.ccc_pool(
+            raw_input,
+            timestep=self.timestep,
+            allow_recruit=allow_recruit,
+            learning_rate_multiplier=learning_rate_multiplier,
+        )
 
     def _active_cccs(self, pool_output: CCCPoolOutput) -> list[tuple[int, torch.Tensor, float]]:
         if not self.use_optimized:

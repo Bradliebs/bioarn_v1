@@ -4,10 +4,11 @@ import torch
 
 from bioarn.config import CCCConfig, GNWConfig, MarginGateConfig
 from bioarn.core.ccc import CCCPool
+from bioarn.core.consolidation import SynapticConsolidation
 from bioarn.core.math_utils import normalize
 from bioarn.loop import SensorimotorLoop
 from bioarn.scaling import BatchedCCCPool
-from bioarn.training import SyntheticCIFAR10Stream, VisionTrainConfig, VisionTrainer
+from bioarn.training import CurriculumScheduler, SyntheticCIFAR10Stream, VisionTrainConfig, VisionTrainer
 
 
 def make_config(
@@ -18,6 +19,9 @@ def make_config(
     use_batched: bool = True,
     margin_threshold: float = 0.55,
     curiosity_weight: float = 0.0,
+    freeze_f1_after: int = 0,
+    curriculum: bool = False,
+    contrastive_curiosity: bool = False,
     workspace: GNWConfig | None = None,
 ) -> VisionTrainConfig:
     return VisionTrainConfig(
@@ -28,9 +32,12 @@ def make_config(
         use_batched=use_batched,
         batch_size=32,
         learning_rate=0.01,
+        freeze_f1_after=freeze_f1_after,
         num_train_samples=num_train_samples,
         num_test_samples=num_test_samples,
         curiosity_weight=curiosity_weight,
+        curriculum=curriculum,
+        contrastive_curiosity=contrastive_curiosity,
         workspace=workspace,
     )
 
@@ -140,6 +147,39 @@ def test_curiosity_improves_small_sample_convergence() -> None:
     assert len(curious_result["raw_accuracy_curve"]) == 40
     assert curious_result["accuracy"] > baseline_result["accuracy"]
     assert curious_metrics["accuracy"] >= baseline_metrics["accuracy"]
+
+
+def test_curriculum_scheduler_orders_easy_first() -> None:
+    scheduler = CurriculumScheduler()
+    scheduler.score_sample("hard", 0.2)
+    scheduler.score_sample("easy", 0.9)
+    scheduler.score_sample("medium", 0.5)
+
+    assert scheduler.order_samples(["medium", "hard", "easy"]) == ["easy", "medium", "hard"]
+
+
+def test_curriculum_scores_first_pass_samples() -> None:
+    trainer = VisionTrainer(make_config(num_train_samples=60, curriculum=True))
+    result = trainer.train_online(make_stream(60, seed=51), num_samples=60, num_passes=2)
+
+    assert result["curriculum_enabled"] is True
+    assert trainer.curriculum_scheduler is not None
+    assert len(trainer.curriculum_scheduler.difficulty_scores) == 60
+
+
+def test_contrastive_curiosity_boosts_replay_priority() -> None:
+    trainer = VisionTrainer(
+        make_config(
+            num_train_samples=80,
+            curiosity_weight=0.8,
+            contrastive_curiosity=True,
+        )
+    )
+    result = trainer.train_online(make_stream(80, seed=61), num_samples=80)
+
+    assert result["contrastive_curiosity_enabled"] is True
+    assert result["mean_boundary_score"] >= 0.0
+    assert result["mean_learning_rate_multiplier"] > 1.0
 
 
 def test_accuracy_above_chance() -> None:
@@ -288,6 +328,55 @@ def test_consolidation_slows_important_cccs() -> None:
     assert fresh_lr == config.slow_lr
 
 
+def test_task_adapters_are_created_per_task() -> None:
+    trainer = VisionTrainer(
+        make_config(
+            max_pool_size=96,
+            num_train_samples=40,
+            freeze_f1_after=10,
+        )
+    )
+
+    trainer.start_new_task()
+    trainer.train_online(
+        make_stream(40, seed=70, class_labels=[0, 1], shuffle=False),
+        num_samples=40,
+    )
+    trainer.start_new_task()
+    trainer.train_online(
+        make_stream(40, seed=71, class_labels=[2, 3], shuffle=False),
+        num_samples=40,
+    )
+
+    pool = trainer.system.ccc_pool
+    adapter_ids = {
+        int(value)
+        for value in pool.adapter_assignments[pool.committed_mask].tolist()
+        if int(value) >= 0
+    }
+    stats = trainer._pool_stats()
+
+    assert stats["f1_frozen"] is True
+    assert stats["task_adapters"] >= 2
+    assert adapter_ids.issuperset({0, 1})
+
+
+def test_consolidation_importance_uses_confidence_and_recency() -> None:
+    high = SynapticConsolidation(1, strength=0.5)
+    low = SynapticConsolidation(1, strength=0.5)
+
+    high.update_importance([0], confidences=[0.95])
+    low.update_importance([0], confidences=[0.25])
+    high_initial = float(high.importance[0].item())
+    low_initial = float(low.importance[0].item())
+
+    for _ in range(96):
+        high.update_importance([], confidences=[])
+
+    assert high_initial > low_initial
+    assert float(high.importance[0].item()) < high_initial
+
+
 def test_no_backprop_cifar() -> None:
     trainer = VisionTrainer(make_config(num_train_samples=120))
     trainer.train_online(make_stream(120, seed=13), num_samples=120)
@@ -301,4 +390,6 @@ def test_cifar_config_correct_dims() -> None:
     assert config.input_dim == 3072
     assert config.concept_dim == 256
     assert config.curiosity_weight == 0.0
+    assert config.curriculum is False
+    assert config.contrastive_curiosity is False
     assert SensorimotorLoop._infer_visual_shape(config.input_dim) == (3, 32, 32)

@@ -130,14 +130,30 @@ class BioARNCore(nn.Module):
     def _mean_confidence(output: CCCOutput) -> float:
         return float(output.confidence.reshape(-1).mean().item())
 
-    def _run_pool(self, raw_input: torch.Tensor, *, allow_recruit: bool) -> CCCPoolOutput:
+    def _run_pool(
+        self,
+        raw_input: torch.Tensor,
+        *,
+        allow_recruit: bool,
+        learning_rate_multiplier: float | torch.Tensor = 1.0,
+    ) -> CCCPoolOutput:
         if allow_recruit:
-            return self.ccc_pool(raw_input, timestep=self.timestep)
+            return self.ccc_pool(
+                raw_input,
+                timestep=self.timestep,
+                learning_rate_multiplier=learning_rate_multiplier,
+            )
 
         outputs: list[CCCOutput] = []
         for ccc in self.ccc_pool.cccs:
             if bool(ccc.is_committed.item()):
-                outputs.append(ccc(raw_input, timestep=self.timestep))
+                outputs.append(
+                    ccc(
+                        raw_input,
+                        timestep=self.timestep,
+                        learning_rate_multiplier=learning_rate_multiplier,
+                    )
+                )
             else:
                 outputs.append(ccc.empty_output(raw_input))
 
@@ -324,9 +340,11 @@ class BioARNCore(nn.Module):
     def _perceive_impl(
         self, raw_input: torch.Tensor, *, allow_recruit: bool
     ) -> PerceptionOutput:
+        hierarchy_novel = False
         if self.hierarchy is not None:
             hierarchy_output: HierarchyOutput = self.hierarchy.process(raw_input)
             processed_input = hierarchy_output.final_features.reshape(-1).to(torch.float32)
+            hierarchy_novel = self.hierarchy.predictive_is_novel(hierarchy_output)
         else:
             processed_input = raw_input
 
@@ -365,7 +383,7 @@ class BioARNCore(nn.Module):
             associations=associations,
             num_fired=len(pool_output.fired_indices),
             num_abstained=len(pool_output.abstained_indices),
-            is_novel=bool(pool_output.recruited),
+            is_novel=bool(pool_output.recruited or hierarchy_novel),
             timestep=self.timestep,
         )
         self.last_perception = perception
