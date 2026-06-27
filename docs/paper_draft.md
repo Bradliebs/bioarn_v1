@@ -4,7 +4,7 @@
 
 Modern generative AI systems are increasingly constrained by energy cost, brittle out-of-distribution (OOD) behavior, and reliance on gradient-based batch training. Bio-ARN 2.0 explores a different design point: a brain-inspired architecture built around sparse concept circuits, local Hebbian learning, predictive coding, workspace-style global broadcasting, and a deployment path to neuromorphic hardware. The core computational unit is the Concept Cell Cluster (CCC), a cortical-column-inspired module that can abstain, recruit new concepts online, and refine them through local resonance rather than backpropagation. CCCs are organized into a ventral-stream-like visual hierarchy, linked through predictive coding and top-down feedback, and coupled to a Global Neuronal Workspace (GNW) for competition, broadcast, and multi-step internal routing. The current system also adds opt-in STDP dynamics, synaptic consolidation, dynamic capacity growth, and curiosity-driven replay.
 
-The current system does not match state-of-the-art transformer accuracy on large-scale visual benchmarks. However, it shows promising properties along other axes. On real CIFAR-10, a hierarchy baseline reaches 30.0% accuracy; curiosity-driven replay improves this to 33.8% online and 55.8% in post-training evaluation; and the best combined 2,000-sample configuration reaches 33.0% accuracy with 1.000 OOD AUROC. For OOD detection, ensemble scoring reaches 0.861 AUROC and GNW workspace scoring reaches 0.868 AUROC, both above a 0.778 baseline. Continual-learning results reveal a task-type-dependent failure mode: Split-CIFAR-10 shows -29.2 points backward transfer with 23.3 points mean forgetting, Split-MNIST shows -46.3% backward transfer with 37.1% forgetting, while Permuted-MNIST is much milder at -5.8% backward transfer and 5.5% forgetting. A Loihi/Lava export path preserves weights exactly, passes round-trip validation, and keeps simulated accuracy within 0.047 of the source model. Analytic energy modeling projects 179.65 µJ per inference on Loihi 2 versus 50.01 mJ for a transformer baseline on an A100 GPU, a 278x advantage at a matched benchmark tier. These results position Bio-ARN not as a drop-in replacement for transformers, but as a candidate architecture for efficient, robust, continuously learning neuromorphic AI.
+The current system does not match state-of-the-art transformer accuracy on large-scale visual benchmarks. However, it shows promising properties along other axes. On real CIFAR-10, a hierarchy baseline reaches 30.0% accuracy; Sprint D curiosity+curriculum training improves this to 33.8% online and 55.8% in post-training evaluation; and the best combined 2,000-sample configuration reaches 33.0% accuracy with 1.000 OOD AUROC. For OOD detection, ensemble scoring reaches 0.861 AUROC and GNW workspace scoring reaches 0.868 AUROC, both above a 0.778 baseline. A Sprint D continual-learning retest shows only a partial win: Split-CIFAR-10 improves slightly to -29.0 points backward transfer with 23.2 points mean forgetting, but Split-MNIST worsens to -54.3% backward transfer with 43.5% forgetting, while Permuted-MNIST remains much milder at -7.5% backward transfer and 6.5% forgetting. A Loihi/Lava export path preserves weights exactly, passes round-trip validation, and keeps simulated accuracy within 0.047 of the source model. Analytic energy modeling projects 179.65 µJ per inference on Loihi 2 versus 50.01 mJ for a transformer baseline on an A100 GPU, a 278x advantage at a matched benchmark tier. These results position Bio-ARN not as a drop-in replacement for transformers, but as a candidate architecture for efficient, robust, continuously learning neuromorphic AI.
 
 ## 1. Introduction
 
@@ -53,7 +53,7 @@ Within and across layers, lateral inhibition reduces redundant co-activations. C
 
 A predictive hierarchy is attached to the feedforward visual path. Instead of propagating all activity upward, Bio-ARN iteratively settles hidden states to minimize local prediction error and free energy [Rao and Ballard, 1999; Friston, 2010]. Predictable structure is suppressed, while residual error is emphasized.
 
-This predictive path is now coupled to explicit top-down feedback connections from IT -> V4 -> V2 -> V1. Higher-level summaries are projected back to lower levels and applied as multiplicative gating on candidate activations. In effect, higher layers bias lower layers toward interpretations that are globally coherent while still allowing abstention when no concept matches well.
+This predictive path is now coupled to explicit top-down feedback connections from IT -> V4 -> V2 -> V1. Higher-level summaries are projected back to lower levels and applied as multiplicative gating on candidate activations. In effect, higher layers bias lower layers toward interpretations that are globally coherent while still allowing abstention when no concept matches well. In Sprint D, the same predictive machinery also operates in an **error-gating** mode: prediction error is treated as a local learning gate, so novel or poorly predicted features receive larger Hebbian updates while already predictable structure is down-weighted.
 
 Unlike backpropagation, these updates are local to adjacent levels and rely on state/error interactions rather than end-to-end gradient transport. In Bio-ARN, predictive coding is therefore both a representational hypothesis and an optimization constraint.
 
@@ -63,7 +63,7 @@ Bio-ARN uses a Global Neuronal Workspace (GNW) as a small-capacity bottleneck fo
 
 An enhanced workspace variant augments the short-term slot mechanism with a longer context buffer and spike-based attention over recent concepts. This lets the system bias current recognition toward recently relevant concepts while still maintaining a strict broadcast bottleneck.
 
-The GNW contributes two useful behaviors. First, it offers a compact mechanism for selective access and internal routing that is missing from purely feedforward sparse classifiers. Second, it provides additional signals for uncertainty and OOD scoring: inputs that fail to stabilize in the workspace or fail to align with workspace context often receive weaker global support.
+The GNW contributes two useful behaviors. First, it offers a compact mechanism for selective access and internal routing that is missing from purely feedforward sparse classifiers. Second, it provides additional signals for uncertainty and OOD scoring: inputs that fail to stabilize in the workspace or fail to align with workspace context often receive weaker global support. Sprint D further turns this into a **GNW consensus classifier**: active CCCs vote under workspace context, the winning concept is read out through the broadcast, and normalized broadcast strength is recycled as a learning gate so low-consensus samples stay plastic while high-consensus samples consolidate.
 
 ### 2.6 Ensemble pool and OOD detection
 
@@ -89,9 +89,12 @@ Several new components sharpen Bio-ARN's operating envelope:
 
 - **STDP temporal dynamics** are opt-in and modulate Hebbian updates using pre/post spike traces on feedback pathways.
 - **Top-down feedback connections** gate lower-layer activations multiplicatively, encouraging globally consistent interpretations.
-- **Synaptic consolidation** estimates CCC importance and reduces the learning rate of frequently used concepts.
+- **Prediction-error gating** uses local surprise to amplify learning on novel features and suppress redundant updates on familiar ones.
+- **Synaptic consolidation** now scores CCC importance with confidence- and recency-weighted usage, then reduces the learning rate of mature concepts.
 - **Dynamic CCC pool growth** expands capacity when abstention remains persistently high.
+- **Curriculum learning** orders the first pass toward easier, higher-confidence samples before harder cases are replayed.
 - **Curiosity-driven replay** prioritizes novel, abstained, misclassified, or newly recruited samples for immediate replay.
+- **A maturation schedule** freezes the shared F1 front-end after warmup, routes later adaptation through task adapters, and progressively shifts plasticity pressure toward newer CCCs.
 
 These modules do not all target the same metric. Some help accuracy, some help OOD behavior, some stabilize temporal learning, and some improve hardware plausibility. That division of labor becomes important in the experimental results.
 
@@ -120,11 +123,11 @@ Real CIFAR-10 remains a challenging benchmark for purely local Hebbian learning.
 | Configuration | Accuracy summary | OOD AUROC | Notes |
 |---|---:|---:|---|
 | Hierarchy baseline | 30.0% | - | reference four-layer hierarchy |
-| Curiosity-driven replay (weight 0.8) | **33.8% online / 55.8% eval** | - | strongest pure replay-driven accuracy lift |
+| Sprint D curiosity + curriculum (weight 0.8) | **33.8% online / 55.8% eval** | - | strongest single Sprint D accuracy lift |
 | Curiosity sweep at 800 samples | 30.5% | - | intermediate data-scaling reference point |
 | Best combined config at 2,000 samples | **33.0%** | **1.000** | best overall accuracy/robustness trade-off |
 
-The absolute numbers remain modest compared with modern convolutional and transformer models. We emphasize this directly because it is important for honest positioning. Bio-ARN should currently be understood as a proof of architectural direction, not a state-of-the-art CIFAR classifier.
+The absolute numbers remain modest compared with modern convolutional and transformer models. We emphasize this directly because it is important for honest positioning. Bio-ARN should currently be understood as a proof of architectural direction, not a state-of-the-art CIFAR classifier. Within that framing, Sprint D is informative: curriculum + curiosity is the most impactful single improvement for CIFAR sample efficiency, while GNW consensus and predictive gating mostly sharpen selectivity and robustness rather than producing a large additional top-1 jump on their own.
 
 ### 4.3 OOD detection
 
@@ -179,22 +182,27 @@ After each task, the current model is evaluated on all tasks seen so far. We rep
 
 | Benchmark | Task type | Backward transfer | Mean forgetting | Interpretation |
 |---|---|---:|---:|---|
-| Split-CIFAR-10 | class splits on natural images | **-29.2 pts** | **23.3 pts** | severe interference; capacity bottleneck |
-| Split-MNIST | class splits on digits | **-46.3%** | **37.1%** | catastrophic forgetting is even stronger |
-| Permuted-MNIST | input permutations with shared labels | **-5.8%** | **5.5%** | forgetting is comparatively mild |
+| Split-CIFAR-10 | class splits on natural images | **-29.0 pts** | **23.2 pts** | slight improvement; error gating + stronger consolidation help, but capacity pressure remains |
+| Split-MNIST | class splits on digits | **-54.3%** | **43.5%** | worse than the earlier baseline; aggressive plasticity still destabilizes class ownership |
+| Permuted-MNIST | input permutations with shared labels | **-7.5%** | **6.5%** | still far milder than class splits, but slightly worse than the previous run |
 
-The key finding is that forgetting is strongly task-type-dependent. Bio-ARN struggles most when new tasks introduce new class partitions that compete for CCC capacity and prototype ownership. It degrades much less when the task sequence preserves the label semantics but changes the surface statistics, as in Permuted-MNIST.
+The updated retest preserves the same qualitative pattern: forgetting is strongly task-type-dependent. Bio-ARN still struggles most when new tasks introduce new class partitions that compete for CCC capacity and prototype ownership. It degrades much less when the task sequence preserves the label semantics but changes the surface statistics, as in Permuted-MNIST.
 
 #### 4.6.3 Analysis and mitigation
 
 The current root cause appears to be **CCC pool saturation on class-split tasks**. Once early concepts occupy the most useful slots, later classes must either overwrite existing structure or recruit into a pool whose abstraction geometry was shaped for earlier tasks. That failure mode is much weaker on permutation benchmarks because the underlying categories remain aligned.
 
-Two mitigation mechanisms are now implemented:
+Sprint D adds three more targeted mitigation mechanisms on top of the earlier growth/consolidation work:
 
-- **Synaptic consolidation**, which reduces learning rates for high-importance CCCs.
-- **Dynamic growth**, which expands the CCC pool under sustained abstention pressure.
+- **Prediction-error gating**, which increases local learning on surprising features and suppresses redundant updates.
+- **Curiosity + curriculum**, which is highly effective for CIFAR sample efficiency but does not automatically translate into retention.
+- **GNW consensus learning gates**, which reduce updates on already well-broadcast concepts and keep low-consensus samples plastic.
 
-These changes help partially, but they do not yet solve the class-split problem. We therefore frame continual learning not as a solved capability, but as one of the paper's most important open research directions.
+What helped: on Split-CIFAR-10, the new stack improves backward transfer by 0.2 points and mean forgetting by 0.1 points relative to the earlier benchmark. That small gain is still meaningful because it points in the right causal direction: local surprise appears to be a better learning signal than uniform plasticity.
+
+What did not help enough: the MNIST retest worsens on both class-split and permuted settings. The most plausible explanation is that curiosity, curriculum, and GNW gating bias the learner toward rapid recruitment and adaptation, but the actual interference bottleneck sits downstream in concept allocation, label binding, and prototype ownership. In other words, the new gates make learning more selective, but they do not yet solve where concepts are stored.
+
+This leads to a new shared-F1-layer insight. Freezing the common F1 front-end and switching to task adapters did not materially protect old tasks. That negative result is useful: it suggests forgetting is not primarily caused by low-level feature drift. Instead, the dominant damage occurs later, when F2/CCC slots and label prototypes are reassigned or their competitive margins are reshaped by new tasks. We therefore frame continual learning not as a solved capability, but as the project's clearest open research challenge.
 
 ### 4.7 MNIST and deployment maturity
 
@@ -236,7 +244,9 @@ The new results sharpen the paper's main message. Bio-ARN is **not** currently c
 The combined-feature finding is especially important. Individual modules serve different purposes:
 
 - curiosity-driven replay helps sample efficiency and online adaptation;
+- curriculum learning makes that replay materially more effective on CIFAR;
 - GNW and ensemble signals help OOD detection;
+- prediction-error gating validates the hypothesis that prediction should also act as a learning gate, not only as an inference aid;
 - STDP and feedback improve temporal/contextual dynamics;
 - consolidation and growth target stability-plasticity;
 - the export stack targets energy and hardware deployment.
@@ -267,6 +277,9 @@ Despite these limitations, Bio-ARN suggests a valuable research direction. If th
 Promising future directions include:
 
 - stronger capacity allocation and consolidation for class-split continual learning;
+- protecting F2 / prototype ownership directly rather than only freezing the shared F1 front-end;
+- class-aware replay anchors or reserved concept slots for previously learned tasks;
+- letting GNW consensus gate not just learning rate but also whether new CCC recruitment is permitted;
 - larger multimodal datasets and richer grounding tasks;
 - improved generative decoding beyond short-horizon lexical validity;
 - measured silicon experiments on Loihi 2 hardware;
