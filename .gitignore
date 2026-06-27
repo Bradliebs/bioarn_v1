@@ -12,6 +12,7 @@ models/
 .coverage
 htmlcov/
 demo/cache/
+demo/model_cache/
 
 # Squad: ignore runtime state (logs, inbox, sessions)
 .squad/orchestration-log/
