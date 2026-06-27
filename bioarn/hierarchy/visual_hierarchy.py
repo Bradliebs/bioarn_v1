@@ -15,6 +15,7 @@ from bioarn.hierarchy.competition import CompetitiveLateralInhibition
 from bioarn.hierarchy.config import HierarchyConfig
 from bioarn.hierarchy.feature_binding import FeatureBinding
 from bioarn.hierarchy.receptive_fields import ReceptiveFieldExtractor
+from bioarn.predictive.error_gating import ErrorGatingOutput, PredictionErrorGate
 from bioarn.predictive.hierarchy import PredictiveHierarchy
 from bioarn.scaling import AdaptiveCapacity, BatchedCCCPool
 
@@ -46,12 +47,15 @@ class HierarchyOutput:
     groupings: list[list[list[int]]] = field(default_factory=list)
     predictive_states: list[torch.Tensor] = field(default_factory=list)
     predictive_errors: list[torch.Tensor] = field(default_factory=list)
+    prediction_error_gates: list[torch.Tensor] = field(default_factory=list)
     predictive_free_energy_trace: list[float] = field(default_factory=list)
     predictive_converged: bool = False
+    predictive_surprise: float = 0.0
+    predictive_mode: str = "disabled"
 
     @property
     def final_features(self) -> torch.Tensor:
-        if self.predictive_states:
+        if self.predictive_mode == "settling" and self.predictive_states:
             predictive = self.predictive_states[-1]
             raw = self.layer_activations[-1].to(torch.float32)
             if predictive.dim() == 1 and raw.dim() == 2:
@@ -268,25 +272,15 @@ class HierarchyPool:
             return concepts, fired_indices, confidences
 
         active_batch = batch.index_select(0, active_positions)
+        state = self.core._vectorized_state(
+            active_batch,
+            timestep=self.core.last_fired.max().item() if self.committed_count else 0,
+            apply_learning=False,
+            update_state=False,
+        )
         committed_indices = self.core.committed_mask.nonzero(as_tuple=False).reshape(-1)
-
-        shared_projection = active_batch @ self.core.f1_weights[0].transpose(0, 1)
-        shared_projection = shared_projection + self.core.f1_bias[0]
-        shared_activated = F.relu(shared_projection)
-        top_k = min(self.config.f1_top_k, shared_activated.shape[-1])
-        top_values, top_indices = torch.topk(shared_activated, k=top_k, dim=-1)
-        shared_f1 = torch.zeros_like(shared_activated).scatter(-1, top_indices, top_values)
-
-        committed_weights = self.core.f2_weights.index_select(0, committed_indices)
-        committed_f2 = torch.matmul(
-            committed_weights,
-            shared_f1.transpose(0, 1),
-        ).transpose(1, 2)
-        directions = normalize(
-            self.core.concept_directions.index_select(0, committed_indices)
-        ).unsqueeze(1)
-        confidence = (normalize(committed_f2).to(directions.dtype) * directions).sum(dim=-1)
-        fired = confidence > self.core.theta_margin.index_select(0, committed_indices).unsqueeze(-1)
+        confidence = state.confidence.index_select(0, committed_indices)
+        fired = state.fired.index_select(0, committed_indices)
 
         for local_index, sample_index in enumerate(active_positions.tolist()):
             sample_mask = fired[:, local_index]
@@ -332,6 +326,9 @@ class HierarchyPool:
                 recruited_index=None,
             )
 
+        observer = getattr(self.core, "observe_samples", None)
+        if callable(observer):
+            observer(batch.shape[0])
         state = self.core._vectorized_state(batch, timestep=timestep)
         fired_mask = state.fired.squeeze(-1)
         fired_indices = fired_mask.nonzero(as_tuple=False).reshape(-1).tolist()
@@ -366,7 +363,7 @@ class HierarchyPool:
 
         update_importance = getattr(self.core, "update_importance", None)
         if callable(update_importance):
-            update_importance(fired_indices)
+            update_importance(fired_indices, confidences=winner_confidences)
         self._maybe_prune(timestep)
         concept, confidence = self._aggregate(
             [int(index) for index in fired_indices],
@@ -394,13 +391,19 @@ class HierarchyPool:
         batch, _ = self._ensure_batch(raw_input)
         if float(batch.norm().item()) <= self.min_input_norm:
             return None
+        observer = getattr(self.core, "observe_samples", None)
+        if callable(observer):
+            observer(batch.shape[0])
         self._maybe_grow_or_prune()
         recruited_index, recruited_output = self.core.recruit(batch, timestep=timestep)
         if recruited_index is None or recruited_output is None:
             return None
         update_importance = getattr(self.core, "update_importance", None)
         if callable(update_importance):
-            update_importance([int(recruited_index)])
+            update_importance(
+                [int(recruited_index)],
+                confidences=[float(recruited_output.confidence.reshape(-1).mean().item())],
+            )
         winner_confidences = torch.tensor(
             [float(recruited_output.confidence.reshape(-1).mean().item())],
             dtype=torch.float32,
@@ -418,6 +421,16 @@ class HierarchyPool:
             recruited=True,
             recruited_index=int(recruited_index),
         )
+
+    def freeze_f1(self) -> None:
+        freezer = getattr(self.core, "freeze_f1", None)
+        if callable(freezer):
+            freezer()
+
+    def create_task_adapter(self) -> None:
+        creator = getattr(self.core, "create_task_adapter", None)
+        if callable(creator):
+            creator()
 
 
 class VisualHierarchy:
@@ -455,9 +468,26 @@ class VisualHierarchy:
             else None
         )
         self.predictive_hierarchy = None
+        self.prediction_error_gate = None
+        self.predictive_mode = "disabled"
+        self.predictive_novelty_threshold = 0.0
         if config.predictive is not None:
-            self.predictive_hierarchy = PredictiveHierarchy(list(config.concept_dims), config.predictive)
-            self._initialize_predictive_hierarchy()
+            self.predictive_mode = str(config.predictive.mode)
+            self.predictive_novelty_threshold = max(
+                0.05,
+                float(config.predictive.error_threshold) * 5.0,
+            )
+            if self.predictive_mode == "settling":
+                self.predictive_hierarchy = PredictiveHierarchy(
+                    list(config.concept_dims),
+                    config.predictive,
+                )
+            else:
+                self.prediction_error_gate = PredictionErrorGate(
+                    list(config.concept_dims),
+                    config.predictive,
+                )
+            self._initialize_predictive_module()
         self.feedback_v2_to_v1 = torch.zeros(
             config.concept_dims[0],
             config.concept_dims[1],
@@ -498,6 +528,9 @@ class VisualHierarchy:
             concept_dim=int(concept_dim),
             num_f1_features=int(num_f1_features),
             f1_top_k=max(4, min(32, int(num_f1_features // 4))),
+            consolidation_strength=float(self.config.consolidation_strength),
+            freeze_f1_after=int(self.config.freeze_f1_after),
+            f1_adapter_dim=int(self.config.f1_adapter_dim),
             fast_lr=1.0,
             slow_lr=float(self.config.learning_rates[layer_index]),
             feedback_lr=float(self.config.learning_rates[layer_index]),
@@ -557,12 +590,20 @@ class VisualHierarchy:
         weights = weights + (0.01 * torch.randn_like(weights))
         return normalize(weights)
 
-    def _initialize_predictive_hierarchy(self) -> None:
-        if self.predictive_hierarchy is None:
+    def _predictive_layers(self):
+        if self.predictive_hierarchy is not None:
+            return self.predictive_hierarchy.layers
+        if self.prediction_error_gate is not None:
+            return self.prediction_error_gate.layers
+        return None
+
+    def _initialize_predictive_module(self) -> None:
+        predictive_layers = self._predictive_layers()
+        if predictive_layers is None:
             return
         with torch.no_grad():
-            layer_count = max(len(self.predictive_hierarchy.layers), 1)
-            for layer_index, layer in enumerate(self.predictive_hierarchy.layers):
+            layer_count = max(len(predictive_layers), 1)
+            for layer_index, layer in enumerate(predictive_layers):
                 layer.W.copy_(
                     self._seed_predictive_weights(
                         input_dim=layer.input_dim,
@@ -720,11 +761,12 @@ class VisualHierarchy:
     def _run_predictive_refinement(
         self,
         layer_results: list[LayerBatchResult],
+        groupings: list[list[list[int]]],
         *,
         learn: bool,
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[float], bool]:
-        if self.predictive_hierarchy is None:
-            return [], [], [], False
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[float], bool, float]:
+        if self.predictive_hierarchy is None and self.prediction_error_gate is None:
+            return [], [], [], [], False, 0.0
 
         feedforward_states = [
             self._summarize_activations(
@@ -734,16 +776,39 @@ class VisualHierarchy:
             )
             for layer, result in zip(self.layers, layer_results, strict=False)
         ]
-        predictive_output = self.predictive_hierarchy.settle_states(
-            feedforward_states,
-            num_iterations=max(1, int(self.config.predictive.settling_steps)),
+        if self.predictive_hierarchy is not None:
+            predictive_output = self.predictive_hierarchy.settle_states(
+                feedforward_states,
+                num_iterations=max(1, int(self.config.predictive.settling_steps)),
+                learn=learn,
+            )
+            return (
+                predictive_output.states,
+                predictive_output.errors,
+                [],
+                predictive_output.free_energy_trace,
+                predictive_output.converged,
+                predictive_output.surprise,
+            )
+
+        grouping12, grouping23, _ = groupings
+        higher_states = [
+            self._expand_higher_activations(layer_results[1].activations, grouping12),
+            self._expand_higher_activations(layer_results[2].activations, grouping23),
+            layer_results[3].activations,
+        ]
+        predictive_output = self.prediction_error_gate.compute_error_gates(
+            [result.activations for result in layer_results],
+            higher_activations=higher_states,
             learn=learn,
         )
         return (
             predictive_output.states,
             predictive_output.errors,
+            predictive_output.gates,
             predictive_output.free_energy_trace,
-            predictive_output.converged,
+            True,
+            predictive_output.surprise,
         )
 
     def _structure_score(self, image: torch.Tensor) -> float:
@@ -791,26 +856,48 @@ class VisualHierarchy:
         inputs: torch.Tensor,
         *,
         allow_recruit: bool,
+        learning_rate_scale: float | torch.Tensor = 1.0,
     ) -> LayerBatchResult:
         activations: list[torch.Tensor] = []
         fired_indices: list[list[int]] = []
         confidences: list[float] = []
         recruited: list[bool] = []
         recruited_indices: list[int | None] = []
+        layer.pool._sync_core()
+        base_slow_lr = float(layer.pool.core.config.slow_lr)
+        base_feedback_lr = float(layer.pool.core.config.feedback_lr)
+        scale_vector = (
+            learning_rate_scale.reshape(-1).to(torch.float32)
+            if isinstance(learning_rate_scale, torch.Tensor)
+            else None
+        )
 
-        for index in range(inputs.shape[0]):
-            sample = layer.pool.learn_single(
-                inputs[index],
-                timestep=self.timestep,
-                allow_recruit=allow_recruit,
-                winner_limit=layer.winner_limit,
-            )
-            self.timestep += 1
-            activations.append(sample.concept)
-            fired_indices.append(sample.fired_indices)
-            confidences.append(sample.confidence)
-            recruited.append(sample.recruited)
-            recruited_indices.append(sample.recruited_index)
+        try:
+            for index in range(inputs.shape[0]):
+                scale = (
+                    float(scale_vector[min(index, scale_vector.numel() - 1)].clamp(0.0, 1.0).item())
+                    if scale_vector is not None and scale_vector.numel() > 0
+                    else max(0.0, float(learning_rate_scale))
+                )
+                layer.pool._sync_core()
+                layer.pool.core.config.slow_lr = base_slow_lr * scale
+                layer.pool.core.config.feedback_lr = base_feedback_lr * scale
+                sample = layer.pool.learn_single(
+                    inputs[index],
+                    timestep=self.timestep,
+                    allow_recruit=allow_recruit,
+                    winner_limit=layer.winner_limit,
+                )
+                self.timestep += 1
+                activations.append(sample.concept)
+                fired_indices.append(sample.fired_indices)
+                confidences.append(sample.confidence)
+                recruited.append(sample.recruited)
+                recruited_indices.append(sample.recruited_index)
+        finally:
+            layer.pool._sync_core()
+            layer.pool.core.config.slow_lr = base_slow_lr
+            layer.pool.core.config.feedback_lr = base_feedback_lr
 
         stacked_activations = self._stack(activations, layer.concept_dim)
         stacked_confidences = torch.tensor(confidences, dtype=torch.float32)
@@ -917,7 +1004,11 @@ class VisualHierarchy:
 
     def _label_signature_from_output(self, output: HierarchyOutput) -> torch.Tensor:
         raw_signature = self._raw_label_signature_from_output(output)
-        if output.predictive_states and output.predictive_errors:
+        if (
+            output.predictive_mode == "settling"
+            and output.predictive_states
+            and output.predictive_errors
+        ):
             return self._predictive_signature(
                 raw_signature,
                 output.predictive_states,
@@ -977,7 +1068,129 @@ class VisualHierarchy:
 
         if prototype_label is None or prototype_similarity < 0.2:
             return -1, max(float(final_confidence), float(prototype_similarity))
-        return int(prototype_label), max(float(final_confidence), float(prototype_similarity))
+        return int(prototype_label), max(float(final_confidence), float(prototype_similarity)        )
+
+    @staticmethod
+    def _mean_gate_value(gate: torch.Tensor | None) -> float:
+        if gate is None or gate.numel() == 0:
+            return 1.0
+        return float(gate.to(torch.float32).mean().clamp(0.0, 1.0).item())
+
+    @staticmethod
+    def _expand_higher_activations(
+        higher_activations: torch.Tensor,
+        grouping: list[list[int]],
+    ) -> torch.Tensor:
+        if higher_activations.numel() == 0 or not grouping:
+            return higher_activations
+        batch = higher_activations.to(torch.float32)
+        if batch.dim() == 1:
+            batch = batch.unsqueeze(0)
+        num_lower = max((max(indices) for indices in grouping if indices), default=-1) + 1
+        if num_lower <= 0:
+            return batch
+        expanded = torch.zeros(
+            num_lower,
+            batch.shape[-1],
+            device=batch.device,
+            dtype=batch.dtype,
+        )
+        for higher_index, lower_indices in enumerate(grouping):
+            source = batch[min(higher_index, batch.shape[0] - 1)]
+            for lower_index in lower_indices:
+                expanded[lower_index] = source
+        return expanded
+
+    def _run_hierarchy_pass(
+        self,
+        *,
+        patch_grid: tuple[int, int],
+        l1_inputs: torch.Tensor,
+        feedback_signals: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        learn: bool,
+        label: int | None,
+        learning_rate_scales: list[float] | None = None,
+    ) -> tuple[list[torch.Tensor], list[LayerBatchResult], list[list[list[int]]]]:
+        feedback_l1, feedback_l2, feedback_l3 = feedback_signals
+        scales = learning_rate_scales or [1.0] * len(self.layers)
+
+        l1_result = (
+            self._run_layer_learn(
+                self.layers[0],
+                l1_inputs,
+                allow_recruit=True,
+                learning_rate_scale=scales[0],
+            )
+            if learn
+            else self._run_layer_infer(self.layers[0], l1_inputs)
+        )
+        l1_result = self._apply_feedback_modulation(self.layers[0], l1_result, feedback_l1)
+
+        l2_inputs, grouping12 = self._prepare_l2_inputs(l1_result.activations, patch_grid)
+        l2_result = (
+            self._run_layer_learn(
+                self.layers[1],
+                l2_inputs,
+                allow_recruit=True,
+                learning_rate_scale=scales[1],
+            )
+            if learn
+            else self._run_layer_infer(self.layers[1], l2_inputs)
+        )
+        l2_result = self._apply_feedback_modulation(self.layers[1], l2_result, feedback_l2)
+
+        l3_inputs, grouping23 = self._prepare_l3_inputs(l2_result.activations)
+        l3_result = (
+            self._run_layer_learn(
+                self.layers[2],
+                l3_inputs,
+                allow_recruit=True,
+                learning_rate_scale=scales[2],
+            )
+            if learn
+            else self._run_layer_infer(self.layers[2], l3_inputs)
+        )
+        l3_result = self._apply_feedback_modulation(self.layers[2], l3_result, feedback_l3)
+
+        l4_inputs, grouping34 = self._prepare_l4_inputs(l3_result.activations)
+        if learn and label is not None:
+            l4_result = self._run_layer_learn(
+                self.layers[3],
+                l4_inputs,
+                allow_recruit=True,
+                learning_rate_scale=scales[3],
+            )
+        else:
+            l4_result = self._run_layer_infer(self.layers[3], l4_inputs)
+        if (
+            learn
+            and label is not None
+            and l4_inputs.shape[0] > 0
+            and not self._has_label_specialist(int(label), l4_result.fired_indices[0])
+        ):
+            recruited = self.layers[3].pool.recruit_single(
+                l4_inputs[0],
+                timestep=self.timestep,
+            )
+            self.timestep += 1
+            if recruited is not None:
+                l4_result.activations[0] = recruited.concept
+                l4_result.fired_indices[0] = recruited.fired_indices
+                l4_result.confidences[0] = recruited.confidence
+                l4_result.recruited[0] = True
+                l4_result.recruited_indices[0] = recruited.recruited_index
+
+        return (
+            [l1_inputs, l2_inputs, l3_inputs, l4_inputs],
+            [l1_result, l2_result, l3_result, l4_result],
+            [grouping12, grouping23, grouping34],
+        )
+
+    def predictive_is_novel(self, output: HierarchyOutput | None = None) -> bool:
+        candidate = output or self.last_output
+        if candidate is None or candidate.predictive_mode == "disabled":
+            return False
+        return bool(candidate.predictive_surprise > self.predictive_novelty_threshold)
 
     def _forward(
         self,
@@ -1006,58 +1219,62 @@ class VisualHierarchy:
             )
         patch_grid = self.extractor.last_grid_shape
         l1_inputs = self._stack(patches, self.config.l1_input_dim)
-        l1_result = (
-            self._run_layer_learn(self.layers[0], l1_inputs, allow_recruit=True)
-            if learn
-            else self._run_layer_infer(self.layers[0], l1_inputs)
-        )
-        l1_result = self._apply_feedback_modulation(self.layers[0], l1_result, feedback_l1)
+        layer_inputs: list[torch.Tensor]
+        layer_results: list[LayerBatchResult]
+        groupings: list[list[list[int]]]
 
-        l2_inputs, grouping12 = self._prepare_l2_inputs(l1_result.activations, patch_grid)
-        l2_result = (
-            self._run_layer_learn(self.layers[1], l2_inputs, allow_recruit=True)
-            if learn
-            else self._run_layer_infer(self.layers[1], l2_inputs)
-        )
-        l2_result = self._apply_feedback_modulation(self.layers[1], l2_result, feedback_l2)
-
-        l3_inputs, grouping23 = self._prepare_l3_inputs(l2_result.activations)
-        l3_result = (
-            self._run_layer_learn(self.layers[2], l3_inputs, allow_recruit=True)
-            if learn
-            else self._run_layer_infer(self.layers[2], l3_inputs)
-        )
-        l3_result = self._apply_feedback_modulation(self.layers[2], l3_result, feedback_l3)
-
-        l4_inputs, grouping34 = self._prepare_l4_inputs(l3_result.activations)
-        if learn and label is not None:
-            l4_result = self._run_layer_learn(self.layers[3], l4_inputs, allow_recruit=True)
+        if learn and self.predictive_mode == "error_gating" and self.prediction_error_gate is not None:
+            _, preview_results, preview_groupings = self._run_hierarchy_pass(
+                patch_grid=patch_grid,
+                l1_inputs=l1_inputs,
+                feedback_signals=(feedback_l1, feedback_l2, feedback_l3),
+                learn=False,
+                label=label,
+            )
+            (
+                _preview_states,
+                _preview_errors,
+                preview_gates,
+                _preview_trace,
+                _preview_converged,
+                _preview_surprise,
+            ) = self._run_predictive_refinement(preview_results, preview_groupings, learn=True)
+            learning_rate_scales = [
+            (preview_gates[index] if index < len(preview_gates) else 1.0)
+                for index in range(len(self.layers))
+            ]
+            layer_inputs, layer_results, groupings = self._run_hierarchy_pass(
+                patch_grid=patch_grid,
+                l1_inputs=l1_inputs,
+                feedback_signals=(feedback_l1, feedback_l2, feedback_l3),
+                learn=True,
+                label=label,
+                learning_rate_scales=learning_rate_scales,
+            )
         else:
-            l4_result = self._run_layer_infer(self.layers[3], l4_inputs)
-        if (
-            learn
-            and label is not None
-            and l4_inputs.shape[0] > 0
-            and not self._has_label_specialist(int(label), l4_result.fired_indices[0])
-        ):
-            recruited = self.layers[3].pool.recruit_single(
-                l4_inputs[0],
-                timestep=self.timestep,
-            )
-            self.timestep += 1
-            if recruited is not None:
-                l4_result.activations[0] = recruited.concept
-                l4_result.fired_indices[0] = recruited.fired_indices
-                l4_result.confidences[0] = recruited.confidence
-                l4_result.recruited[0] = True
-                l4_result.recruited_indices[0] = recruited.recruited_index
-
-        predictive_states, predictive_errors, predictive_free_energy_trace, predictive_converged = (
-            self._run_predictive_refinement(
-                [l1_result, l2_result, l3_result, l4_result],
+            layer_inputs, layer_results, groupings = self._run_hierarchy_pass(
+                patch_grid=patch_grid,
+                l1_inputs=l1_inputs,
+                feedback_signals=(feedback_l1, feedback_l2, feedback_l3),
                 learn=learn,
+                label=label,
             )
+
+        (
+            predictive_states,
+            predictive_errors,
+            predictive_gates,
+            predictive_free_energy_trace,
+            predictive_converged,
+            predictive_surprise,
+        ) = self._run_predictive_refinement(
+            layer_results,
+            groupings,
+            learn=(learn and self.predictive_mode == "settling"),
         )
+        l1_result, l2_result, l3_result, l4_result = layer_results
+        grouping12, grouping23, grouping34 = groupings
+        l1_inputs, l2_inputs, l3_inputs, l4_inputs = layer_inputs
 
         output = HierarchyOutput(
             patches=patches,
@@ -1096,8 +1313,11 @@ class VisualHierarchy:
             groupings=[grouping12, grouping23, grouping34],
             predictive_states=predictive_states,
             predictive_errors=predictive_errors,
+            prediction_error_gates=predictive_gates,
             predictive_free_energy_trace=predictive_free_energy_trace,
             predictive_converged=predictive_converged,
+            predictive_surprise=predictive_surprise,
+            predictive_mode=self.predictive_mode,
         )
 
         if learn:
@@ -1113,6 +1333,14 @@ class VisualHierarchy:
 
         self.last_output = output
         return output
+
+    @torch.no_grad()
+    def start_new_task(self) -> None:
+        if int(self.config.freeze_f1_after) <= 0:
+            return
+        for layer in self.layers:
+            layer.pool.freeze_f1()
+            layer.pool.create_task_adapter()
 
     @torch.no_grad()
     def process(self, image: torch.Tensor) -> HierarchyOutput:

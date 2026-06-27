@@ -52,6 +52,8 @@ class CCCConfig:
     concept_dim: int = 256       # Dimensionality of concept direction vectors
     num_f1_features: int = 128   # Number of F1 feature neurons (competitive selection)
     f1_top_k: int = 32           # How many F1 features survive competition
+    freeze_f1_after: int = 0     # Freeze shared F1 and enable task adapters after N samples
+    f1_adapter_dim: int = 16     # Bottleneck width for residual task adapters
     fast_lr: float = 1.0         # One-shot learning rate (immediate encoding)
     slow_lr: float = 0.01        # Hebbian tuning rate (gradual refinement)
     feedback_lr: float = 0.01    # Feedback weight learning rate
@@ -63,6 +65,8 @@ class CCCConfig:
     def __post_init__(self) -> None:
         if isinstance(self.stdp, Mapping):
             self.stdp = STDPConfig(**self.stdp)
+        self.freeze_f1_after = int(max(0, self.freeze_f1_after))
+        self.f1_adapter_dim = int(max(1, self.f1_adapter_dim))
         self.max_pool_size = int(max(1, self.max_pool_size))
         self.max_growth_factor = float(max(1.0, self.max_growth_factor))
         self.consolidation_strength = float(max(0.0, self.consolidation_strength))
@@ -83,11 +87,12 @@ class SDMConfig:
 class PredictiveConfig:
     """Predictive coding engine parameters."""
     num_levels: int = 4          # Hierarchy depth
-    gamma: float = 0.1           # State update rate from prediction errors
+    gamma: float = 0.1           # Prediction-error gain for settling or learning gates
     eta: float = 0.01            # Weight learning rate (local Hebbian)
     precision_init: float = 1.0  # Initial precision weighting
     error_threshold: float = 0.01  # Below this, errors are suppressed (PCL)
     settling_steps: int = 6      # Iterative inference steps for resonance/settling
+    mode: str = "error_gating"   # Predictive mode: error_gating or settling
 
 
 @dataclass

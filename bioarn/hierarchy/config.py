@@ -19,6 +19,9 @@ class HierarchyConfig:
     concept_dims: list[int] = field(default_factory=lambda: [32, 64, 128, 64])
     thresholds: list[float] = field(default_factory=lambda: [0.25, 0.3, 0.35, 0.4])
     learning_rates: list[float] = field(default_factory=lambda: [0.05, 0.03, 0.02, 0.01])
+    consolidation_strength: float = 0.0
+    freeze_f1_after: int = 0
+    f1_adapter_dim: int = 16
 
     enable_binding: bool = True
     binding_strength: float = 0.1
@@ -52,6 +55,9 @@ class HierarchyConfig:
         self.enable_spatial_attention = bool(self.enable_spatial_attention)
         self.enable_lateral_inhibition = bool(self.enable_lateral_inhibition)
         self.enable_adaptive_capacity = bool(self.enable_adaptive_capacity)
+        self.consolidation_strength = float(max(0.0, self.consolidation_strength))
+        self.freeze_f1_after = int(max(0, self.freeze_f1_after))
+        self.f1_adapter_dim = int(max(1, self.f1_adapter_dim))
         self.attention_gain_strength = float(max(0.0, self.attention_gain_strength))
         self.attention_center_bias = float(max(0.0, self.attention_center_bias))
         self.inhibition_similarity_threshold = float(self.inhibition_similarity_threshold)
@@ -93,8 +99,11 @@ class HierarchyConfig:
         if self.predictive is not None:
             self.predictive.num_levels = int(self.predictive.num_levels)
             self.predictive.settling_steps = int(max(1, self.predictive.settling_steps))
+            self.predictive.mode = str(self.predictive.mode).strip().lower()
             if self.predictive.num_levels != self.num_layers:
                 raise ValueError("predictive.num_levels must match the hierarchy num_layers.")
+            if self.predictive.mode not in {"error_gating", "settling"}:
+                raise ValueError("predictive.mode must be either 'error_gating' or 'settling'.")
         if self.stdp is not None:
             self.stdp.tau_plus = float(self.stdp.tau_plus)
             self.stdp.tau_minus = float(self.stdp.tau_minus)

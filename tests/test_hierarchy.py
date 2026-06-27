@@ -7,6 +7,7 @@ import torch
 from bioarn.config import CCCConfig, MarginGateConfig, PredictiveConfig
 from bioarn.core.ccc import CCCPool
 from bioarn.core.math_utils import normalize
+from bioarn.predictive import PredictionErrorGate
 from bioarn.predictive.hierarchy import HierarchyConnector, PredictiveHierarchy
 
 
@@ -202,6 +203,38 @@ def test_generation_different_concepts() -> None:
     assert not torch.allclose(first, second)
 
 
+def test_prediction_error_gate_highlights_surprising_features() -> None:
+    gate = PredictionErrorGate(
+        layer_dims=[4, 4, 4, 4],
+        config=make_predictive_config(gamma=4.0, error_threshold=0.05),
+    )
+    with torch.no_grad():
+        for layer in gate.layers:
+            layer.W.copy_(torch.eye(4))
+            layer.precision.fill_(1.0)
+            layer.state.zero_()
+
+    familiar = gate.compute_error_gates(
+        [
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        ]
+    )
+    surprising = gate.compute_error_gates(
+        [
+            torch.tensor([0.0, 1.0, 1.0, 0.0]),
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        ]
+    )
+
+    assert surprising.gates[0].mean() > familiar.gates[0].mean()
+    assert torch.allclose(surprising.gates[-1], torch.ones_like(surprising.gates[-1]))
+
+
 from bioarn.hierarchy import HierarchyConfig, HierarchyOutput, VisualHierarchy
 from bioarn.training import VisionTrainConfig, VisionTrainer
 
@@ -372,10 +405,40 @@ def test_visual_hierarchy_predictive_refinement_opt_in() -> None:
 
     output = hierarchy.process(make_structured_visual_image(2, 77))
 
+    assert output.predictive_mode == "error_gating"
     assert output.predictive_states
     assert output.predictive_errors
+    assert output.prediction_error_gates
     assert output.predictive_free_energy_trace[-1] <= output.predictive_free_energy_trace[0]
     assert output.final_features.shape == (1, 14)
+
+
+def test_visual_hierarchy_settling_mode_remains_available() -> None:
+    hierarchy = VisualHierarchy(
+        HierarchyConfig(
+            pool_sizes=[20, 28, 36, 20],
+            concept_dims=[12, 20, 28, 14],
+            thresholds=[0.2, 0.28, 0.34, 0.4],
+            learning_rates=[0.05, 0.04, 0.03, 0.02],
+            predictive=PredictiveConfig(
+                gamma=0.15,
+                eta=0.01,
+                precision_init=1.0,
+                error_threshold=0.0,
+                settling_steps=4,
+                mode="settling",
+            ),
+        )
+    )
+    for index in range(8):
+        hierarchy.learn(make_structured_visual_image(index % 2, index), label=index % 2)
+
+    output = hierarchy.process(make_structured_visual_image(1, 55))
+
+    assert output.predictive_mode == "settling"
+    assert output.predictive_states
+    assert output.predictive_errors
+    assert output.prediction_error_gates == []
 
 
 def test_l1_patches_correct() -> None:

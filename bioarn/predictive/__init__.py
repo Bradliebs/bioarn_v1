@@ -1,5 +1,6 @@
 """Predictive coding engine: hierarchical prediction error minimization."""
 
+from bioarn.predictive.error_gating import ErrorGatingOutput, PredictionErrorGate
 from bioarn.predictive.hierarchy import (
     ActionSignal,
     HierarchyConnector,
@@ -13,6 +14,7 @@ from bioarn.predictive.pc_layer import PCStack, PCStackOutput, PCLayer, PCLayerO
 
 __all__ = [
     "ActionSignal",
+    "ErrorGatingOutput",
     "HierarchyConnector",
     "HierarchyGenerationOutput",
     "HierarchyPerceptionOutput",
@@ -21,6 +23,7 @@ __all__ = [
     "PCStack",
     "PCStackOutput",
     "PredictionQualityOutput",
+    "PredictionErrorGate",
     "PredictiveHierarchy",
     "ResonanceLoopOutput",
     "free_energy",
