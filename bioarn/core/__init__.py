@@ -1,6 +1,6 @@
 """Core components: spiking neurons, margin gates, concept cell clusters."""
 
-from bioarn.core.ccc import CCCOutput, CCCPool, CCCPoolOutput, ConceptCellCluster
+from bioarn.core.ccc import CCCOutput, CCCPool, CCCPoolOutput, ConceptCellCluster, F1Adapter
 from bioarn.core.consolidation import SynapticConsolidation
 from bioarn.core.margin_gate import MarginGate, MarginGateOutput, ResonanceOutput
 from bioarn.core.spiking import (
@@ -21,6 +21,7 @@ __all__ = [
     "CCCPool",
     "CCCPoolOutput",
     "ConceptCellCluster",
+    "F1Adapter",
     "SynapticConsolidation",
     "LIFLayer",
     "LIFNeuron",

@@ -55,6 +55,9 @@ def _build_hierarchy() -> VisualHierarchy:
             concept_dims=[32, 64, 128, 64],
             thresholds=[0.25, 0.3, 0.35, 0.4],
             learning_rates=[0.05, 0.03, 0.02, 0.01],
+            consolidation_strength=0.35,
+            freeze_f1_after=1,
+            f1_adapter_dim=16,
             class_count=10,
         )
     )
@@ -74,6 +77,9 @@ def _build_mnist_trainer(
             use_batched=True,
             batch_size=32,
             learning_rate=0.02,
+            consolidation_strength=0.35,
+            freeze_f1_after=min(train_samples, max(50, train_samples // 3)),
+            f1_adapter_dim=16,
             num_train_samples=train_samples,
             num_test_samples=test_samples,
             preprocessing_warmup_samples=min(train_samples, max(50, train_samples // 3)),
@@ -171,6 +177,7 @@ def _train_hierarchy_task(
         f"task_classes={sorted({int(label) for _, label in ordered if label is not None})}"
     )
 
+    hierarchy.start_new_task()
     for tensor, _ in ordered[:warmup_count]:
         hierarchy.learn(tensor)
     for tensor, label in ordered[warmup_count:]:
@@ -459,6 +466,7 @@ def run_permuted_mnist(
     ) -> list[int]:
         del stage_index
         print(f"[{stage_name}] train_samples={len(task_samples)}")
+        trainer.start_new_task()
         trainer.train_online(
             list(task_samples),
             num_samples=len(task_samples),
@@ -563,6 +571,7 @@ def run_split_mnist(
             f"[{stage_name}] train_samples={len(task_samples)} "
             f"task_classes={sorted({int(label) for _, label in task_samples if label is not None})}"
         )
+        trainer.start_new_task()
         trainer.train_online(
             list(task_samples),
             num_samples=len(task_samples),
