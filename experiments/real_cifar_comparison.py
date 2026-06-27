@@ -25,6 +25,7 @@ from bioarn.training import (
     take_samples,
 )
 from combined_config_sweep import run_best_combined
+from sprint_d_benchmark import run_best_sprint_d
 
 TRAIN_N = 2000
 TEST_N = 500
@@ -539,14 +540,14 @@ def run_both(
     )
 
 
-def run_combined(
+def run_best_d(
     train_samples: list[tuple[torch.Tensor, int | None]],
     test_samples: list[tuple[torch.Tensor, int | None]],
     ood_samples: list[torch.Tensor],
 ) -> RunResult:
-    result = run_best_combined(train_samples, test_samples, ood_samples)
+    result = run_best_sprint_d(train_samples, test_samples, ood_samples)
     return RunResult(
-        name="combined",
+        name="best_d",
         accuracy=float(result.accuracy),
         abstention_rate=float(result.abstention_rate),
         ood_auroc=float(result.ood_auroc),
@@ -750,7 +751,7 @@ def run_experiment() -> list[RunResult]:
         ),
         ("ensemble", run_ensemble),
         ("both", run_both),
-        ("combined", run_combined),
+        ("best_d", run_best_d),
     )
     results: list[RunResult] = []
     for index, (name, runner) in enumerate(runners, start=1):
