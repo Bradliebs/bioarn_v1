@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from bioarn.config import PredictiveConfig
+from bioarn.config import PredictiveConfig, STDPConfig
 
 
 @dataclass
@@ -41,6 +41,7 @@ class HierarchyConfig:
     capacity_prune_max_fire_count: int = 0
     feedback_strength: float = 0.0
     predictive: PredictiveConfig | None = None
+    stdp: STDPConfig | None = None
 
     def __post_init__(self) -> None:
         height, width, channels = (int(value) for value in self.image_size)
@@ -94,6 +95,11 @@ class HierarchyConfig:
             self.predictive.settling_steps = int(max(1, self.predictive.settling_steps))
             if self.predictive.num_levels != self.num_layers:
                 raise ValueError("predictive.num_levels must match the hierarchy num_layers.")
+        if self.stdp is not None:
+            self.stdp.tau_plus = float(self.stdp.tau_plus)
+            self.stdp.tau_minus = float(self.stdp.tau_minus)
+            self.stdp.A_plus = float(self.stdp.A_plus)
+            self.stdp.A_minus = float(self.stdp.A_minus)
 
     @property
     def height(self) -> int:

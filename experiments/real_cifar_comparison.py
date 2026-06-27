@@ -24,6 +24,7 @@ from bioarn.training import (
     load_cifar10_or_synthetic,
     take_samples,
 )
+from combined_config_sweep import run_best_combined
 
 TRAIN_N = 2000
 TEST_N = 500
@@ -451,6 +452,20 @@ def run_both(
     )
 
 
+def run_combined(
+    train_samples: list[tuple[torch.Tensor, int | None]],
+    test_samples: list[tuple[torch.Tensor, int | None]],
+    ood_samples: list[torch.Tensor],
+) -> RunResult:
+    result = run_best_combined(train_samples, test_samples, ood_samples)
+    return RunResult(
+        name="combined",
+        accuracy=float(result.accuracy),
+        abstention_rate=float(result.abstention_rate),
+        ood_auroc=float(result.ood_auroc),
+    )
+
+
 def _classify_hybrid(
     hierarchy: VisualHierarchy,
     pool: EnsemblePool,
@@ -635,6 +650,7 @@ def run_experiment() -> list[RunResult]:
         ),
         ("ensemble", run_ensemble),
         ("both", run_both),
+        ("combined", run_combined),
     )
     results: list[RunResult] = []
     for index, (name, runner) in enumerate(runners, start=1):

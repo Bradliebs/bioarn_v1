@@ -502,6 +502,7 @@ class VisualHierarchy:
             slow_lr=float(self.config.learning_rates[layer_index]),
             feedback_lr=float(self.config.learning_rates[layer_index]),
             max_pool_size=int(self.config.pool_sizes[layer_index]),
+            stdp=self.config.stdp,
         )
         margin_config = MarginGateConfig(
             theta_margin=float(self.config.thresholds[layer_index]),
