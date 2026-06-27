@@ -55,3 +55,12 @@ Recovery commit (d99976c) included workspace improvements (context buffer, selec
 - Energy benchmarking still shows a 278× projected inference advantage and an 8,050× online-training advantage
 - Committed `6954e43`
 - Team context: Switch refreshed the README so the repaired demo and benchmark guidance are easier to consume
+
+
+## Session 2026-06-27T11:00:00Z
+
+**Mission:** Recording Sprint E predictive-processing and benchmark decisions
+
+- Logged precision-weighted predictive processing as the new uncertainty-scaled CCC plasticity path
+- Logged the prediction-error-gated default predictive route plus the latest combined and Sprint D benchmark outcomes
+- Team context: Neo's concept locking and Morpheus's convolutional CCCs are now recorded as the companion Sprint E features

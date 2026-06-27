@@ -47,3 +47,12 @@
 - Targeted validation passed: 67 tests
 - Committed `627e3e3`
 - Team context: Trinity's complementary routing now lets `both` edge hierarchy on observed runs (30.0% vs 29.0%)
+
+
+## Session 2026-06-27T11:00:00Z
+
+**Mission:** Recording Sprint E concept-locking and maturation decisions
+
+- Logged concept locking as the active continual-learning protection path for stable CCCs
+- Logged phase-gated maturation scheduling as the current training-time activation policy for optional modules
+- Team context: Tank's precision weighting and Morpheus's convolutional CCCs complete the core Sprint E feature stack while Switch benchmarks the combined path

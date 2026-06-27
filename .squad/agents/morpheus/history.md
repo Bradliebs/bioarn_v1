@@ -74,3 +74,12 @@ Recovery commit (d99976c) included sequence memory module, memory config, extend
 - Targeted export validation passed
 - Committed `0b4a32a`
 - Team context: the export path now complements the latest CIFAR and multimodal gains with a deployment-facing artifact story
+
+
+## Session 2026-06-27T11:00:00Z
+
+**Mission:** Recording Sprint E convolutional CCC delivery
+
+- Logged the convolutional CCC path, including the shared convolutional F1 stage and `VisionTrainer` opt-in wiring
+- Preserved the rationale that vision inputs should keep spatial structure before concept matching
+- Team context: Neo's concept locking and Tank's precision weighting are the other merged Sprint E feature deliveries

@@ -50,3 +50,12 @@
 - Regression validation reached 439 passing tests
 - Committed `bb5f032`
 - Team context: Tank's demo fixes and Neo/Trinity benchmark gains are now reflected in contributor-facing docs
+
+
+## Session 2026-06-27T11:00:00Z
+
+**Mission:** Recording benchmark and continual-learning findings around Sprint E
+
+- Logged the severe continual-learning forgetting findings and the later Sprint D retest showing only marginal CIFAR gains with worse MNIST retention
+- Logged the paper-positioning decision that emphasizes efficiency, robustness, and biological plausibility over raw top-1 accuracy
+- Team context: the Sprint E combined benchmark on `experiments/sprint_e_benchmark.py` remains in progress per manifest
