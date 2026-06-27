@@ -4,7 +4,7 @@
 
 Modern generative AI systems are increasingly constrained by energy cost, brittle out-of-distribution (OOD) behavior, and reliance on gradient-based batch training. Bio-ARN 2.0 explores a different design point: a brain-inspired architecture built around sparse concept circuits, local Hebbian learning, predictive coding, workspace-style global broadcasting, and a deployment path to neuromorphic hardware. The core computational unit is the Concept Cell Cluster (CCC), a cortical-column-inspired module that can abstain, recruit new concepts online, and refine them through local resonance rather than backpropagation. CCCs are organized into a ventral-stream-like visual hierarchy, linked through predictive coding and top-down feedback, and coupled to a Global Neuronal Workspace (GNW) for competition, broadcast, and multi-step internal routing. The current system also adds opt-in STDP dynamics, synaptic consolidation, dynamic capacity growth, and curiosity-driven replay.
 
-The current system does not match state-of-the-art transformer accuracy on large-scale visual benchmarks. However, it shows promising properties along other axes. On real CIFAR-10, a hierarchy baseline reaches 30.0% accuracy; Sprint D curiosity+curriculum training improves this to 33.8% online and 55.8% in post-training evaluation; and the best combined 2,000-sample configuration reaches 33.0% accuracy with 1.000 OOD AUROC. For OOD detection, ensemble scoring reaches 0.861 AUROC and GNW workspace scoring reaches 0.868 AUROC, both above a 0.778 baseline. A Sprint D continual-learning retest shows only a partial win: Split-CIFAR-10 improves slightly to -29.0 points backward transfer with 23.2 points mean forgetting, but Split-MNIST worsens to -54.3% backward transfer with 43.5% forgetting, while Permuted-MNIST remains much milder at -7.5% backward transfer and 6.5% forgetting. A Loihi/Lava export path preserves weights exactly, passes round-trip validation, and keeps simulated accuracy within 0.047 of the source model. Analytic energy modeling projects 179.65 µJ per inference on Loihi 2 versus 50.01 mJ for a transformer baseline on an A100 GPU, a 278x advantage at a matched benchmark tier. These results position Bio-ARN not as a drop-in replacement for transformers, but as a candidate architecture for efficient, robust, continuously learning neuromorphic AI.
+The current system does not match state-of-the-art transformer accuracy on large-scale visual benchmarks. However, it shows promising properties along other axes. On real CIFAR-10, a hierarchy baseline reaches 30.0% accuracy; Sprint D curiosity+curriculum training improves this to 33.8% online and 55.8% in post-training evaluation; and the best combined 2,000-sample configuration reaches 33.0% accuracy with 1.000 OOD AUROC. Sprint E adds three targeted continual-learning mechanisms: concept locking, convolutional CCCs, and precision-weighted predictive processing inspired by hippocampal uncertainty signaling [Frank et al., 2026]. In the latest Split-CIFAR-10 continual-learning benchmark, the combined convolutional+locking path reduces mean forgetting from 34.7% to 20.7%, while the precision gate scales Hebbian plasticity with pool entropy and auto-locking preserves mature concept detectors once their importance crosses threshold. Full accuracy gains from the convolutional path are still pending, but the retention improvement is already material. A Loihi/Lava export path preserves weights exactly, passes round-trip validation, and keeps simulated accuracy within 0.047 of the source model. Analytic energy modeling projects 179.65 µJ per inference on Loihi 2 versus 50.01 mJ for a transformer baseline on an A100 GPU, a 278x advantage at a matched benchmark tier. These results position Bio-ARN not as a drop-in replacement for transformers, but as a candidate architecture for efficient, robust, continuously learning neuromorphic AI.
 
 ## 1. Introduction
 
@@ -16,9 +16,9 @@ The project's central claim is therefore not that brain-inspired learning alread
 
 This paper makes the following contributions:
 
-1. It presents **Concept Cell Clusters (CCCs)** as the basic sparse computational unit for online recruitment, abstention, refinement, and importance-aware stabilization.
-2. It integrates CCCs into a **visual ventral-stream hierarchy**, a **predictive coding stack with top-down gating**, a **Global Neuronal Workspace**, an **ensemble OOD mechanism**, and **curiosity-driven replay**.
-3. It reports new **scaling-law and continual-learning analyses**, showing both useful operating points and a task-type-dependent forgetting bottleneck.
+1. It presents **Concept Cell Clusters (CCCs)** as the basic sparse computational unit for online recruitment, abstention, refinement, and importance-triggered locking of mature concepts.
+2. It integrates CCCs into a **visual ventral-stream hierarchy**, a **predictive coding stack with top-down gating and precision weighting**, a **Global Neuronal Workspace**, an **ensemble OOD mechanism**, and **curiosity-driven replay**.
+3. It reports new **scaling-law and continual-learning analyses**, including a Sprint E reduction in class-split forgetting through convolutional CCCs and concept locking.
 4. It provides a **functional Loihi 2 export path** with round-trip/Lava validation and an analytic energy study suggesting large projected efficiency gains over dense transformer baselines.
 
 [Figure 1: End-to-end Bio-ARN pipeline, from sensory encoding through predictive coding, CCC hierarchies, GNW broadcast, ensemble/OOD heads, curiosity-driven replay, and Loihi 2 export.]
@@ -98,6 +98,26 @@ Several new components sharpen Bio-ARN's operating envelope:
 
 These modules do not all target the same metric. Some help accuracy, some help OOD behavior, some stabilize temporal learning, and some improve hardware plausibility. That division of labor becomes important in the experimental results.
 
+### 2.10 Concept locking and memory protection
+
+Sprint E adds a stronger protection mechanism for mature concepts: **importance tracking -> threshold -> permanent lock**. Each CCC already accumulates an importance score from usage, confidence, and recency. When that score exceeds `lock_threshold`, the pool marks the CCC as locked and freezes the parameters most responsible for its identity: the `concept_direction` vector and the feedback weights that reconstruct or refine the concept. A locked CCC still participates in the forward pass, can still win competition, and can still classify familiar inputs, but it is skipped by subsequent local updates.
+
+This matters because the newer continual-learning analysis points to a more specific failure mode than generic low-level drift. Shared F1 freezing was not enough. The direct damage occurs later in `learn_slow()`, where repeated local refinement can rotate a committed `concept_direction` and rewrite its feedback pathway toward newer tasks. Concept locking therefore targets the proximate root cause of catastrophic forgetting: once a CCC is consistently useful, it becomes a read-only detector. New concepts must then recruit previously uncommitted CCCs rather than repurposing old ones.
+
+### 2.11 Precision-weighted predictive processing
+
+Sprint E also replaces uniformly applied predictive plasticity with a selective precision mechanism grounded in recent neuroscience. Frank et al. (2026) report that human hippocampal ripples rise before uncertain stimuli and tune cortical responses by signaling predicted uncertainty [Frank et al., 2026]. Bio-ARN implements a computational analogue of that idea. A pool-level entropy estimator tracks how concentrated or diffuse recent CCC firing has been; a sigmoid transform converts that entropy into a precision value; and the resulting precision weights the learning-rate multiplier already used by the local Hebbian update path.
+
+The mapping is direct. Hippocampal ripple signaling corresponds to the pool entropy estimator, which measures uncertainty in the recent CCC firing distribution. Precision weighting corresponds to the sigmoid transform that converts entropy into a learning gate. High uncertainty produces high precision, so surprising or weakly organized contexts learn faster. Low uncertainty produces low precision, so familiar contexts update more cautiously and protect existing memories.
+
+This selective weighting addresses a concrete limitation in the earlier predictive-coding variants. Iterative settling smoothed bottom-up features too uniformly and drove CIFAR accuracy from 30.0% to 11.8%. Plain error gating was far less destructive, but it remained effectively neutral at roughly 30.0% because it treated all residual errors similarly. Precision weighting is more targeted: only high-entropy, novel contexts receive a large plasticity signal. In this sense it provides **soft protection**, while concept locking provides **hard protection** once a representation becomes mature.
+
+### 2.12 Convolutional Concept Cell Clusters
+
+Standard CCCs treat a 32 x 32 x 3 image as a flattened 3072-dimensional vector. That is simple and hardware-friendly, but it discards spatial adjacency before concept matching begins. Sprint E therefore adds **Convolutional CCCs**, implemented as a `ConvCCCPool` with a shared `ConvF1Layer` that applies local 2D convolutions, adaptive spatial pooling, and sparse top-k selection before the usual concept-space competition.
+
+Crucially, the learning rule remains local. The convolutional filters are updated through correlation-based Hebbian rules over pre- and post-synaptic activity rather than gradient backpropagation, and the downstream concept updates still use the same CCC-style local refinement logic. The result is a more vision-appropriate front end that preserves Bio-ARN's bio-plausibility constraint while giving the architecture access to spatial feature extraction.
+
 ## 3. Neuromorphic Deployment
 
 Bio-ARN includes a functional export path from trained CCC pools and visual hierarchies to a portable Loihi 2 graph. In this mapping, each CCC is decomposed into LIF populations corresponding to F1 feature neurons, F2 concept neurons, and a margin-gate readout. Feedback connections, local lateral inhibition, and winner-take-all competition are represented as explicit neuromorphic projections. Hierarchical exports further add feedforward layer-to-layer populations and projections.
@@ -114,7 +134,7 @@ From a systems perspective, this matters because Bio-ARN's central mechanisms—
 
 ### 4.1 Experimental framing
 
-The current experimental suite should be read as architectural validation rather than a final scaling study. The codebase includes MNIST, real CIFAR-10, text generation, multimodal demos, continual-learning benchmarks, OOD analyses, scaling sweeps, and analytic energy reports. The most mature strengths are uncertainty estimation, local learning, and hardware-oriented efficiency. The most obvious weakness is raw visual accuracy on harder datasets. The numbers below reflect the current June 2026 repository state.
+The current experimental suite should be read as architectural validation rather than a final scaling study. The codebase includes MNIST, real CIFAR-10, text generation, multimodal demos, continual-learning benchmarks, OOD analyses, scaling sweeps, and analytic energy reports. The most mature strengths are uncertainty estimation, local learning, and hardware-oriented efficiency. The most obvious weakness is raw visual accuracy on harder datasets. The numbers below reflect the current June 2026 repository state and now include the Sprint E retention-focused additions: concept locking, convolutional CCCs, and precision-weighted predictive processing.
 
 ### 4.2 CIFAR-10 progression and combined configurations
 
@@ -127,7 +147,7 @@ Real CIFAR-10 remains a challenging benchmark for purely local Hebbian learning.
 | Curiosity sweep at 800 samples | 30.5% | - | intermediate data-scaling reference point |
 | Best combined config at 2,000 samples | **33.0%** | **1.000** | best overall accuracy/robustness trade-off |
 
-The absolute numbers remain modest compared with modern convolutional and transformer models. We emphasize this directly because it is important for honest positioning. Bio-ARN should currently be understood as a proof of architectural direction, not a state-of-the-art CIFAR classifier. Within that framing, Sprint D is informative: curriculum + curiosity is the most impactful single improvement for CIFAR sample efficiency, while GNW consensus and predictive gating mostly sharpen selectivity and robustness rather than producing a large additional top-1 jump on their own.
+The absolute numbers remain modest compared with modern convolutional and transformer models. We emphasize this directly because it is important for honest positioning. Bio-ARN should currently be understood as a proof of architectural direction, not a state-of-the-art CIFAR classifier. Within that framing, Sprint D is informative: curriculum + curiosity is the most impactful single improvement for CIFAR sample efficiency, while GNW consensus and predictive gating mostly sharpen selectivity and robustness rather than producing a large additional top-1 jump on their own. Sprint E has not yet displaced the current best closed-set CIFAR configuration; the convolutional CCC path still needs tuning with the full hierarchy. Its most credible measured gain so far is in continual retention rather than top-1 accuracy.
 
 ### 4.3 OOD detection
 
@@ -188,21 +208,28 @@ After each task, the current model is evaluated on all tasks seen so far. We rep
 
 The updated retest preserves the same qualitative pattern: forgetting is strongly task-type-dependent. Bio-ARN still struggles most when new tasks introduce new class partitions that compete for CCC capacity and prototype ownership. It degrades much less when the task sequence preserves the label semantics but changes the surface statistics, as in Permuted-MNIST.
 
-#### 4.6.3 Analysis and mitigation
+#### 4.6.3 Sprint E update
 
-The current root cause appears to be **CCC pool saturation on class-split tasks**. Once early concepts occupy the most useful slots, later classes must either overwrite existing structure or recruit into a pool whose abstraction geometry was shaped for earlier tasks. That failure mode is much weaker on permutation benchmarks because the underlying categories remain aligned.
+Sprint E specifically targets the class-split forgetting problem on Split-CIFAR-10. The new combined convolutional+locking path reduces mean forgetting from **34.7%** to **20.7%**, which is the clearest retention gain yet observed from a single architectural change set. This should be interpreted as a genuine but still partial success: catastrophic forgetting is substantially lower, not eliminated.
 
-Sprint D adds three more targeted mitigation mechanisms on top of the earlier growth/consolidation work:
+Three additional observations matter. First, the precision-weighting trace behaves as intended: pool entropy and the effective learning-rate multiplier move together, so uncertainty is modulating plasticity rather than merely being logged. Second, CCCs are being auto-locked during training once their importance exceeds threshold, confirming that the hard-protection mechanism actually engages online. Third, the same benchmark does not yet show a decisive accuracy win for the convolutional path, so the current claim is narrower: Sprint E improves retention and representational selectivity, while accuracy tuning with hierarchy integration remains ongoing.
+
+#### 4.6.4 Analysis and mitigation
+
+The stronger Sprint E result refines the root-cause analysis. Capacity pressure still matters, but the more direct failure mode is **concept drift inside already committed CCCs**. In `learn_slow()`, mature `concept_direction` vectors and feedback pathways can still rotate toward later tasks, which erodes earlier class ownership even when the front end is frozen. That failure mode is much weaker on permutation benchmarks because the underlying categories remain aligned.
+
+Across Sprints D and E, the main mitigation mechanisms are now:
 
 - **Prediction-error gating**, which increases local learning on surprising features and suppresses redundant updates.
 - **Curiosity + curriculum**, which is highly effective for CIFAR sample efficiency but does not automatically translate into retention.
 - **GNW consensus learning gates**, which reduce updates on already well-broadcast concepts and keep low-consensus samples plastic.
+- **Precision weighting**, which uses pool entropy to scale plasticity up in uncertain contexts and down in familiar ones.
+- **Concept locking**, which permanently freezes mature concept directions and feedback weights once importance crosses threshold.
+- **Convolutional CCCs**, which preserve spatial structure so task-specific visual features do not have to be relearned from flat vectors alone.
 
-What helped: on Split-CIFAR-10, the new stack improves backward transfer by 0.2 points and mean forgetting by 0.1 points relative to the earlier benchmark. That small gain is still meaningful because it points in the right causal direction: local surprise appears to be a better learning signal than uniform plasticity.
+What helped: Sprint E's conv+locking path reduces mean forgetting from 34.7% to 20.7%, a materially larger gain than the earlier Sprint D-only improvements. This supports the causal hypothesis that protecting mature concept ownership matters more than simply making low-level plasticity selective.
 
-What did not help enough: the MNIST retest worsens on both class-split and permuted settings. The most plausible explanation is that curiosity, curriculum, and GNW gating bias the learner toward rapid recruitment and adaptation, but the actual interference bottleneck sits downstream in concept allocation, label binding, and prototype ownership. In other words, the new gates make learning more selective, but they do not yet solve where concepts are stored.
-
-This leads to a new shared-F1-layer insight. Freezing the common F1 front-end and switching to task adapters did not materially protect old tasks. That negative result is useful: it suggests forgetting is not primarily caused by low-level feature drift. Instead, the dominant damage occurs later, when F2/CCC slots and label prototypes are reassigned or their competitive margins are reshaped by new tasks. We therefore frame continual learning not as a solved capability, but as the project's clearest open research challenge.
+What did not help enough: accuracy on the convolutional path is still under-tuned, and the broader class-split problem has not disappeared. The most plausible explanation is that selective plasticity and locking protect stored concepts, but concept allocation, label binding, and hierarchy-level calibration still determine whether new tasks can be absorbed cleanly. We therefore frame continual learning not as a solved capability, but as the project's clearest open research challenge.
 
 ### 4.7 MNIST and deployment maturity
 
@@ -233,7 +260,7 @@ Bio-ARN intersects several research traditions but does not fit neatly into any 
 
 **Hebbian and local-learning systems.** Hebbian learning and STDP have deep biological and computational roots [Hebb, 1949; Bi and Poo, 1998]. More recent work on local-learning alternatives to backpropagation has explored predictive coding, equilibrium methods, and contrastive local objectives. Bio-ARN belongs to this family but is distinctive in combining local concept recruitment, associative memory, workspace dynamics, and deployment-oriented sparsity in one framework.
 
-**Predictive coding.** Predictive coding theories propose that cortical systems minimize prediction error through hierarchical feedback and residual signaling [Rao and Ballard, 1999; Friston, 2010]. Bio-ARN adopts this logic explicitly, using local prediction error to suppress predictable structure and highlight novelty.
+**Predictive coding.** Predictive coding theories propose that cortical systems minimize prediction error through hierarchical feedback and residual signaling [Rao and Ballard, 1999; Friston, 2010]. Bio-ARN adopts this logic explicitly, using local prediction error to suppress predictable structure and highlight novelty. Sprint E further grounds the learning-gate variant of that idea in recent evidence that hippocampal ripples can tune cortical responses as a function of predicted uncertainty [Frank et al., 2026].
 
 **Global workspace theories.** Global workspace theory and the Global Neuronal Workspace provide a computational story for limited-capacity access, conscious broadcast, and serial integration [Baars, 1988; Dehaene and Changeux, 2011]. Bio-ARN does not claim consciousness. It uses the GNW idea instrumentally, as a bottlenecked global routing mechanism for sparse concepts.
 
@@ -253,6 +280,8 @@ The combined-feature finding is especially important. Individual modules serve d
 
 These modules do **not** simply compound into ever-higher raw accuracy. That is not a flaw in the framing; it is the central result. Bio-ARN's value is the **combination of properties** rather than dominance on any single standard benchmark.
 
+Sprint E sharpens that interpretation rather than overturning it. Precision weighting and concept locking divide stability protection into two complementary regimes: uncertainty-dependent **soft** plasticity control and importance-triggered **hard** memory protection. Convolutional CCCs address a different bottleneck by giving the architecture a spatially structured visual front end without abandoning local learning.
+
 No other system in the current project scope provides all of the following simultaneously in one executable stack:
 
 1. projected neuromorphic energy efficiency,
@@ -260,6 +289,8 @@ No other system in the current project scope provides all of the following simul
 3. online local learning without backpropagation,
 4. explicit continual-learning machinery, and
 5. a validated Loihi/Lava export path.
+
+The Frank et al. connection is especially important for how this project now positions itself. Bio-ARN is no longer using predictive coding only as a generic metaphor for top-down error suppression. It now implements a computational analogue of hippocampal precision signaling: uncertainty in recent concept usage modulates how strongly new errors change the system. That creates a more principled bridge between computational neuroscience and neuromorphic engineering. In practical terms, the precision gate offers a neuroscience-grounded way to manage the stability-plasticity dilemma, while concept locking provides a complementary engineering safeguard once a representation is judged mature.
 
 ### 6.1 Limitations
 
@@ -277,6 +308,7 @@ Despite these limitations, Bio-ARN suggests a valuable research direction. If th
 Promising future directions include:
 
 - stronger capacity allocation and consolidation for class-split continual learning;
+- tighter hierarchy integration for convolutional CCCs so the retention gain also translates into stronger closed-set accuracy;
 - protecting F2 / prototype ownership directly rather than only freezing the shared F1 front-end;
 - class-aware replay anchors or reserved concept slots for previously learned tasks;
 - letting GNW consensus gate not just learning rate but also whether new CCC recruitment is permitted;
@@ -287,8 +319,12 @@ Promising future directions include:
 
 ## 7. Conclusion
 
-Bio-ARN 2.0 is a research architecture built around a simple but ambitious hypothesis: useful intelligence for edge and neuromorphic settings may require a different stack than the one optimized for large datacenter transformers. By combining CCC-based sparse concepts, predictive coding, top-down feedback, workspace broadcast, multimodal binding, ensemble uncertainty, and local Hebbian learning, Bio-ARN offers a concrete alternative design.
+Bio-ARN 2.0 is a research architecture built around a simple but ambitious hypothesis: useful intelligence for edge and neuromorphic settings may require a different stack than the one optimized for large datacenter transformers. By combining CCC-based sparse concepts, concept locking, precision-weighted predictive coding, convolutional local feature extractors, top-down feedback, workspace broadcast, multimodal binding, ensemble uncertainty, and local Hebbian learning, Bio-ARN offers a concrete alternative design.
 
 The current evidence is mixed in the right way. Bio-ARN is not yet a high-accuracy vision model, and its continual-learning story remains incomplete on class-split tasks. But it already shows promising OOD behavior, online learning capability, functional neuromorphic export, and compelling projected energy efficiency. We therefore view it as an architecture worth scaling and stress-testing, especially for domains where efficiency, robustness, continual adaptation, and deployability matter as much as raw benchmark score.
 
 [Figure 6: Summary comparison positioning Bio-ARN against transformer-class systems across accuracy, energy, OOD robustness, continual learning, and biological plausibility.]
+
+## 8. References
+
+Frank, D., Moratti, S., Hellerstedt, R., Sarnthein, J., Li, N., Horn, A., Imbach, L., Stieglitz, L., Gil-Nagel, A., Toledano, R., Friston, K. J., & Strange, B. A. (2026). Human hippocampal ripples tune cortical responses based on predicted uncertainty. *Nature Neuroscience*. https://doi.org/10.1038/s41593-026-02345-6
