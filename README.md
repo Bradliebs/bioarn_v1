@@ -10,6 +10,20 @@ Bio-ARN 2.0 is a research codebase for building **spiking neural systems with He
 
 **Docs:** [Architecture Guide](docs/architecture.md) · [API Reference](docs/api_reference.md) · [Getting Started](docs/getting_started.md) · [Research Notes](docs/research_notes.md) · [Contributing](CONTRIBUTING.md)
 
+## Installation
+
+```bash
+pip install bioarn
+```
+
+For development:
+
+```bash
+git clone https://github.com/Bradliebs/bioarn_v1.git
+cd bioarn_v1
+pip install -e ".[dev]"
+```
+
 ## Key results
 
 | Area | Current result | Notes |
