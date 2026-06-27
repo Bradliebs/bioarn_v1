@@ -223,17 +223,17 @@ def test_hierarchy_features_feed_into_bioarncore() -> None:
 
 def test_workspace_opt_in_biases_recognition_confidence() -> None:
     plain_core = _identity_core()
-    workspace_core = _identity_core(
-        workspace=GNWConfig(
-            capacity=3,
-            broadcast_gain=2.2,
-            fatigue_rate=0.1,
-            fatigue_threshold=0.2,
-            competition_temp=0.45,
-            context_size=32,
-            context_top_k=3,
-        )
+    workspace = GNWConfig(
+        capacity=3,
+        broadcast_gain=2.2,
+        fatigue_rate=0.1,
+        fatigue_threshold=0.2,
+        competition_temp=0.45,
+        context_size=32,
+        context_top_k=3,
     )
+    workspace.context_bonus = 0.15  # type: ignore[attr-defined]
+    workspace_core = _identity_core(workspace=workspace)
 
     plain_core.forward(_concept(0), learn=True)
     workspace_core.forward(_concept(0), learn=True)
@@ -245,6 +245,50 @@ def test_workspace_opt_in_biases_recognition_confidence() -> None:
     assert workspace_core.last_perception.broadcast.context_vector is not None
     assert workspace_recognition.abstained is False
     assert workspace_recognition.confidence >= plain_recognition.confidence
+
+
+def test_workspace_consensus_prefers_context_supported_candidate() -> None:
+    workspace = GNWConfig(
+        capacity=3,
+        broadcast_gain=2.2,
+        fatigue_rate=0.1,
+        fatigue_threshold=0.2,
+        competition_temp=0.45,
+        context_size=32,
+        context_top_k=3,
+    )
+    workspace.context_bonus = 0.20  # type: ignore[attr-defined]
+    core = _identity_core(workspace=workspace)
+    core.gnw.context.update(_concept(0), 1.0)
+
+    vote_result, broadcast = core.workspace_consensus(
+        [
+            (0, _concept(0), 0.55),
+            (1, _concept(1), 0.60),
+        ],
+        update_workspace=False,
+    )
+
+    assert broadcast.indices[0] == 0
+    assert torch.allclose(vote_result.winning_direction, _concept(0), atol=1e-4)
+
+
+def test_workspace_learning_multiplier_tracks_consensus_strength() -> None:
+    core = _identity_core()
+    weak_broadcast = core._empty_broadcast()
+    strong_broadcast = weak_broadcast.__class__(
+        directions=[_concept(0)],
+        activations=[float(core.gnw.config.broadcast_gain)],
+        indices=[0],
+        num_occupied=1,
+        total_broadcast_energy=float(core.gnw.config.capacity * core.gnw.config.broadcast_gain),
+    )
+
+    weak_multiplier = core.workspace_learning_multiplier(weak_broadcast)
+    strong_multiplier = core.workspace_learning_multiplier(strong_broadcast)
+
+    assert weak_multiplier > strong_multiplier
+    assert weak_multiplier > 1.0
 
 
 def test_hierarchy_learn_then_classify_shape() -> None:

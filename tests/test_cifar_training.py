@@ -257,24 +257,28 @@ def test_evaluation_metrics() -> None:
 
 
 def test_workspace_training_path_runs() -> None:
+    workspace = GNWConfig(
+        capacity=5,
+        broadcast_gain=2.2,
+        fatigue_rate=0.08,
+        fatigue_threshold=0.18,
+        competition_temp=0.45,
+        context_size=48,
+    )
+    workspace.gnw_learning_gain = 0.8  # type: ignore[attr-defined]
+    workspace.context_bonus = 0.15  # type: ignore[attr-defined]
     trainer = VisionTrainer(
         make_config(
             num_train_samples=80,
             num_test_samples=40,
-            workspace=GNWConfig(
-                capacity=5,
-                broadcast_gain=2.2,
-                fatigue_rate=0.08,
-                fatigue_threshold=0.18,
-                competition_temp=0.45,
-                context_size=48,
-            ),
+            workspace=workspace,
         )
     )
-    trainer.train_online(make_stream(80, seed=21), num_samples=80)
+    result = trainer.train_online(make_stream(80, seed=21), num_samples=80)
     metrics = trainer.evaluate(make_stream(40, seed=22, shuffle=False), num_samples=40)
 
     assert trainer.system.config.workspace is not None
+    assert result["mean_learning_rate_multiplier"] > 1.0
     assert metrics["accuracy"] >= 0.0
     assert metrics["abstention_rate"] >= 0.0
 

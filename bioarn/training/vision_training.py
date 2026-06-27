@@ -52,6 +52,7 @@ class PoolStepResult:
     confidence: float
     abstained: bool
     winner_confidences: torch.Tensor
+    broadcast_strength: float = 0.0
 
 
 class SyntheticCIFAR10Stream(StreamingDataSource):
@@ -492,7 +493,9 @@ class VisionTrainer:
         self,
         fired_indices: list[int],
         winner_confidences: torch.Tensor,
-    ) -> tuple[torch.Tensor, float, bool]:
+        *,
+        preview: bool = False,
+    ) -> tuple[torch.Tensor, float, bool, float]:
         active_cccs: list[tuple[int, torch.Tensor, float]] = []
         for position, index in enumerate(fired_indices):
             confidence = (
@@ -502,13 +505,17 @@ class VisionTrainer:
             )
             active_cccs.append((index, self._ccc_direction(index), confidence))
 
-        thought = self.system.stream.think_step(active_cccs, timestep=self.system.timestep)
-        self.system.last_thought = thought
-        focused_cccs = self.system._workspace_focus_candidates(active_cccs, thought.broadcast)
-        vote_result = self.system.fabric.vote(focused_cccs)
-        vote_result = self.system._workspace_bias_vote(vote_result, thought.broadcast)
+        vote_result, broadcast = self.system.workspace_consensus(
+            active_cccs,
+            update_workspace=not preview,
+        )
         concept_direction = vote_result.winning_direction.detach().clone()
-        return concept_direction, float(vote_result.confidence), vote_result.voter_count == 0
+        return (
+            concept_direction,
+            float(vote_result.confidence),
+            vote_result.voter_count == 0,
+            float(self.system.normalized_broadcast_strength(broadcast)),
+        )
 
     def _step_pool(
         self,
@@ -533,10 +540,12 @@ class VisionTrainer:
         fired_indices = list(pool_output.fired_indices)
         winner_confidences = pool_output.winner_confidences.to(torch.float32)
 
-        if getattr(self.system.config, "workspace", None) is not None and not preview:
-            concept, confidence, abstained = self._workspace_consensus(
+        broadcast_strength = 0.0
+        if getattr(self.system.config, "workspace", None) is not None:
+            concept, confidence, abstained, broadcast_strength = self._workspace_consensus(
                 fired_indices,
                 winner_confidences,
+                preview=preview,
             )
         else:
             concept, confidence = self._pool_concept(fired_indices, winner_confidences)
@@ -552,6 +561,7 @@ class VisionTrainer:
             confidence=float(confidence),
             abstained=bool(abstained),
             winner_confidences=winner_confidences.detach().clone(),
+            broadcast_strength=float(broadcast_strength),
         )
 
     def _record_ccc_activity(
@@ -780,6 +790,7 @@ class VisionTrainer:
                     self.curiosity_system is not None
                     or self.curriculum_scheduler is not None
                     or self.config.contrastive_curiosity
+                    or getattr(self.system.config, "workspace", None) is not None
                 )
                 if needs_preview:
                     preview_result = self._step_pool(
@@ -810,6 +821,15 @@ class VisionTrainer:
                         novelty_signal = self._preview_novelty_signal(prediction_error_preview)
                         if novelty_signal is not None:
                             learning_rate_multiplier *= max(1.0, float(novelty_signal.learning_boost))
+                    if getattr(self.system.config, "workspace", None) is not None:
+                        gnw_learning_gain = max(
+                            0.0,
+                            float(getattr(self.system.gnw.config, "gnw_learning_gain", 0.75)),
+                        )
+                        learning_rate_multiplier *= (
+                            1.0
+                            + (gnw_learning_gain * (1.0 - float(preview_result.broadcast_strength)))
+                        )
                     if self.config.contrastive_curiosity:
                         boundary_score = self._boundary_score(preview_result.winner_confidences)
                         boundary_scores.append(boundary_score)

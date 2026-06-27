@@ -241,6 +241,175 @@ class BioARNCore(nn.Module):
         )
         return max(0.0, min(1.0, similarity))
 
+    def _current_context_vector(self) -> torch.Tensor | None:
+        if hasattr(self.gnw, "get_context_vector"):
+            context = self.gnw.get_context_vector()
+            if float(context.norm().item()) > 0.0:
+                return context.detach().clone()
+        if self.last_thought.broadcast.context_vector is not None:
+            return self.last_thought.broadcast.context_vector.detach().clone()
+        return None
+
+    def _workspace_candidate_priorities(
+        self,
+        candidates: list[tuple[int, torch.Tensor, float]],
+    ) -> list[tuple[int, torch.Tensor, float]]:
+        if not self.workspace_enabled or not candidates:
+            return candidates
+
+        context_vector = self._current_context_vector()
+        context_bonus = max(0.0, float(getattr(self.gnw.config, "context_bonus", 0.08)))
+        prioritized: list[tuple[int, torch.Tensor, float]] = []
+        for index, direction, confidence in candidates:
+            peer_support = 0.0
+            peer_weight = 0.0
+            for other_index, other_direction, other_confidence in candidates:
+                if other_index == index:
+                    continue
+                weight = max(0.0, float(other_confidence))
+                if weight <= 0.0:
+                    continue
+                peer_support += self._positive_similarity(direction, other_direction) * weight
+                peer_weight += weight
+            if peer_weight > 0.0:
+                peer_support /= peer_weight
+            context_support = self._positive_similarity(direction, context_vector)
+            prioritized_confidence = min(
+                1.0,
+                max(0.0, float(confidence))
+                + (context_bonus * context_support)
+                + (0.20 * peer_support),
+            )
+            prioritized.append((index, direction, prioritized_confidence))
+        return prioritized
+
+    def _workspace_preview_broadcast(
+        self,
+        candidates: list[tuple[int, torch.Tensor, float]],
+    ) -> BroadcastOutput:
+        if not candidates:
+            return self._empty_broadcast()
+
+        ranked = sorted(candidates, key=lambda candidate: float(candidate[2]), reverse=True)
+        limited = ranked[: max(1, int(self.gnw.config.capacity))]
+        activations = [
+            float(max(0.0, confidence) * float(self.gnw.config.broadcast_gain))
+            for _, _, confidence in limited
+        ]
+        return BroadcastOutput(
+            directions=[direction.detach().clone() for _, direction, _ in limited],
+            activations=activations,
+            indices=[index for index, _, _ in limited],
+            num_occupied=len(limited),
+            total_broadcast_energy=float(sum(activations)),
+            context_vector=self._current_context_vector(),
+        )
+
+    def normalized_broadcast_strength(self, broadcast: BroadcastOutput | None = None) -> float:
+        current = broadcast if broadcast is not None else self.last_thought.broadcast
+        max_energy = max(
+            1.0,
+            float(self.gnw.config.capacity) * float(self.gnw.config.broadcast_gain),
+        )
+        return float(max(0.0, min(1.0, float(current.total_broadcast_energy) / max_energy)))
+
+    def workspace_learning_multiplier(self, broadcast: BroadcastOutput | None = None) -> float:
+        normalized_strength = self.normalized_broadcast_strength(broadcast)
+        gain = max(0.0, float(getattr(self.gnw.config, "gnw_learning_gain", 0.75)))
+        return float(1.0 + (gain * (1.0 - normalized_strength)))
+
+    def _workspace_vote_from_broadcast(
+        self,
+        candidates: list[tuple[int, torch.Tensor, float]],
+        broadcast: BroadcastOutput,
+    ) -> VoteResult:
+        if not candidates:
+            return self.fabric._empty_vote_result(self.gnw._device_anchor.device)  # type: ignore[attr-defined]
+
+        candidate_map = {
+            index: (direction.detach().clone(), max(0.0, float(confidence)))
+            for index, direction, confidence in candidates
+        }
+        if broadcast.indices:
+            winner_index = int(broadcast.indices[0])
+            winner_direction = candidate_map.get(
+                winner_index,
+                (broadcast.directions[0].detach().clone(), max(broadcast.activations[0], 0.0)),
+            )[0]
+        else:
+            winner_index, winner_direction, _ = max(candidates, key=lambda candidate: float(candidate[2]))
+            winner_direction = winner_direction.detach().clone()
+        winner_position = next(
+            (
+                position
+                for position, (index, _, _) in enumerate(candidates)
+                if int(index) == int(winner_index)
+            ),
+            0,
+        )
+
+        directions = torch.stack(
+            [self._normalized_direction(direction) for _, direction, _ in candidates],
+            dim=0,
+        )
+        confidences = torch.tensor(
+            [max(0.0, float(confidence)) for _, _, confidence in candidates],
+            device=directions.device,
+            dtype=directions.dtype,
+        )
+        winner_norm = self._normalized_direction(winner_direction).to(directions)
+        agreement = cosine_similarity(
+            directions,
+            winner_norm.unsqueeze(0).expand_as(directions),
+        ).clamp(min=0.0, max=1.0)
+        agreement_score = float(
+            (agreement * confidences).sum().item() / confidences.sum().clamp_min(1e-6).item()
+        )
+        voter_mask = agreement >= max(0.10, float(agreement.max().item()) * 0.25)
+        if not bool(voter_mask.any().item()):
+            voter_mask[winner_position] = True
+        voter_indices = [
+            index
+            for (index, _, _), included in zip(candidates, voter_mask.tolist(), strict=False)
+            if included
+        ]
+        winner_confidence = candidate_map.get(winner_index, (winner_direction, 0.0))[1]
+        strength = self.normalized_broadcast_strength(broadcast)
+        context_support = self._positive_similarity(winner_direction, broadcast.context_vector)
+        attention_support = max(broadcast.attention_weights, default=0.0)
+        confidence = min(
+            1.0,
+            winner_confidence
+            * (0.65 + (0.35 * agreement_score))
+            * (0.75 + (0.25 * strength))
+            * (1.0 + (0.20 * context_support) + (0.10 * attention_support)),
+        )
+        return VoteResult(
+            winning_direction=winner_direction.detach().clone(),
+            confidence=float(confidence),
+            agreement_score=float(agreement_score),
+            voter_count=len(voter_indices),
+            voter_indices=voter_indices,
+        )
+
+    def workspace_consensus(
+        self,
+        candidates: list[tuple[int, torch.Tensor, float]],
+        *,
+        update_workspace: bool = True,
+    ) -> tuple[VoteResult, BroadcastOutput]:
+        if not candidates:
+            empty_vote = self.fabric._empty_vote_result(self.gnw._device_anchor.device)  # type: ignore[attr-defined]
+            return empty_vote, self._empty_broadcast()
+
+        prioritized = self._workspace_candidate_priorities(candidates)
+        if update_workspace and self.workspace_enabled:
+            self.last_thought = self.stream.think_step(prioritized, timestep=self.timestep)
+            broadcast = self.last_thought.broadcast
+        else:
+            broadcast = self._workspace_preview_broadcast(prioritized)
+        return self._workspace_vote_from_broadcast(prioritized, broadcast), broadcast
+
     def _workspace_focus_candidates(
         self,
         candidates: list[tuple[int, torch.Tensor, float]],
@@ -362,13 +531,21 @@ class BioARNCore(nn.Module):
             else []
         )
         surviving_cccs = self._surviving_cccs(active_cccs, inhibited_winners)
-        self.last_thought = self.stream.think_step(surviving_cccs, timestep=self.timestep)
-        focused_cccs = self._workspace_focus_candidates(
-            surviving_cccs,
-            self.last_thought.broadcast,
-        )
-        vote_result = self.fabric.vote(focused_cccs)
-        vote_result = self._workspace_bias_vote(vote_result, self.last_thought.broadcast)
+        if self.workspace_enabled:
+            vote_result, broadcast = self.workspace_consensus(
+                active_cccs,
+                update_workspace=True,
+            )
+            focused_cccs = self._workspace_focus_candidates(active_cccs, broadcast)
+        else:
+            self.last_thought = self.stream.think_step(surviving_cccs, timestep=self.timestep)
+            broadcast = self.last_thought.broadcast
+            focused_cccs = self._workspace_focus_candidates(
+                surviving_cccs,
+                broadcast,
+            )
+            vote_result = self.fabric.vote(focused_cccs)
+            vote_result = self._workspace_bias_vote(vote_result, broadcast)
 
         associations = (
             self.fabric.retrieve_associates(vote_result.winning_direction, k=5)
@@ -379,7 +556,7 @@ class BioARNCore(nn.Module):
         perception = PerceptionOutput(
             pool_output=pool_output,
             vote_result=vote_result,
-            broadcast=self.last_thought.broadcast,
+            broadcast=broadcast,
             associations=associations,
             num_fired=len(pool_output.fired_indices),
             num_abstained=len(pool_output.abstained_indices),
@@ -457,6 +634,14 @@ class BioARNCore(nn.Module):
         )
 
     @torch.no_grad()
+    def workspace_classify(self, raw_input: torch.Tensor) -> RecognitionOutput:
+        """Classify an input through workspace consensus when GNW is enabled."""
+
+        if not self.workspace_enabled:
+            return self.recognize(raw_input)
+        return self.recognize(raw_input)
+
+    @torch.no_grad()
     def ensemble_recognize(self, raw_input: torch.Tensor) -> EnsembleResult | RecognitionOutput:
         """Recognize using the ensemble pool if configured, otherwise fall back to recognize().
 
@@ -467,6 +652,8 @@ class BioARNCore(nn.Module):
 
         if self.ensemble is not None:
             return self.ensemble.classify(raw_input)
+        if self.workspace_enabled:
+            return self.workspace_classify(raw_input)
         return self.recognize(raw_input)
 
     @torch.no_grad()

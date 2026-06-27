@@ -363,6 +363,49 @@ def run_curriculum_curiosity(
     )
 
 
+def run_gnw_consensus(
+    train_samples: list[tuple[torch.Tensor, int | None]],
+    test_samples: list[tuple[torch.Tensor, int | None]],
+    ood_samples: list[torch.Tensor],
+) -> RunResult:
+    train_config = _base_train_config()
+    workspace = _workspace_config()
+    workspace.context_bonus = 0.15  # type: ignore[attr-defined]
+    workspace.gnw_learning_gain = 0.8  # type: ignore[attr-defined]
+    train_config.workspace = workspace
+    trainer = VisionTrainer(train_config)
+    trainer.train_online(
+        train_samples,
+        num_samples=TRAIN_N,
+        interleave_classes=True,
+        num_passes=NUM_PASSES,
+    )
+    eval_metrics = trainer.evaluate(test_samples, num_samples=TEST_N)
+
+    id_scores: list[float] = []
+    for tensor, _ in test_samples:
+        step_result = trainer._step_pool(  # noqa: SLF001
+            trainer._prepare_tensor(tensor),  # noqa: SLF001
+            allow_recruit=False,
+        )
+        id_scores.append(float(step_result.confidence))
+
+    ood_scores: list[float] = []
+    for tensor in ood_samples:
+        step_result = trainer._step_pool(  # noqa: SLF001
+            trainer._prepare_tensor(tensor),  # noqa: SLF001
+            allow_recruit=False,
+        )
+        ood_scores.append(float(step_result.confidence))
+
+    return RunResult(
+        name="gnw_consensus",
+        accuracy=float(eval_metrics["accuracy"]),
+        abstention_rate=float(eval_metrics["abstention_rate"]),
+        ood_auroc=_auroc(id_scores, ood_scores),
+    )
+
+
 def run_hierarchy(
     train_samples: list[tuple[torch.Tensor, int | None]],
     test_samples: list[tuple[torch.Tensor, int | None]],
@@ -658,6 +701,7 @@ def run_experiment() -> list[RunResult]:
         ("baseline", run_baseline),
         ("workspace", run_workspace),
         ("curriculum+curiosity", run_curriculum_curiosity),
+        ("gnw_consensus", run_gnw_consensus),
         ("hierarchy", run_hierarchy),
         (
             "hierarchy+feedback",
