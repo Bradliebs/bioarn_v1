@@ -16,11 +16,15 @@ if __package__ is None or __package__ == "":
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
+from bioarn.config import GNWConfig, PredictiveConfig
 from bioarn.data import MNISTStream
 from bioarn.hierarchy import HierarchyConfig, VisualHierarchy
 from bioarn.training import VisionTrainConfig, VisionTrainer, load_cifar10_or_synthetic, take_samples
 
 TASK_GROUPS: list[tuple[int, int]] = [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9)]
+SPRINT_D_CONSOLIDATION_STRENGTH = 0.5
+SPRINT_D_CURIOSITY_WEIGHT = 0.8
+SPRINT_D_CURRICULUM = True
 
 
 @dataclass
@@ -46,6 +50,47 @@ class ContinualResult:
     mean_forward_transfer: float
 
 
+def sprint_d_profile() -> str:
+    return (
+        "Sprint D profile: "
+        f"consolidation={SPRINT_D_CONSOLIDATION_STRENGTH}, "
+        f"curiosity={SPRINT_D_CURIOSITY_WEIGHT}, "
+        f"curriculum={SPRINT_D_CURRICULUM}, "
+        "predictive=error_gating, gnw_consensus=enabled"
+    )
+
+
+def _build_predictive_config() -> PredictiveConfig:
+    return PredictiveConfig(
+        num_levels=4,
+        gamma=0.12,
+        eta=0.008,
+        precision_init=1.0,
+        error_threshold=0.02,
+        settling_steps=6,
+        mode="error_gating",
+    )
+
+
+def _build_workspace_config(*, concept_dim: int) -> GNWConfig:
+    workspace = GNWConfig(
+        capacity=5,
+        broadcast_gain=2.2,
+        fatigue_rate=0.08,
+        fatigue_threshold=0.18,
+        competition_temp=0.45,
+        concept_dim=concept_dim,
+        context_size=192,
+        context_decay=0.97,
+        context_update_rate=0.25,
+        attention_heads=4,
+        context_top_k=6,
+    )
+    workspace.context_bonus = 0.15  # type: ignore[attr-defined]
+    workspace.gnw_learning_gain = 0.8  # type: ignore[attr-defined]
+    return workspace
+
+
 def _build_hierarchy() -> VisualHierarchy:
     return VisualHierarchy(
         HierarchyConfig(
@@ -55,10 +100,11 @@ def _build_hierarchy() -> VisualHierarchy:
             concept_dims=[32, 64, 128, 64],
             thresholds=[0.25, 0.3, 0.35, 0.4],
             learning_rates=[0.05, 0.03, 0.02, 0.01],
-            consolidation_strength=0.35,
+            consolidation_strength=SPRINT_D_CONSOLIDATION_STRENGTH,
             freeze_f1_after=1,
             f1_adapter_dim=16,
             class_count=10,
+            predictive=_build_predictive_config(),
         )
     )
 
@@ -77,12 +123,15 @@ def _build_mnist_trainer(
             use_batched=True,
             batch_size=32,
             learning_rate=0.02,
-            consolidation_strength=0.35,
+            consolidation_strength=SPRINT_D_CONSOLIDATION_STRENGTH,
             freeze_f1_after=min(train_samples, max(50, train_samples // 3)),
             f1_adapter_dim=16,
             num_train_samples=train_samples,
             num_test_samples=test_samples,
             preprocessing_warmup_samples=min(train_samples, max(50, train_samples // 3)),
+            curiosity_weight=SPRINT_D_CURIOSITY_WEIGHT,
+            curriculum=SPRINT_D_CURRICULUM,
+            workspace=_build_workspace_config(concept_dim=128),
         )
     )
 
@@ -677,6 +726,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
+    print(sprint_d_profile())
 
     train_by_task, test_by_task, data_source = _load_cifar_task_data(
         train_per_task=args.train_per_task,

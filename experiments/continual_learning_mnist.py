@@ -13,7 +13,13 @@ if __package__ is None or __package__ == "":
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-from experiments.continual_learning import _print_result, run_permuted_mnist, run_split_mnist, summarize_findings
+from experiments.continual_learning import (
+    _print_result,
+    run_permuted_mnist,
+    run_split_mnist,
+    sprint_d_profile,
+    summarize_findings,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,6 +46,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
+    print(sprint_d_profile())
     print(
         "Running MNIST continual learning benchmarks with "
         f"split_train={args.split_train_samples}, split_test={args.split_test_samples}, "
