@@ -11,6 +11,11 @@ from bioarn.predictive.hierarchy import (
     ResonanceLoopOutput,
 )
 from bioarn.predictive.pc_layer import PCStack, PCStackOutput, PCLayer, PCLayerOutput, free_energy
+from bioarn.predictive.precision_weighting import (
+    PoolEntropyEstimator,
+    PrecisionSignal,
+    PrecisionWeightedGate,
+)
 
 __all__ = [
     "ActionSignal",
@@ -24,6 +29,9 @@ __all__ = [
     "PCStackOutput",
     "PredictionQualityOutput",
     "PredictionErrorGate",
+    "PoolEntropyEstimator",
+    "PrecisionSignal",
+    "PrecisionWeightedGate",
     "PredictiveHierarchy",
     "ResonanceLoopOutput",
     "free_energy",

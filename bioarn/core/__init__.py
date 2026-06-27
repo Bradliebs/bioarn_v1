@@ -2,6 +2,13 @@
 
 from bioarn.core.ccc import CCCOutput, CCCPool, CCCPoolOutput, ConceptCellCluster, F1Adapter
 from bioarn.core.consolidation import SynapticConsolidation
+from bioarn.core.conv_ccc import (
+    ConvCCCOutput,
+    ConvCCCPool,
+    ConvCCCPoolOutput,
+    ConvConceptCellCluster,
+    ConvF1Layer,
+)
 from bioarn.core.margin_gate import MarginGate, MarginGateOutput, ResonanceOutput
 from bioarn.core.spiking import (
     LIFLayer,
@@ -21,6 +28,11 @@ __all__ = [
     "CCCPool",
     "CCCPoolOutput",
     "ConceptCellCluster",
+    "ConvCCCOutput",
+    "ConvCCCPool",
+    "ConvCCCPoolOutput",
+    "ConvConceptCellCluster",
+    "ConvF1Layer",
     "F1Adapter",
     "SynapticConsolidation",
     "LIFLayer",

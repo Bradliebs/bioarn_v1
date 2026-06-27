@@ -1,13 +1,14 @@
 import pytest
 import torch
 
-from bioarn.config import CCCConfig, MarginGateConfig
+from bioarn.config import CCCConfig, MarginGateConfig, PrecisionConfig
 from bioarn.core.ccc import CCCPool, ConceptCellCluster
 from bioarn.core.margin_gate import ResonanceOutput
 from bioarn.core.math_utils import cosine_similarity, normalize
+from bioarn.predictive import PoolEntropyEstimator, PrecisionSignal
 
 
-def make_config(max_pool_size: int = 4) -> CCCConfig:
+def make_config(max_pool_size: int = 4, lock_threshold: float = 0.8) -> CCCConfig:
     return CCCConfig(
         input_dim=4,
         concept_dim=4,
@@ -17,6 +18,7 @@ def make_config(max_pool_size: int = 4) -> CCCConfig:
         slow_lr=0.2,
         feedback_lr=0.3,
         max_pool_size=max_pool_size,
+        lock_threshold=lock_threshold,
     )
 
 
@@ -38,6 +40,7 @@ def configure_identity_ccc(ccc: ConceptCellCluster) -> None:
         ccc.feedback_weights.zero_()
         ccc.concept_direction.zero_()
         ccc.is_committed.zero_()
+        ccc.locked.zero_()
         ccc.age.zero_()
         ccc.last_fired.fill_(-1)
 
@@ -124,6 +127,35 @@ def test_ccc_slow_learning_shifts_direction() -> None:
     new_similarity = cosine_similarity(ccc.concept_direction, shifted_f2).item()
 
     assert new_similarity > previous_similarity
+
+
+def test_ccc_locked_skips_fast_learning() -> None:
+    ccc = make_ccc()
+    ccc.lock()
+    f1_output = ccc.f1_encode(concept_input())
+
+    ccc.learn_fast(concept_input(), f1_output)
+
+    assert ccc.is_committed.item() is False
+    assert ccc.locked.item() is True
+    assert torch.count_nonzero(ccc.concept_direction).item() == 0
+
+
+def test_ccc_locked_still_fires_but_skips_slow_learning() -> None:
+    ccc = make_ccc(theta_resonance=0.95)
+    commit_ccc(ccc)
+    ccc.lock()
+    previous_direction = ccc.concept_direction.clone()
+    previous_feedback = ccc.feedback_weights.clone()
+
+    output = ccc(concept_input(), timestep=5)
+
+    assert output.fired is True
+    assert output.resonance is not None
+    assert ccc.locked.item() is True
+    assert torch.allclose(ccc.concept_direction, previous_direction)
+    assert torch.allclose(ccc.feedback_weights, previous_feedback)
+    assert ccc.last_fired.item() == 5
 
 
 def test_ccc_feedback_prediction() -> None:
@@ -236,6 +268,65 @@ def test_pool_stats() -> None:
 
     assert stats["num_committed"] == 1
     assert stats["num_uncommitted"] == 2
+    assert stats["num_locked"] == 0
     assert stats["total_concepts"] == 3
     assert stats["mean_confidence"] == pytest.approx(1.0)
     assert stats["fire_rate"] == pytest.approx(1.0)
+
+
+def test_pool_entropy_estimator_normalizes_uncertainty() -> None:
+    familiar = PoolEntropyEstimator(pool_size=4, window_size=16)
+    uncertain = PoolEntropyEstimator(pool_size=4, window_size=16)
+
+    for _ in range(8):
+        familiar.observe([0])
+        uncertain.observe([0, 1])
+
+    assert familiar.compute_entropy() == pytest.approx(0.0)
+    assert uncertain.compute_entropy() > 0.95
+
+
+def test_precision_signal_boosts_learning_when_entropy_is_high() -> None:
+    signal = PrecisionSignal(
+        alpha=5.0,
+        threshold=0.5,
+        min_precision=0.1,
+        max_precision=1.0,
+    )
+
+    low_precision = signal.compute(0.0)
+    high_precision = signal.compute(1.0)
+
+    assert 0.1 <= low_precision < 0.5
+    assert 0.5 < high_precision <= 1.0
+
+
+def test_pool_precision_updates_from_preview_and_forward() -> None:
+    config = make_config(max_pool_size=3)
+    config.precision = PrecisionConfig(enabled=True, pool_size=3, entropy_window=16)
+    pool = CCCPool(config, make_margin_config())
+    configure_identity_pool(pool)
+    commit_ccc(pool.cccs[0])
+    commit_ccc(pool.cccs[1], shifted_input())
+
+    preview_output = pool.preview(concept_input())
+    preview_precision = pool.get_precision()
+    forward_output = pool(concept_input(), timestep=3)
+
+    assert preview_output.fired_indices
+    assert forward_output.fired_indices
+    assert 0.1 <= preview_precision <= 1.0
+    assert 0.1 <= pool.get_precision() <= 1.0
+
+
+def test_pool_auto_lock_and_stats() -> None:
+    pool = CCCPool(make_config(max_pool_size=3, lock_threshold=0.8), make_margin_config())
+    configure_identity_pool(pool)
+    commit_ccc(pool.cccs[0])
+
+    pool.update_importance([0], confidences=[1.0])
+
+    stats = pool.get_pool_stats()
+
+    assert pool.cccs[0].locked.item() is True
+    assert stats["num_locked"] == 1

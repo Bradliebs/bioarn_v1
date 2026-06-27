@@ -19,6 +19,7 @@ from bioarn.config import (
     CCCConfig,
     GNWConfig,
     MarginGateConfig,
+    PrecisionConfig,
     SDMConfig,
 )
 from bioarn.core.math_utils import normalize
@@ -289,6 +290,30 @@ def test_workspace_learning_multiplier_tracks_consensus_strength() -> None:
 
     assert weak_multiplier > strong_multiplier
     assert weak_multiplier > 1.0
+
+
+def test_precision_weighting_updates_core_pool_signal() -> None:
+    config = _minimal_config()
+    config.ccc.precision = PrecisionConfig(
+        enabled=True,
+        pool_size=config.ccc.max_pool_size,
+        entropy_window=16,
+    )
+    core = BioARNCore(config)
+    with torch.no_grad():
+        for ccc in core.ccc_pool.cccs:
+            ccc.f1_layer.weight.copy_(torch.eye(4))
+            ccc.f1_layer.bias.zero_()
+            ccc.f2_weights.copy_(normalize(torch.eye(4)))
+            ccc.feedback_weights.zero_()
+            ccc.concept_direction.zero_()
+            ccc.is_committed.zero_()
+            ccc.age.zero_()
+            ccc.last_fired.fill_(-1)
+
+    core.forward(_concept(0), learn=True)
+
+    assert 0.1 <= core.ccc_pool.get_precision() <= 1.0
 
 
 def test_hierarchy_learn_then_classify_shape() -> None:

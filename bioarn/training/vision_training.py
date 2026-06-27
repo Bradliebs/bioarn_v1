@@ -6,16 +6,27 @@ import copy
 import contextlib
 import socket
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import islice
 from pathlib import Path
 from typing import Iterable, Iterator
 
 import torch
 
-from bioarn.config import BioARNConfig, CCCConfig, GNWConfig, MarginGateConfig, RewardConfig, SDMConfig
+from bioarn.config import (
+    BioARNConfig,
+    CCCConfig,
+    ConvCCCConfig,
+    GNWConfig,
+    MarginGateConfig,
+    PrecisionConfig,
+    RewardConfig,
+    SDMConfig,
+)
+from bioarn.core.conv_ccc import ConvCCCPool
 from bioarn.core.math_utils import cosine_similarity, normalize
 from bioarn.data import CIFAR10Stream, DataSample, StreamingDataSource
+from bioarn.loop import SensorimotorLoop
 from bioarn.preprocessing import PreprocessingPipeline
 from bioarn.reward import NoveltySignal, RewardSystem
 from bioarn.scaling import ScaledBioARN
@@ -43,8 +54,10 @@ class VisionTrainConfig:
     curiosity_weight: float = 0.0
     curriculum: bool = False
     contrastive_curiosity: bool = False
+    use_conv_ccc: bool = False
     workspace: GNWConfig | None = None
     maturation: MaturationConfig | None = None
+    precision: PrecisionConfig | None = None
 
 
 @dataclass
@@ -55,6 +68,12 @@ class PoolStepResult:
     abstained: bool
     winner_confidences: torch.Tensor
     broadcast_strength: float = 0.0
+
+    def __iter__(self):
+        yield self.fired_indices
+        yield self.concept_direction
+        yield self.confidence
+        yield self.abstained
 
 
 class SyntheticCIFAR10Stream(StreamingDataSource):
@@ -302,6 +321,9 @@ class VisionTrainer:
     ):
         self.config = config
         self.preprocessing = preprocessing
+        self._spatial_input_shape = SensorimotorLoop._infer_visual_shape(int(config.input_dim))
+        if self.config.use_conv_ccc and self.preprocessing is not None:
+            raise ValueError("ConvCCCPool currently expects raw image inputs without preprocessing.")
         self.effective_input_dim = self._effective_input_dim()
         self._configured_workspace = copy.deepcopy(config.workspace)
         self.system = self._build_system(config, input_dim=self.effective_input_dim)
@@ -322,8 +344,81 @@ class VisionTrainer:
 
     @staticmethod
     def _build_system(config: VisionTrainConfig, *, input_dim: int) -> BioARNCore:
+        margin_config = MarginGateConfig(
+            theta_margin=config.margin_threshold,
+            theta_margin_lr=0.001,
+            theta_resonance=min(0.9, config.margin_threshold + 0.25),
+        )
+        if config.use_conv_ccc:
+            channels, height, width = SensorimotorLoop._infer_visual_shape(input_dim)
+            if height != width:
+                raise ValueError("ConvCCCPool currently requires square spatial inputs.")
+            conv_config = ConvCCCConfig(
+                in_channels=channels,
+                spatial_size=height,
+                num_conv_features=64,
+                spatial_grid=4,
+                f1_top_k=64,
+                fast_lr=1.0,
+                slow_lr=config.learning_rate,
+                feedback_lr=config.learning_rate,
+                max_pool_size=config.max_pool_size,
+                max_growth_factor=config.max_growth_factor,
+                consolidation_strength=config.consolidation_strength,
+                lock_threshold=0.8,
+            )
+            workspace_config = copy.deepcopy(config.workspace)
+            precision_config = copy.deepcopy(config.precision)
+            if precision_config is not None:
+                precision_config.pool_size = int(config.max_pool_size)
+            placeholder_ccc = CCCConfig(
+                input_dim=input_dim,
+                concept_dim=conv_config.concept_dim,
+                num_f1_features=max(16, min(64, input_dim)),
+                f1_top_k=max(8, min(64, input_dim) // 4),
+                freeze_f1_after=config.freeze_f1_after,
+                f1_adapter_dim=config.f1_adapter_dim,
+                fast_lr=1.0,
+                slow_lr=config.learning_rate,
+                feedback_lr=config.learning_rate,
+                max_pool_size=1,
+                max_growth_factor=1.0,
+                consolidation_strength=config.consolidation_strength,
+                precision=precision_config,
+            )
+            bio_config = BioARNConfig(
+                ccc=placeholder_ccc,
+                margin_gate=margin_config,
+                sdm=SDMConfig(
+                    address_dim=max(512, conv_config.concept_dim * 4),
+                    hamming_radius=max(16, conv_config.concept_dim // 4),
+                    num_hard_locations=256,
+                    data_dim=conv_config.concept_dim,
+                    decay_rate=0.999,
+                    stdp_window=10,
+                ),
+                gnw=copy.deepcopy(workspace_config) if workspace_config is not None else GNWConfig(),
+                workspace=workspace_config,
+                seed=42,
+            )
+            system = ScaledBioARN(bio_config, use_optimized=False)
+            system.ccc_pool = ConvCCCPool(conv_config, margin_config)
+            system.config.ccc = replace(
+                system.config.ccc,
+                concept_dim=conv_config.concept_dim,
+                max_pool_size=conv_config.max_pool_size,
+                max_growth_factor=conv_config.max_growth_factor,
+                slow_lr=conv_config.slow_lr,
+                feedback_lr=conv_config.feedback_lr,
+            )
+            system.fabric.ccc_config = system.config.ccc
+            return system
+
         ccc_features = 64 if input_dim >= 1024 else max(16, min(64, input_dim))
         workspace_config = copy.deepcopy(config.workspace)
+        precision_config = copy.deepcopy(config.precision)
+        if precision_config is not None:
+            precision_config.pool_size = int(config.max_pool_size)
         bio_config = BioARNConfig(
             ccc=CCCConfig(
                 input_dim=input_dim,
@@ -338,12 +433,9 @@ class VisionTrainer:
                 max_pool_size=config.max_pool_size,
                 max_growth_factor=config.max_growth_factor,
                 consolidation_strength=config.consolidation_strength,
+                precision=precision_config,
             ),
-            margin_gate=MarginGateConfig(
-                theta_margin=config.margin_threshold,
-                theta_margin_lr=0.001,
-                theta_resonance=min(0.9, config.margin_threshold + 0.25),
-            ),
+            margin_gate=margin_config,
             sdm=SDMConfig(
                 address_dim=max(512, config.concept_dim * 4),
                 hamming_radius=max(16, config.concept_dim // 4),
@@ -388,6 +480,24 @@ class VisionTrainer:
         self.system.workspace_enabled = workspace_active
 
     def _prepare_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.config.use_conv_ccc:
+            prepared = tensor.to(torch.float32)
+            channels, height, width = self._spatial_input_shape
+            expected = channels * height * width
+            if prepared.dim() == 1:
+                if prepared.numel() != expected:
+                    raise ValueError(
+                        f"Expected flattened image with {expected} values, got {prepared.numel()}."
+                    )
+                return prepared.reshape(channels, height, width)
+            if prepared.dim() == 3:
+                if tuple(prepared.shape) != (channels, height, width):
+                    raise ValueError(
+                        f"Expected image with shape {(channels, height, width)}, got {tuple(prepared.shape)}."
+                    )
+                return prepared
+            raise ValueError("ConvCCCPool expects per-sample vision inputs to be flat or CHW tensors.")
+
         prepared = tensor.to(torch.float32).reshape(-1)
         if self.preprocessing is not None:
             prepared = self.preprocessing.transform(prepared).to(torch.float32).reshape(-1)
@@ -465,6 +575,12 @@ class VisionTrainer:
 
     def _current_pool_capacity(self) -> int:
         return int(self._pool_stats()["total_concepts"])
+
+    def _current_pool_precision(self) -> float:
+        getter = getattr(self.system.ccc_pool, "get_precision", None)
+        if not callable(getter):
+            return 1.0
+        return float(getter())
 
     def _ensure_pool_growth(self, pool) -> object:
         first_uncommitted = getattr(pool, "_first_uncommitted_index", None)
@@ -812,9 +928,11 @@ class VisionTrainer:
                 prediction_error_preview = 0.0
                 boundary_score = 0.0
                 learning_rate_multiplier = 1.0
+                precision_enabled = getattr(self.system.ccc_pool, "precision_gate", None) is not None
 
                 needs_preview = (
-                    self.curiosity_system is not None
+                    precision_enabled
+                    or self.curiosity_system is not None
                     or self.curriculum_scheduler is not None
                     or self.config.contrastive_curiosity
                     or getattr(self.system.config, "workspace", None) is not None
@@ -837,6 +955,8 @@ class VisionTrainer:
                     )
                     if self.curriculum_scheduler is not None and replay_depth == 0 and pass_index == 0:
                         self.curriculum_scheduler.score_sample(sample_id, preview_confidence)
+                    if precision_enabled:
+                        learning_rate_multiplier *= self._current_pool_precision()
                     if self.curiosity_system is not None:
                         prediction_error_preview = self._estimate_prediction_error(
                             prediction=preview_prediction,

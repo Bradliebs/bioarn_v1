@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from bioarn.config import CCCConfig, GNWConfig, MarginGateConfig
+from bioarn.config import CCCConfig, GNWConfig, MarginGateConfig, PrecisionConfig
 from bioarn.core.ccc import CCCPool
 from bioarn.core.consolidation import SynapticConsolidation
 from bioarn.core.math_utils import normalize
@@ -31,6 +31,7 @@ def make_config(
     contrastive_curiosity: bool = False,
     workspace: GNWConfig | None = None,
     maturation: MaturationConfig | None = None,
+    precision: PrecisionConfig | None = None,
 ) -> VisionTrainConfig:
     return VisionTrainConfig(
         input_dim=3072,
@@ -48,6 +49,7 @@ def make_config(
         contrastive_curiosity=contrastive_curiosity,
         workspace=workspace,
         maturation=maturation,
+        precision=precision,
     )
 
 
@@ -121,6 +123,20 @@ def test_vision_trainer_init() -> None:
     assert trainer.config.input_dim == 3072
     assert trainer.config.concept_dim == 256
     assert trainer._pool_stats()["total_concepts"] == 128
+
+
+def test_vision_trainer_precision_weighting_reads_pool_signal() -> None:
+    trainer = VisionTrainer(
+        make_config(
+            num_train_samples=24,
+            precision=PrecisionConfig(enabled=True, pool_size=64, entropy_window=16),
+        )
+    )
+
+    result = trainer.train_online(make_stream(24, seed=9), num_samples=24)
+
+    assert 0.1 <= float(trainer.system.ccc_pool.get_precision()) <= 1.0
+    assert result["mean_learning_rate_multiplier"] >= 0.1
 
 
 def test_train_online_runs() -> None:

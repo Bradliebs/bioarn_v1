@@ -14,6 +14,7 @@ from bioarn.core.consolidation import SynapticConsolidation
 from bioarn.core.margin_gate import MarginGate, MarginGateOutput, ResonanceOutput
 from bioarn.core.math_utils import normalize, sparse_top_k
 from bioarn.core.stdp import STDPRule
+from bioarn.predictive.precision_weighting import PrecisionWeightedGate
 
 
 @dataclass
@@ -151,6 +152,7 @@ class ConceptCellCluster(nn.Module):
             "concept_direction", torch.zeros(config.concept_dim, dtype=torch.float32)
         )
         self.register_buffer("is_committed", torch.tensor(False, dtype=torch.bool))
+        self.register_buffer("locked", torch.tensor(False, dtype=torch.bool))
         self.register_buffer("age", torch.tensor(0, dtype=torch.long))
         self.register_buffer("last_fired", torch.tensor(-1, dtype=torch.long))
         self.register_buffer("importance", torch.tensor(0.0, dtype=torch.float32))
@@ -185,7 +187,25 @@ class ConceptCellCluster(nn.Module):
         object.__setattr__(self, "adapter", adapter)
         self.adapter_id = int(adapter_id)
 
+    def _ensure_runtime_state(self) -> None:
+        device = self.concept_direction.device
+        if "locked" not in self._buffers:
+            self.register_buffer("locked", torch.tensor(False, dtype=torch.bool, device=device))
+        if "importance" not in self._buffers:
+            self.register_buffer("importance", torch.tensor(0.0, dtype=torch.float32, device=device))
+        if not hasattr(self, "adapter_id"):
+            self.adapter_id = -1
+        if not hasattr(self, "adapter"):
+            object.__setattr__(self, "adapter", None)
+
+    def lock(self) -> None:
+        """Permanently lock this CCC — it classifies but never updates weights."""
+
+        self._ensure_runtime_state()
+        self.locked.fill_(True)
+
     def _effective_lr(self, base_lr: float) -> float:
+        self._ensure_runtime_state()
         scale = max(
             0.0,
             1.0 - (float(self.config.consolidation_strength) * float(self.importance.item())),
@@ -293,10 +313,11 @@ class ConceptCellCluster(nn.Module):
 
     @torch.no_grad()
     def _apply_adapter(self, f1_output: torch.Tensor) -> torch.Tensor:
-        if self.adapter is None:
+        adapter = getattr(self, "adapter", None)
+        if adapter is None:
             return f1_output
         f1_batch, squeeze = self._ensure_batch(f1_output)
-        adapted = self.adapter(f1_batch)
+        adapted = adapter(f1_batch)
         adapted = sparse_top_k(F.relu(adapted), self.config.f1_top_k)
         return self._maybe_squeeze(adapted, squeeze)
 
@@ -327,6 +348,7 @@ class ConceptCellCluster(nn.Module):
     def preview(self, raw_input: torch.Tensor) -> CCCOutput:
         """Run a read-only CCC pass without updating learning state."""
 
+        self._ensure_runtime_state()
         raw_batch, squeeze = self._ensure_batch(raw_input)
         f1_batch = self._ensure_batch(self.f1_encode(raw_batch))[0]
         f2_batch = self._ensure_batch(self.f2_activate(f1_batch))[0]
@@ -373,6 +395,7 @@ class ConceptCellCluster(nn.Module):
     ) -> CCCOutput:
         """Run the full CCC processing pipeline."""
 
+        self._ensure_runtime_state()
         raw_batch, squeeze = self._ensure_batch(raw_input)
         f1_batch = self._ensure_batch(self.f1_encode(raw_batch))[0]
         f2_batch = self._ensure_batch(self.f2_activate(f1_batch))[0]
@@ -439,10 +462,15 @@ class ConceptCellCluster(nn.Module):
     ) -> None:
         """Commit an unassigned CCC to a new concept in one shot."""
 
+        self._ensure_runtime_state()
+        if bool(self.locked.item()):
+            return
+
         lr_multiplier = float(torch.as_tensor(learning_rate_multiplier, dtype=torch.float32).mean().item())
         base_f1_batch = self._ensure_batch(self._base_f1_encode(raw_input))[0]
-        if self.adapter is not None:
-            self.adapter.hebbian_update(
+        adapter = getattr(self, "adapter", None)
+        if adapter is not None:
+            adapter.hebbian_update(
                 base_f1_batch,
                 learning_signal=torch.ones(
                     base_f1_batch.shape[0],
@@ -477,7 +505,10 @@ class ConceptCellCluster(nn.Module):
     ) -> None:
         """Apply local Hebbian refinement after resonance."""
 
+        self._ensure_runtime_state()
         if not bool(self.is_committed.item()):
+            return
+        if bool(self.locked.item()):
             return
 
         f1_batch = self._ensure_batch(f1_output)[0]
@@ -515,9 +546,10 @@ class ConceptCellCluster(nn.Module):
         feedback_lr = self._effective_lr(self.config.feedback_lr) * lr_multiplier
         self.feedback_weights.add_(feedback_lr * hebbian_update)
         self.feedback_weights.copy_(self._normalize_feedback_rows(self.feedback_weights))
-        if self.adapter is not None:
+        adapter = getattr(self, "adapter", None)
+        if adapter is not None:
             base_f1_batch = self._ensure_batch(self._base_f1_encode(raw_input))[0]
-            self.adapter.hebbian_update(
+            adapter.hebbian_update(
                 base_f1_batch,
                 learning_signal=learn_signal,
                 lr=self._adapter_lr(self.config.slow_lr) * lr_multiplier,
@@ -527,11 +559,13 @@ class ConceptCellCluster(nn.Module):
     def get_info(self) -> dict[str, bool | float | int | dict[str, float | int]]:
         """Return CCC status and gate statistics."""
 
+        self._ensure_runtime_state()
         return {
             "is_committed": bool(self.is_committed.item()),
+            "locked": bool(self.locked.item()),
             "age": int(self.age.item()),
             "last_fired": int(self.last_fired.item()),
-            "adapter_id": int(self.adapter_id),
+            "adapter_id": int(getattr(self, "adapter_id", -1)),
             "concept_direction_norm": float(self.concept_direction.norm().item()),
             "margin_gate": self.margin_gate.get_stats(),
         }
@@ -564,21 +598,55 @@ class CCCPool(nn.Module):
             len(self.cccs),
             strength=self.config.consolidation_strength,
         )
+        precision_config = getattr(self.config, "precision", None)
+        self.precision_gate = (
+            PrecisionWeightedGate(precision_config)
+            if precision_config is not None and bool(precision_config.enabled)
+            else None
+        )
+        if self.precision_gate is not None:
+            self.precision_gate.set_pool_size(self.initial_capacity)
         self._sync_importance_buffers()
 
     @property
     def current_adapter(self) -> F1Adapter | None:
+        self._ensure_runtime_state()
         if 0 <= self.active_adapter_id < len(self.task_adapters):
             return self.task_adapters[self.active_adapter_id]
         return None
 
+    def _ensure_runtime_buffers(self) -> None:
+        device = self.consolidation.importance.device
+        if "f1_samples_seen" not in self._buffers:
+            self.register_buffer("f1_samples_seen", torch.tensor(0, dtype=torch.long, device=device))
+        if "f1_frozen" not in self._buffers:
+            self.register_buffer("f1_frozen", torch.tensor(False, dtype=torch.bool, device=device))
+
+    def _ensure_runtime_state(self) -> None:
+        self._ensure_runtime_buffers()
+        if not hasattr(self, "task_adapters"):
+            self.task_adapters = nn.ModuleList()
+        if not hasattr(self, "active_adapter_id"):
+            self.active_adapter_id = -1
+        if not hasattr(self, "precision_gate"):
+            precision_config = getattr(self.config, "precision", None)
+            self.precision_gate = (
+                PrecisionWeightedGate(precision_config)
+                if precision_config is not None and bool(precision_config.enabled)
+                else None
+            )
+            if self.precision_gate is not None:
+                self.precision_gate.set_pool_size(len(self.cccs))
+
     def freeze_f1(self) -> None:
+        self._ensure_runtime_state()
         self.f1_frozen.fill_(True)
         if self.cccs:
             for parameter in self.cccs[0].f1_layer.parameters():
                 parameter.requires_grad_(False)
 
     def observe_samples(self, sample_count: int) -> None:
+        self._ensure_runtime_state()
         count = int(max(0, sample_count))
         if count <= 0:
             return
@@ -591,6 +659,7 @@ class CCCPool(nn.Module):
             self.freeze_f1()
 
     def create_task_adapter(self) -> F1Adapter | None:
+        self._ensure_runtime_state()
         if int(self.config.freeze_f1_after) <= 0:
             return None
         self.freeze_f1()
@@ -638,6 +707,9 @@ class CCCPool(nn.Module):
         self.consolidation.ensure_capacity(target_size)
         self.config.max_pool_size = target_size
         self._sync_importance_buffers()
+        self._ensure_runtime_state()
+        if self.precision_gate is not None:
+            self.precision_gate.set_pool_size(target_size)
         return target_size
 
     def update_importance(
@@ -652,7 +724,25 @@ class CCCPool(nn.Module):
             confidences=confidences,
         )
         self._sync_importance_buffers()
+        self.auto_lock()
         return scores
+
+    @torch.no_grad()
+    def auto_lock(self) -> list[int]:
+        """Lock all CCCs whose importance exceeds the lock threshold. Returns locked indices."""
+
+        locked_indices: list[int] = []
+        threshold = self.config.lock_threshold
+        if threshold <= 0:
+            return locked_indices
+        for index, ccc in enumerate(self.cccs):
+            if hasattr(ccc, "_ensure_runtime_state"):
+                ccc._ensure_runtime_state()
+            if bool(ccc.is_committed.item()) and not bool(ccc.locked.item()):
+                if float(ccc.importance.item()) >= threshold:
+                    ccc.lock()
+                    locked_indices.append(index)
+        return locked_indices
 
     @staticmethod
     def _confidence_score(confidence: torch.Tensor) -> torch.Tensor:
@@ -668,6 +758,7 @@ class CCCPool(nn.Module):
     def preview(self, raw_input: torch.Tensor) -> CCCPoolOutput:
         """Run the pool read-only without recruitment or learning."""
 
+        self._ensure_runtime_state()
         outputs: list[CCCOutput] = []
         for ccc in self.cccs:
             if bool(ccc.is_committed.item()):
@@ -684,6 +775,8 @@ class CCCPool(nn.Module):
             if fired_indices
             else torch.empty(0, dtype=torch.float32)
         )
+        if self.precision_gate is not None:
+            self.precision_gate.preview_pool_output(fired_indices)
 
         return CCCPoolOutput(
             outputs=outputs,
@@ -703,6 +796,7 @@ class CCCPool(nn.Module):
     ) -> CCCPoolOutput:
         """Run all committed CCCs and recruit a new one if all abstain."""
 
+        self._ensure_runtime_state()
         batch_size = raw_input.shape[0] if raw_input.dim() == 2 else 1
         self.observe_samples(batch_size)
         outputs: list[CCCOutput] = []
@@ -756,6 +850,9 @@ class CCCPool(nn.Module):
             if fired_indices
             else torch.empty(0, dtype=torch.float32)
         )
+        if self.precision_gate is not None:
+            self.precision_gate.observe_pool_output(fired_indices)
+        self.auto_lock()
 
         return CCCPoolOutput(
             outputs=outputs,
@@ -781,7 +878,13 @@ class CCCPool(nn.Module):
     def get_pool_stats(self) -> dict[str, float | int]:
         """Return high-level pool statistics."""
 
+        self._ensure_runtime_buffers()
+        self._ensure_runtime_state()
+        for ccc in self.cccs:
+            if hasattr(ccc, "_ensure_runtime_state"):
+                ccc._ensure_runtime_state()
         num_committed = sum(bool(ccc.is_committed.item()) for ccc in self.cccs)
+        num_locked = sum(bool(ccc.locked.item()) for ccc in self.cccs)
         total_presentations = sum(
             int(ccc.margin_gate.total_presentations.item()) for ccc in self.cccs
         )
@@ -797,6 +900,7 @@ class CCCPool(nn.Module):
         return {
             "num_committed": num_committed,
             "num_uncommitted": len(self.cccs) - num_committed,
+            "num_locked": num_locked,
             "mean_confidence": float(mean_confidence),
             "fire_rate": float(fire_rate),
             "total_concepts": len(self.cccs),
@@ -806,6 +910,13 @@ class CCCPool(nn.Module):
             "f1_frozen": bool(self.f1_frozen.item()),
             "task_adapters": len(self.task_adapters),
         }
+
+    def get_precision(self) -> float:
+        """Return the current precision weighting for pool learning."""
+
+        if getattr(self, "precision_gate", None) is None:
+            return 1.0
+        return float(self.precision_gate.current_precision)
 
 
 __all__ = [

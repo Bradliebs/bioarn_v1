@@ -46,6 +46,27 @@ class STDPConfig:
 
 
 @dataclass
+class PrecisionConfig:
+    """Precision-weighted predictive processing parameters."""
+
+    enabled: bool = False
+    pool_size: int = 100
+    entropy_window: int = 100
+    precision_alpha: float = 5.0
+    precision_threshold: float = 0.5
+    min_precision: float = 0.1
+    max_precision: float = 1.0
+
+    def __post_init__(self) -> None:
+        self.pool_size = int(max(1, self.pool_size))
+        self.entropy_window = int(max(1, self.entropy_window))
+        self.precision_alpha = float(self.precision_alpha)
+        self.precision_threshold = float(self.precision_threshold)
+        self.min_precision = float(max(0.0, self.min_precision))
+        self.max_precision = float(max(self.min_precision, self.max_precision))
+
+
+@dataclass
 class CCCConfig:
     """Concept Cell Cluster parameters."""
     input_dim: int = 784         # Dimensionality of input (e.g., 28×28 for MNIST)
@@ -60,16 +81,55 @@ class CCCConfig:
     max_pool_size: int = 1000    # Maximum number of CCCs in the pool
     max_growth_factor: float = 3.0  # Allow the pool to grow beyond its initial size
     consolidation_strength: float = 0.0  # Penalize updates to highly active CCCs
+    lock_threshold: float = 0.8  # Lock CCC when importance exceeds this
     stdp: STDPConfig | None = None
+    precision: PrecisionConfig | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.stdp, Mapping):
             self.stdp = STDPConfig(**self.stdp)
+        if isinstance(self.precision, Mapping):
+            self.precision = PrecisionConfig(**self.precision)
         self.freeze_f1_after = int(max(0, self.freeze_f1_after))
         self.f1_adapter_dim = int(max(1, self.f1_adapter_dim))
         self.max_pool_size = int(max(1, self.max_pool_size))
         self.max_growth_factor = float(max(1.0, self.max_growth_factor))
         self.consolidation_strength = float(max(0.0, self.consolidation_strength))
+        self.lock_threshold = float(max(0.0, self.lock_threshold))
+
+
+@dataclass
+class ConvCCCConfig:
+    """Convolutional CCC parameters."""
+
+    in_channels: int = 3
+    spatial_size: int = 32
+    num_conv_features: int = 64
+    spatial_grid: int = 4
+    concept_dim: int = 0
+    f1_top_k: int = 64
+    fast_lr: float = 1.0
+    slow_lr: float = 0.01
+    feedback_lr: float = 0.01
+    max_pool_size: int = 200
+    max_growth_factor: float = 3.0
+    consolidation_strength: float = 0.0
+    lock_threshold: float = 0.8
+
+    def __post_init__(self) -> None:
+        self.in_channels = int(max(1, self.in_channels))
+        self.spatial_size = int(max(1, self.spatial_size))
+        self.num_conv_features = int(max(1, self.num_conv_features))
+        self.spatial_grid = int(max(1, self.spatial_grid))
+        if int(self.concept_dim) <= 0:
+            self.concept_dim = self.num_conv_features * self.spatial_grid * self.spatial_grid
+        else:
+            self.concept_dim = int(self.concept_dim)
+        self.f1_top_k = int(max(1, self.f1_top_k))
+        self.max_pool_size = int(max(1, self.max_pool_size))
+        self.max_growth_factor = float(max(1.0, self.max_growth_factor))
+        self.consolidation_strength = float(max(0.0, self.consolidation_strength))
+        self.lock_threshold = float(min(max(self.lock_threshold, 0.0), 1.0))
 
 
 @dataclass

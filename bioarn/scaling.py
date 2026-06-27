@@ -18,6 +18,7 @@ from bioarn.core.margin_gate import MarginGateOutput, ResonanceOutput
 from bioarn.core.math_utils import cosine_similarity, normalize
 from bioarn.memory.associative_fabric import AssociativeFabric
 from bioarn.memory.sdm import SparseDistributedMemory, TemporalAssociator
+from bioarn.predictive.precision_weighting import PrecisionWeightedGate
 from bioarn.system import BioARNCore
 
 
@@ -241,6 +242,14 @@ class BatchedCCCPool(nn.Module):
         self.active_adapter_id = -1
         self.register_buffer("f1_samples_seen", torch.tensor(0, dtype=torch.long))
         self.register_buffer("f1_frozen", torch.tensor(False, dtype=torch.bool))
+        precision_config = getattr(self.config, "precision", None)
+        self.precision_gate = (
+            PrecisionWeightedGate(precision_config)
+            if precision_config is not None and bool(precision_config.enabled)
+            else None
+        )
+        if self.precision_gate is not None:
+            self.precision_gate.set_pool_size(num_cccs)
 
     @staticmethod
     def _ensure_batch(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -262,14 +271,46 @@ class BatchedCCCPool(nn.Module):
 
     @property
     def current_adapter(self) -> F1Adapter | None:
+        self._ensure_runtime_state()
         if 0 <= self.active_adapter_id < len(self.task_adapters):
             return self.task_adapters[self.active_adapter_id]
         return None
 
+    def _ensure_runtime_buffers(self) -> None:
+        device = self.committed_mask.device
+        if "f1_samples_seen" not in self._buffers:
+            self.register_buffer("f1_samples_seen", torch.tensor(0, dtype=torch.long, device=device))
+        if "f1_frozen" not in self._buffers:
+            self.register_buffer("f1_frozen", torch.tensor(False, dtype=torch.bool, device=device))
+
+    def _ensure_runtime_state(self) -> None:
+        self._ensure_runtime_buffers()
+        device = self.committed_mask.device
+        if "adapter_assignments" not in self._buffers:
+            self.register_buffer(
+                "adapter_assignments",
+                torch.full(self.committed_mask.shape, -1, dtype=torch.long, device=device),
+            )
+        if not hasattr(self, "task_adapters"):
+            self.task_adapters = nn.ModuleList()
+        if not hasattr(self, "active_adapter_id"):
+            self.active_adapter_id = -1
+        if not hasattr(self, "precision_gate"):
+            precision_config = getattr(self.config, "precision", None)
+            self.precision_gate = (
+                PrecisionWeightedGate(precision_config)
+                if precision_config is not None and bool(precision_config.enabled)
+                else None
+            )
+            if self.precision_gate is not None:
+                self.precision_gate.set_pool_size(int(self.config.max_pool_size))
+
     def freeze_f1(self) -> None:
+        self._ensure_runtime_state()
         self.f1_frozen.fill_(True)
 
     def observe_samples(self, sample_count: int) -> None:
+        self._ensure_runtime_state()
         count = int(max(0, sample_count))
         if count <= 0:
             return
@@ -282,6 +323,7 @@ class BatchedCCCPool(nn.Module):
             self.freeze_f1()
 
     def create_task_adapter(self) -> F1Adapter | None:
+        self._ensure_runtime_state()
         if int(self.config.freeze_f1_after) <= 0:
             return None
         self.freeze_f1()
@@ -298,6 +340,8 @@ class BatchedCCCPool(nn.Module):
         return adapter
 
     def _copy_shared_state_from(self, source: "BatchedCCCPool") -> None:
+        self._ensure_runtime_state()
+        source._ensure_runtime_state()
         cloned_adapters = nn.ModuleList()
         for adapter in source.task_adapters:
             cloned = F1Adapter(source.config.num_f1_features, adapter_dim=source.config.f1_adapter_dim)
@@ -312,6 +356,15 @@ class BatchedCCCPool(nn.Module):
         self.f1_samples_seen.copy_(source.f1_samples_seen)
         self.f1_frozen.copy_(source.f1_frozen)
 
+    def _copy_precision_state_from(self, source: CCCPool | "BatchedCCCPool") -> None:
+        if self.precision_gate is None:
+            return
+        source_precision = getattr(source, "precision_gate", None)
+        if source_precision is None:
+            return
+        self.precision_gate.load_state_from(source_precision)
+        self.precision_gate.set_pool_size(int(self.config.max_pool_size))
+
     def _adapter_lr(self, base_lr: float) -> float:
         return min(0.05, max(1e-3, float(base_lr)))
 
@@ -325,6 +378,7 @@ class BatchedCCCPool(nn.Module):
         return torch.zeros_like(activated).scatter(-1, indices, values)
 
     def _apply_adapter(self, f1_batch: torch.Tensor, adapter_id: int) -> torch.Tensor:
+        self._ensure_runtime_state()
         if adapter_id < 0 or adapter_id >= len(self.task_adapters):
             return f1_batch
         adapted = self.task_adapters[adapter_id](f1_batch)
@@ -350,6 +404,9 @@ class BatchedCCCPool(nn.Module):
         grown.max_capacity = self.max_capacity
         grown.base_config = self.base_config
         _copy_batched_pool_slice(self, grown, length=current_size)
+        grown._copy_precision_state_from(self)
+        if grown.precision_gate is not None:
+            grown.precision_gate.set_pool_size(target)
         return grown
 
     def update_importance(
@@ -365,6 +422,7 @@ class BatchedCCCPool(nn.Module):
         )
 
     def _row_f1_encode(self, index: int, raw_batch: torch.Tensor) -> torch.Tensor:
+        self._ensure_runtime_state()
         base_f1 = self._shared_f1_encode(raw_batch)
         return self._apply_adapter(base_f1, int(self.adapter_assignments[index].item()))
 
@@ -498,6 +556,7 @@ class BatchedCCCPool(nn.Module):
         update_state: bool = True,
         learning_rate_multiplier: float | torch.Tensor = 1.0,
     ) -> _BatchedForwardState:
+        self._ensure_runtime_state()
         inputs = raw_batch.to(self.f1_weights.dtype)
         num_cccs = int(self.config.max_pool_size)
         batch_size = raw_batch.shape[0]
@@ -959,6 +1018,8 @@ class BatchedCCCPool(nn.Module):
             if fired_indices
             else torch.empty(0, dtype=torch.float32, device=self.f1_weights.device)
         )
+        if self.precision_gate is not None:
+            self.precision_gate.preview_pool_output(fired_indices)
         return CCCPoolOutput(
             outputs=outputs,
             fired_indices=fired_indices,
@@ -1007,6 +1068,8 @@ class BatchedCCCPool(nn.Module):
             if fired_indices
             else torch.empty(0, dtype=torch.float32, device=self.f1_weights.device)
         )
+        if self.precision_gate is not None:
+            self.precision_gate.observe_pool_output(fired_indices)
 
         return CCCPoolOutput(
             outputs=outputs,
@@ -1027,6 +1090,7 @@ class BatchedCCCPool(nn.Module):
 
     @torch.no_grad()
     def get_pool_stats(self) -> dict[str, float | int]:
+        self._ensure_runtime_state()
         num_committed = int(self.committed_mask.sum().item())
         total_presentations = int(self.total_presentations.sum().item())
         total_fires = int(self.total_fires.sum().item())
@@ -1052,8 +1116,15 @@ class BatchedCCCPool(nn.Module):
             "task_adapters": len(self.task_adapters),
         }
 
+    def get_precision(self) -> float:
+        self._ensure_runtime_state()
+        if getattr(self, "precision_gate", None) is None:
+            return 1.0
+        return float(self.precision_gate.current_precision)
+
     @torch.no_grad()
     def load_from_pool(self, pool: CCCPool | "BatchedCCCPool") -> "BatchedCCCPool":
+        self._ensure_runtime_state()
         if isinstance(pool, BatchedCCCPool):
             self.f1_weights.copy_(pool.f1_weights)
             self.f1_bias.copy_(pool.f1_bias)
@@ -1073,6 +1144,7 @@ class BatchedCCCPool(nn.Module):
             self.avg_confidence_when_abstained.copy_(pool.avg_confidence_when_abstained)
             self.consolidation.copy_from(pool.consolidation)
             self._copy_shared_state_from(pool)
+            self._copy_precision_state_from(pool)
             return self
 
         for index, ccc in enumerate(pool.cccs):
@@ -1115,6 +1187,7 @@ class BatchedCCCPool(nn.Module):
             self.f1_samples_seen.copy_(pool.f1_samples_seen)
         if hasattr(pool, "f1_frozen"):
             self.f1_frozen.copy_(pool.f1_frozen)
+        self._copy_precision_state_from(pool)
         return self
 
 
