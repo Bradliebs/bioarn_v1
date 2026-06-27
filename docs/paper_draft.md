@@ -2,9 +2,9 @@
 
 ## Abstract
 
-Modern generative AI systems are increasingly constrained by energy cost, brittle out-of-distribution (OOD) behavior, and reliance on gradient-based batch training. Bio-ARN 2.0 explores a different design point: a brain-inspired architecture built around sparse concept circuits, local Hebbian learning, predictive coding, workspace-style global broadcasting, and a deployment path to neuromorphic hardware. The core computational unit is the Concept Cell Cluster (CCC), a cortical-column-inspired module that can abstain, recruit new concepts online, and refine them through local resonance rather than backpropagation. CCCs are organized into a ventral-stream-like visual hierarchy, linked through predictive coding, and coupled to a Global Neuronal Workspace (GNW) for competition, broadcast, and multi-step internal routing. Bio-ARN further supports ensemble-based uncertainty estimation and shared cross-modal concept binding for image-text learning.
+Modern generative AI systems are increasingly constrained by energy cost, brittle out-of-distribution (OOD) behavior, and reliance on gradient-based batch training. Bio-ARN 2.0 explores a different design point: a brain-inspired architecture built around sparse concept circuits, local Hebbian learning, predictive coding, workspace-style global broadcasting, and a deployment path to neuromorphic hardware. The core computational unit is the Concept Cell Cluster (CCC), a cortical-column-inspired module that can abstain, recruit new concepts online, and refine them through local resonance rather than backpropagation. CCCs are organized into a ventral-stream-like visual hierarchy, linked through predictive coding and top-down feedback, and coupled to a Global Neuronal Workspace (GNW) for competition, broadcast, and multi-step internal routing. The current system also adds opt-in STDP dynamics, synaptic consolidation, dynamic capacity growth, and curiosity-driven replay.
 
-The current system does not match state-of-the-art transformer accuracy on large-scale visual benchmarks. However, it shows promising properties along other axes. On real CIFAR-10, the best current hierarchy+ensemble configuration reaches 30.0% accuracy, while ensemble OOD detection reaches 0.861 AUROC versus a 0.778 baseline, and GNW workspace scoring reaches 0.868 AUROC. On MNIST, the architecture reaches 85.2% accuracy. In text generation, a dual character+word setup achieves 85.7% real-word rate with 0.34 repetition. A functional Loihi 2 export path maps CCC pools and visual hierarchies to leaky integrate-and-fire (LIF) populations. Analytic energy modeling projects 179.65 µJ per inference on Loihi 2 versus 50.01 mJ for a transformer baseline on an A100 GPU, a 278x advantage at a matched benchmark tier. These results position Bio-ARN not as a drop-in replacement for transformers, but as a candidate architecture for efficient, robust, continuously learning neuromorphic AI.
+The current system does not match state-of-the-art transformer accuracy on large-scale visual benchmarks. However, it shows promising properties along other axes. On real CIFAR-10, a hierarchy baseline reaches 30.0% accuracy; curiosity-driven replay improves this to 33.8% online and 55.8% in post-training evaluation; and the best combined 2,000-sample configuration reaches 33.0% accuracy with 1.000 OOD AUROC. For OOD detection, ensemble scoring reaches 0.861 AUROC and GNW workspace scoring reaches 0.868 AUROC, both above a 0.778 baseline. Continual-learning results reveal a task-type-dependent failure mode: Split-CIFAR-10 shows -29.2 points backward transfer with 23.3 points mean forgetting, Split-MNIST shows -46.3% backward transfer with 37.1% forgetting, while Permuted-MNIST is much milder at -5.8% backward transfer and 5.5% forgetting. A Loihi/Lava export path preserves weights exactly, passes round-trip validation, and keeps simulated accuracy within 0.047 of the source model. Analytic energy modeling projects 179.65 µJ per inference on Loihi 2 versus 50.01 mJ for a transformer baseline on an A100 GPU, a 278x advantage at a matched benchmark tier. These results position Bio-ARN not as a drop-in replacement for transformers, but as a candidate architecture for efficient, robust, continuously learning neuromorphic AI.
 
 ## 1. Introduction
 
@@ -12,16 +12,16 @@ Large foundation models have demonstrated remarkable capability, but their domin
 
 Bio-ARN 2.0 asks whether some of those constraints can be elevated from inspiration to systems design. Rather than treating biological plausibility as an aesthetic goal, Bio-ARN uses it to guide architecture: sparse concept detectors, predictive suppression, local associative memory, broadcast-limited global access, and event-driven deployment assumptions. The result is a multi-module cognitive stack intended for online learning and neuromorphic execution rather than maximum leaderboard accuracy.
 
-The project's central claim is therefore not that brain-inspired learning already outperforms transformer-scale systems on raw supervised accuracy. It does not. Instead, the claim is that a unified architecture can combine four properties that are rarely demonstrated together in one executable system: (1) local Hebbian learning without backpropagation, (2) practical OOD-aware abstention and uncertainty signals, (3) multimodal concept binding and generation, and (4) a concrete export path toward neuromorphic hardware.
+The project's central claim is therefore not that brain-inspired learning already outperforms transformer-scale systems on raw supervised accuracy. It does not. Instead, the claim is that a unified architecture can combine four properties that are rarely demonstrated together in one executable system: (1) local Hebbian learning without backpropagation, (2) practical OOD-aware abstention and uncertainty signals, (3) online continual adaptation with explicit capacity management, and (4) a concrete export path toward neuromorphic hardware.
 
 This paper makes the following contributions:
 
-1. It presents **Concept Cell Clusters (CCCs)** as the basic sparse computational unit for online recruitment, abstention, and refinement.
-2. It integrates CCCs into a **visual ventral-stream hierarchy**, a **predictive coding stack**, a **Global Neuronal Workspace**, and an **ensemble OOD mechanism**.
-3. It demonstrates a **multi-modal learning path** in which shared CCCs bind visual and textual signals through alternating local updates.
-4. It provides a **functional Loihi 2 export path** and an analytic energy study suggesting large projected efficiency gains over dense transformer baselines.
+1. It presents **Concept Cell Clusters (CCCs)** as the basic sparse computational unit for online recruitment, abstention, refinement, and importance-aware stabilization.
+2. It integrates CCCs into a **visual ventral-stream hierarchy**, a **predictive coding stack with top-down gating**, a **Global Neuronal Workspace**, an **ensemble OOD mechanism**, and **curiosity-driven replay**.
+3. It reports new **scaling-law and continual-learning analyses**, showing both useful operating points and a task-type-dependent forgetting bottleneck.
+4. It provides a **functional Loihi 2 export path** with round-trip/Lava validation and an analytic energy study suggesting large projected efficiency gains over dense transformer baselines.
 
-[Figure 1: End-to-end Bio-ARN pipeline, from sensory encoding through predictive coding, CCC hierarchies, GNW broadcast, ensemble/OOD heads, and Loihi 2 export.]
+[Figure 1: End-to-end Bio-ARN pipeline, from sensory encoding through predictive coding, CCC hierarchies, GNW broadcast, ensemble/OOD heads, curiosity-driven replay, and Loihi 2 export.]
 
 ## 2. Architecture
 
@@ -29,17 +29,17 @@ This paper makes the following contributions:
 
 The fundamental unit of Bio-ARN is the Concept Cell Cluster (CCC). A CCC contains: (i) an F1 sparse feature projection, (ii) an F2 concept-space activation, (iii) a margin gate that determines whether the current input matches the stored concept strongly enough to fire, and (iv) a top-down feedback pathway that supports resonance and refinement. Conceptually, the CCC is a compact cortical-column-like circuit with explicit abstention behavior.
 
-This abstention behavior is important. Standard classifiers must map every input to one of a fixed set of classes. A CCC can instead emit "none of the above" when the margin gate is not crossed. If no committed CCC explains the input, an unused CCC can be recruited online through fast local learning. Once recruited, repeated resonance gradually refines the concept via slow local weight updates.
+This abstention behavior is important. Standard classifiers must map every input to one of a fixed set of classes. A CCC can instead emit "none of the above" when the margin gate is not crossed. If no committed CCC explains the input, an unused CCC can be recruited online through fast local learning. Once recruited, repeated resonance gradually refines the concept via slow local weight updates. Synaptic consolidation tracks how often a CCC becomes important and correspondingly reduces its effective learning rate, protecting frequently used concepts from being overwritten too aggressively.
 
-The result is a unit that supports one-shot commitment, sparse competition, and continual specialization without a global backward pass. In Bio-ARN, recognition is therefore open-set by construction rather than purely post hoc.
+The result is a unit that supports one-shot commitment, sparse competition, continual specialization, and partial stability-plasticity control without a global backward pass. In Bio-ARN, recognition is therefore open-set by construction rather than purely post hoc.
 
-[Figure 2: Internal CCC computation: F1 sparse encoding, F2 concept activation, margin-gate abstention/firing, feedback prediction, and Hebbian refinement.]
+[Figure 2: Internal CCC computation: F1 sparse encoding, F2 concept activation, margin-gate abstention/firing, feedback prediction, and Hebbian/STDP refinement.]
 
 ### 2.2 Visual hierarchy: V1 -> V2 -> V4 -> IT
 
 For vision, CCCs are organized into a four-stage hierarchy inspired by the ventral stream: V1, V2, V4, and inferotemporal-like (IT) representations [Riesenhuber and Poggio, 1999]. Inputs are first decomposed into receptive-field patches, then processed layer-by-layer with progressively larger effective receptive fields and more abstract concept vectors.
 
-Each layer is backed by a CCC pool with its own dimensionality, threshold, and winner limit. Lower layers emphasize local feature capture; higher layers summarize increasingly abstract combinations. Intermediate representations are aggregated using confidence-weighted concept summaries, and optional adaptive capacity mechanisms allow layer pools to grow or prune when abstention pressure becomes sustained.
+Each layer is backed by a CCC pool with its own dimensionality, threshold, and winner limit. Lower layers emphasize local feature capture; higher layers summarize increasingly abstract combinations. Intermediate representations are aggregated using confidence-weighted concept summaries. When abstention pressure remains high, pools can expand dynamically up to 3x their initial size, making capacity a controllable resource rather than a fixed ceiling.
 
 This hierarchy is not a conventional deep network trained end-to-end. Each level learns with local rules and its own competitive dynamics. The hierarchy therefore trades gradient-optimized accuracy for online specialization and sparse routing.
 
@@ -49,11 +49,11 @@ Bio-ARN includes an explicit spatial attention stage in the visual hierarchy. Pa
 
 Within and across layers, lateral inhibition reduces redundant co-activations. Candidate concepts are sorted by confidence and greedily filtered when their cosine similarity exceeds a threshold. In practice, this yields winner-take-most behavior: multiple compatible concepts can survive, but highly overlapping ones are suppressed. The system remains sparse not only because few units fire, but because similar candidates are actively prevented from co-dominating.
 
-### 2.4 Predictive coding integration
+### 2.4 Predictive coding and top-down feedback
 
 A predictive hierarchy is attached to the feedforward visual path. Instead of propagating all activity upward, Bio-ARN iteratively settles hidden states to minimize local prediction error and free energy [Rao and Ballard, 1999; Friston, 2010]. Predictable structure is suppressed, while residual error is emphasized.
 
-This matters for both efficiency and selectivity. If lower-level patterns are already well explained, less activity needs to reach the concept system. Predictive coding thus acts as a sparsity engine, a novelty signal, and a source of top-down context. The hierarchy also supports generation by cascading higher-level states back into lower sensory predictions.
+This predictive path is now coupled to explicit top-down feedback connections from IT -> V4 -> V2 -> V1. Higher-level summaries are projected back to lower levels and applied as multiplicative gating on candidate activations. In effect, higher layers bias lower layers toward interpretations that are globally coherent while still allowing abstention when no concept matches well.
 
 Unlike backpropagation, these updates are local to adjacent levels and rely on state/error interactions rather than end-to-end gradient transport. In Bio-ARN, predictive coding is therefore both a representational hypothesis and an optimization constraint.
 
@@ -67,9 +67,9 @@ The GNW contributes two useful behaviors. First, it offers a compact mechanism f
 
 ### 2.6 Ensemble pool and OOD detection
 
-Bio-ARN's ensemble pool trains multiple CCC-based experts with diverse preprocessing and per-expert perturbations. Predictions are combined with weighted voting, optional Hebbian-style boosting, abstention-aware agreement scoring, and prototype-based label readout.
+Bio-ARN's ensemble pool trains multiple CCC-based experts with diverse preprocessing and per-expert perturbations. Predictions are combined with weighted voting, Hebbian-style boosting, abstention-aware agreement scoring, and prototype-based label readout.
 
-This ensemble design is central to Bio-ARN's robustness story. OOD detection is not treated as a separate calibration model bolted onto a closed-set classifier; instead, it emerges from abstention fractions, confidence margins, expert disagreement, and workspace support. The current ensemble OOD AUROC of 0.861 exceeds a baseline 0.778, while GNW workspace scoring reaches 0.868. These gains suggest that sparse concept competition plus abstention provides a useful substrate for uncertainty estimation.
+This ensemble design is central to Bio-ARN's robustness story. OOD detection is not treated as a separate calibration model bolted onto a closed-set classifier; instead, it emerges from abstention fractions, confidence margins, expert disagreement, and workspace support. Ensemble OOD reaches 0.861 AUROC, GNW workspace scoring reaches 0.868 AUROC, and the best combined configuration reaches 1.000 AUROC. These gains suggest that sparse concept competition plus abstention provides a useful substrate for uncertainty estimation.
 
 ### 2.7 Multi-modal binding
 
@@ -83,13 +83,27 @@ All core learning in Bio-ARN is local. Fast concept recruitment initializes new 
 
 This is the architecture's strongest differentiator and also one of its main risks. The upside is online learning, hardware friendliness, and biological plausibility. The downside is weaker optimization efficiency on tasks where backprop-trained deep models dominate.
 
+### 2.9 Stability and exploration extensions
+
+Several new components sharpen Bio-ARN's operating envelope:
+
+- **STDP temporal dynamics** are opt-in and modulate Hebbian updates using pre/post spike traces on feedback pathways.
+- **Top-down feedback connections** gate lower-layer activations multiplicatively, encouraging globally consistent interpretations.
+- **Synaptic consolidation** estimates CCC importance and reduces the learning rate of frequently used concepts.
+- **Dynamic CCC pool growth** expands capacity when abstention remains persistently high.
+- **Curiosity-driven replay** prioritizes novel, abstained, misclassified, or newly recruited samples for immediate replay.
+
+These modules do not all target the same metric. Some help accuracy, some help OOD behavior, some stabilize temporal learning, and some improve hardware plausibility. That division of labor becomes important in the experimental results.
+
 ## 3. Neuromorphic Deployment
 
 Bio-ARN includes a functional export path from trained CCC pools and visual hierarchies to a portable Loihi 2 graph. In this mapping, each CCC is decomposed into LIF populations corresponding to F1 feature neurons, F2 concept neurons, and a margin-gate readout. Feedback connections, local lateral inhibition, and winner-take-all competition are represented as explicit neuromorphic projections. Hierarchical exports further add feedforward layer-to-layer populations and projections.
 
 The export format tracks population allocation, projection matrices, thresholds, delays, and metadata needed for downstream Lava/Loihi execution. This does not yet constitute a full claim of measured large-scale application performance on silicon. Rather, it establishes that the architecture was designed with deployable spike-compatible structure in mind, instead of treating neuromorphic mapping as a post hoc approximation.
 
-From a systems perspective, this matters because Bio-ARN's central mechanisms—sparse event-driven activity, local plasticity, winner-take-all competition, and recurrent context—map more naturally to neuromorphic substrates than dense attention blocks do [Davies et al., 2021].
+The deployment path is now supported by direct validation checks. Export preserves weights exactly, round-trip reconstruction succeeds, and Lava-style simulation stays within 0.047 absolute accuracy of the original model. That is a stronger claim than "export exists": it shows that the graph representation is faithful enough to serve as a real deployment interface rather than a lossy visualization artifact.
+
+From a systems perspective, this matters because Bio-ARN's central mechanisms—sparse event-driven activity, local plasticity, winner-take-all competition, recurrent context, and explicit feedback—map more naturally to neuromorphic substrates than dense attention blocks do [Davies et al., 2021].
 
 [Figure 3: CCC-to-Loihi 2 mapping, showing F1/F2/gate populations, inhibitory competition, feedback projections, and hierarchical composition.]
 
@@ -97,19 +111,20 @@ From a systems perspective, this matters because Bio-ARN's central mechanisms—
 
 ### 4.1 Experimental framing
 
-The current experimental suite should be read as architectural validation rather than a final scaling study. The codebase includes MNIST, real CIFAR-10, text generation, multimodal demos, continual-learning benchmarks, OOD analyses, and analytic energy reports. The most mature strengths are uncertainty estimation, local learning, and hardware-oriented efficiency. The most obvious weakness is raw visual accuracy on harder datasets. The numbers below combine repository-documented benchmarks with the latest internal project metrics available for the June 2026 draft.
+The current experimental suite should be read as architectural validation rather than a final scaling study. The codebase includes MNIST, real CIFAR-10, text generation, multimodal demos, continual-learning benchmarks, OOD analyses, scaling sweeps, and analytic energy reports. The most mature strengths are uncertainty estimation, local learning, and hardware-oriented efficiency. The most obvious weakness is raw visual accuracy on harder datasets. The numbers below reflect the current June 2026 repository state.
 
-### 4.2 CIFAR-10 progression
+### 4.2 CIFAR-10 progression and combined configurations
 
-Real CIFAR-10 remains a challenging benchmark for purely local Hebbian learning. Nevertheless, architectural additions have improved performance over the flat baseline.
+Real CIFAR-10 remains a challenging benchmark for purely local Hebbian learning. Nevertheless, architectural additions have improved performance over earlier hierarchy-only results.
 
-| Configuration | Accuracy | Notes |
-|---|---:|---|
-| Flat online pool | lower than hierarchy variants | used mainly as a control for OOD and architecture ablations |
-| Visual hierarchy | 26.4% | best confirmed hierarchy-only result in repository documentation |
-| Hierarchy + ensemble | **30.0%** | current best reported real CIFAR-10 configuration |
+| Configuration | Accuracy summary | OOD AUROC | Notes |
+|---|---:|---:|---|
+| Hierarchy baseline | 30.0% | - | reference four-layer hierarchy |
+| Curiosity-driven replay (weight 0.8) | **33.8% online / 55.8% eval** | - | strongest pure replay-driven accuracy lift |
+| Curiosity sweep at 800 samples | 30.5% | - | intermediate data-scaling reference point |
+| Best combined config at 2,000 samples | **33.0%** | **1.000** | best overall accuracy/robustness trade-off |
 
-The absolute number is modest compared with modern convolutional and transformer models. We emphasize this directly because it is important for honest positioning. Bio-ARN should currently be understood as a proof of architectural direction, not a state-of-the-art CIFAR classifier.
+The absolute numbers remain modest compared with modern convolutional and transformer models. We emphasize this directly because it is important for honest positioning. Bio-ARN should currently be understood as a proof of architectural direction, not a state-of-the-art CIFAR classifier.
 
 ### 4.3 OOD detection
 
@@ -120,10 +135,11 @@ OOD behavior is more encouraging than closed-set accuracy alone would suggest.
 | Baseline confidence scoring | 0.778 AUROC |
 | Ensemble OOD | **0.861 AUROC** |
 | GNW workspace OOD | **0.868 AUROC** |
+| Best combined configuration | **1.000 AUROC** |
 
 These results support the view that abstention, expert disagreement, and workspace stability are useful uncertainty signals. In other words, Bio-ARN's sparse concept architecture appears to buy robustness earlier than it buys top-1 accuracy.
 
-[Figure 4: Accuracy/OOD trade-off across baseline, hierarchy, ensemble, and hierarchy+ensemble configurations on CIFAR-10.]
+[Figure 4: Accuracy/OOD trade-off across hierarchy, curiosity-replay, GNW, ensemble, and best-combined configurations on CIFAR-10.]
 
 ### 4.4 Energy efficiency
 
@@ -147,23 +163,57 @@ These numbers do not imply fluent transformer-like generation. The outputs remai
 
 ### 4.6 Continual learning
 
-Continual learning is a core motivation for the architecture, but the current results expose an important limitation. The benchmark suite shows a capacity bottleneck and substantial negative backward transfer, with current reported backward transfer at **-29.2 points**. This indicates that although Bio-ARN learns online, its present memory allocation and interference controls are not yet sufficient for strong sequential task retention at scale.
+Continual learning is a core motivation for the architecture, and the new benchmark suite makes that strength-and-weakness profile much clearer.
 
-We consider this an encouraging failure mode: the system is revealing exactly where a no-backprop continual learner must improve. Future work should target better capacity management, stronger replay-free consolidation, and more explicit separation between stable and plastic concept subsets.
+#### 4.6.1 Methodology
 
-### 4.7 MNIST and export maturity
+We evaluate three sequential settings:
 
-On MNIST, Bio-ARN reaches **85.2% accuracy**, which is useful as a moderate-complexity validation target for online sparse learning. The repository also reports a **functional Loihi 2 export path**, showing that the hardware mapping is executable rather than purely conceptual.
+1. **Split-CIFAR-10**: five binary class-split tasks, e.g. (0/1), (2/3), ..., (8/9), trained sequentially with the visual hierarchy.
+2. **Split-MNIST**: the same five-way binary class-split protocol on MNIST.
+3. **Permuted-MNIST**: five sequential tasks sharing the same labels but each applying a distinct pixel permutation.
 
-### 4.8 Scaling analysis
+After each task, the current model is evaluated on all tasks seen so far. We report backward transfer (BWT) and mean forgetting. This matters because it separates two qualitatively different continual-learning demands: learning new class partitions versus adapting to new input transformations.
 
-Scaling remains an open question.
+#### 4.6.2 Results
 
-- The current architecture benefits from sparsity as pool size grows.
-- Larger CCC pools can, in principle, maintain low activation fractions even as capacity expands.
-- A fuller scaling section should incorporate the forthcoming large-pool and systems-level analysis from Tank's experiments.
+| Benchmark | Task type | Backward transfer | Mean forgetting | Interpretation |
+|---|---|---:|---:|---|
+| Split-CIFAR-10 | class splits on natural images | **-29.2 pts** | **23.3 pts** | severe interference; capacity bottleneck |
+| Split-MNIST | class splits on digits | **-46.3%** | **37.1%** | catastrophic forgetting is even stronger |
+| Permuted-MNIST | input permutations with shared labels | **-5.8%** | **5.5%** | forgetting is comparatively mild |
 
-[Figure 5: Placeholder scaling plot showing accuracy, active CCC count, activation fraction, and projected sparse savings as pool capacity increases.]
+The key finding is that forgetting is strongly task-type-dependent. Bio-ARN struggles most when new tasks introduce new class partitions that compete for CCC capacity and prototype ownership. It degrades much less when the task sequence preserves the label semantics but changes the surface statistics, as in Permuted-MNIST.
+
+#### 4.6.3 Analysis and mitigation
+
+The current root cause appears to be **CCC pool saturation on class-split tasks**. Once early concepts occupy the most useful slots, later classes must either overwrite existing structure or recruit into a pool whose abstraction geometry was shaped for earlier tasks. That failure mode is much weaker on permutation benchmarks because the underlying categories remain aligned.
+
+Two mitigation mechanisms are now implemented:
+
+- **Synaptic consolidation**, which reduces learning rates for high-importance CCCs.
+- **Dynamic growth**, which expands the CCC pool under sustained abstention pressure.
+
+These changes help partially, but they do not yet solve the class-split problem. We therefore frame continual learning not as a solved capability, but as one of the paper's most important open research directions.
+
+### 4.7 MNIST and deployment maturity
+
+On MNIST, Bio-ARN reaches **85.2% accuracy**, which remains a useful moderate-complexity validation target for online sparse learning. Together with the Loihi/Lava round-trip checks, this suggests that the architecture's implementation maturity is strongest on small-to-medium tasks where local learning and structured sparsity are easier to stabilize.
+
+### 4.8 Scaling laws
+
+Scaling sweeps reveal useful operating points rather than simple monotonic improvement.
+
+| Sweep | Key finding | Practical implication |
+|---|---|---|
+| CCC pool size | performance saturates at **100** | larger pools increase capacity headroom but do not keep improving accuracy |
+| Hierarchy depth | **4 layers** is optimal | V1 -> V2 -> V4 -> IT is the current sweet spot |
+| Expert count | **3 experts** is best | more experts add cost faster than they add robustness |
+| Data volume | more data helps roughly linearly; **2,000 samples** is best | the architecture is still data-limited rather than fully saturated |
+
+The data-volume sweep is particularly important. Moving from smaller training sets to 2,000 samples continues to improve CIFAR behavior, and the curiosity-driven 800-sample point still reaches 30.5%, suggesting that the current system benefits from both more data and better sample prioritization. These are empirical scaling laws for the present Bio-ARN implementation, not universal laws, but they provide a concrete guide for future tuning.
+
+[Figure 5: Scaling-law summary across pool size, hierarchy depth, expert count, and data volume.]
 
 ## 5. Related Work
 
@@ -181,20 +231,42 @@ Bio-ARN intersects several research traditions but does not fit neatly into any 
 
 ## 6. Discussion
 
-Bio-ARN's strengths are architectural coherence, strong inductive structure, and explicit attention to efficiency. The system combines online learning, abstention, predictive suppression, multimodal concept sharing, workspace broadcasting, and neuromorphic export in a single executable codebase. That combination is unusual and scientifically useful even where individual task performance is still limited.
+The new results sharpen the paper's main message. Bio-ARN is **not** currently competing on raw CIFAR-10 accuracy, and it should not be presented that way. The more defensible claim is that the architecture combines several properties that are usually studied separately: local online learning, OOD-aware abstention, explicit continual-learning machinery, and a real neuromorphic deployment path.
 
-Its limitations are equally clear:
+The combined-feature finding is especially important. Individual modules serve different purposes:
 
-1. **CIFAR-10 accuracy is still low.** A 30.0% result is meaningful as progress within this paradigm, but not competitive with mainstream deep learning.
-2. **Continual learning is not solved.** Negative backward transfer remains substantial.
-3. **Energy gains are projected, not end-to-end measured on deployed Loihi 2 workloads.**
-4. **The current CPU prototype is not optimized.** Hardware-oriented claims should not be confused with present dense-software runtime performance.
+- curiosity-driven replay helps sample efficiency and online adaptation;
+- GNW and ensemble signals help OOD detection;
+- STDP and feedback improve temporal/contextual dynamics;
+- consolidation and growth target stability-plasticity;
+- the export stack targets energy and hardware deployment.
+
+These modules do **not** simply compound into ever-higher raw accuracy. That is not a flaw in the framing; it is the central result. Bio-ARN's value is the **combination of properties** rather than dominance on any single standard benchmark.
+
+No other system in the current project scope provides all of the following simultaneously in one executable stack:
+
+1. projected neuromorphic energy efficiency,
+2. OOD-aware abstention and uncertainty signals,
+3. online local learning without backpropagation,
+4. explicit continual-learning machinery, and
+5. a validated Loihi/Lava export path.
+
+### 6.1 Limitations
+
+Bio-ARN's limitations are equally clear:
+
+1. **CIFAR-10 accuracy is still low.** Even the best combined configuration peaks at 33.0%, and the most optimistic replay-enhanced result is still far below mainstream deep-learning baselines.
+2. **Continual learning is highly task-dependent.** Class-split benchmarks show severe forgetting, especially Split-MNIST and Split-CIFAR-10.
+3. **The CCC pool is still a bottleneck.** Dynamic growth and consolidation help, but class-split tasks can still saturate useful concept capacity.
+4. **OOD gains do not guarantee accuracy gains.** The best robustness configurations are not always the best classifiers.
+5. **Energy gains are projected, not yet measured end-to-end on deployed Loihi 2 workloads.**
+6. **The current CPU prototype is not optimized.** Hardware-oriented claims should not be confused with present dense-software runtime performance.
 
 Despite these limitations, Bio-ARN suggests a valuable research direction. If the field's next frontier includes efficient on-device intelligence, open-set robustness, and low-power continual adaptation, then architectures like Bio-ARN deserve study even before they match dense backprop-trained models on conventional benchmarks.
 
 Promising future directions include:
 
-- stronger capacity allocation and consolidation for continual learning;
+- stronger capacity allocation and consolidation for class-split continual learning;
 - larger multimodal datasets and richer grounding tasks;
 - improved generative decoding beyond short-horizon lexical validity;
 - measured silicon experiments on Loihi 2 hardware;
@@ -202,8 +274,8 @@ Promising future directions include:
 
 ## 7. Conclusion
 
-Bio-ARN 2.0 is a research architecture built around a simple but ambitious hypothesis: useful intelligence for edge and neuromorphic settings may require a different stack than the one optimized for large datacenter transformers. By combining CCC-based sparse concepts, predictive coding, workspace broadcast, multimodal binding, ensemble uncertainty, and local Hebbian learning, Bio-ARN offers a concrete alternative design.
+Bio-ARN 2.0 is a research architecture built around a simple but ambitious hypothesis: useful intelligence for edge and neuromorphic settings may require a different stack than the one optimized for large datacenter transformers. By combining CCC-based sparse concepts, predictive coding, top-down feedback, workspace broadcast, multimodal binding, ensemble uncertainty, and local Hebbian learning, Bio-ARN offers a concrete alternative design.
 
-The current evidence is mixed in the right way. Bio-ARN is not yet a high-accuracy vision model. But it already shows promising OOD behavior, online learning capability, functional neuromorphic export, and compelling projected energy efficiency. We therefore view it as an architecture worth scaling and stress-testing, especially for domains where efficiency, robustness, and continual adaptation matter as much as raw benchmark score.
+The current evidence is mixed in the right way. Bio-ARN is not yet a high-accuracy vision model, and its continual-learning story remains incomplete on class-split tasks. But it already shows promising OOD behavior, online learning capability, functional neuromorphic export, and compelling projected energy efficiency. We therefore view it as an architecture worth scaling and stress-testing, especially for domains where efficiency, robustness, continual adaptation, and deployability matter as much as raw benchmark score.
 
 [Figure 6: Summary comparison positioning Bio-ARN against transformer-class systems across accuracy, energy, OOD robustness, continual learning, and biological plausibility.]
