@@ -21,6 +21,7 @@ from bioarn.reward import NoveltySignal, RewardSystem
 from bioarn.scaling import ScaledBioARN
 from bioarn.system import BioARNCore
 from bioarn.training.curriculum import CurriculumScheduler
+from bioarn.training.maturation import MaturationConfig, MaturationSchedule
 
 
 @dataclass
@@ -43,6 +44,7 @@ class VisionTrainConfig:
     curriculum: bool = False
     contrastive_curiosity: bool = False
     workspace: GNWConfig | None = None
+    maturation: MaturationConfig | None = None
 
 
 @dataclass
@@ -301,6 +303,7 @@ class VisionTrainer:
         self.config = config
         self.preprocessing = preprocessing
         self.effective_input_dim = self._effective_input_dim()
+        self._configured_workspace = copy.deepcopy(config.workspace)
         self.system = self._build_system(config, input_dim=self.effective_input_dim)
         self.label_bank = _PrototypeBank()
         self.ccc_label_counts: defaultdict[int, Counter[int]] = defaultdict(Counter)
@@ -309,6 +312,8 @@ class VisionTrainer:
         self.last_fired_indices: list[int] = []
         self.curiosity_system = self._build_curiosity_system()
         self.curriculum_scheduler = CurriculumScheduler() if self.config.curriculum else None
+        self.maturation = self._build_maturation_schedule()
+        self._apply_maturation_phase()
 
     def _effective_input_dim(self) -> int:
         if self.preprocessing is None:
@@ -366,6 +371,21 @@ class VisionTrainer:
                 curiosity_weight=weight,
             )
         )
+
+    def _build_maturation_schedule(self) -> MaturationSchedule | None:
+        if self.config.maturation is None or not bool(self.config.maturation.enabled):
+            return None
+        return MaturationSchedule(copy.deepcopy(self.config.maturation))
+
+    def _apply_maturation_phase(self) -> None:
+        if self.maturation is None:
+            return
+        active_modules = self.maturation.get_active_modules()
+        workspace_active = bool(active_modules["workspace"] and self._configured_workspace is not None)
+        self.system.config.workspace = (
+            copy.deepcopy(self._configured_workspace) if workspace_active else None
+        )
+        self.system.workspace_enabled = workspace_active
 
     def _prepare_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
         prepared = tensor.to(torch.float32).reshape(-1)
@@ -671,7 +691,7 @@ class VisionTrainer:
         label: int | None,
         *,
         learning_rate_multiplier: float = 1.0,
-    ) -> tuple[int | None, bool, bool, float]:
+    ) -> tuple[int | None, bool, bool, float, PoolStepResult]:
         before_committed = int(self._pool_stats()["num_committed"])
         tensor = self._prepare_tensor(tensor)
         self._observe_pool_samples(1)
@@ -690,7 +710,13 @@ class VisionTrainer:
         self._update_pool_importance(step_result.fired_indices, step_result.winner_confidences)
         self._record_ccc_activity(step_result.fired_indices, label, step_result.confidence)
         recruited = int(self._pool_stats()["num_committed"]) > before_committed
-        return prediction, bool(step_result.abstained), recruited, float(step_result.confidence)
+        return (
+            prediction,
+            bool(step_result.abstained),
+            recruited,
+            float(step_result.confidence),
+            step_result,
+        )
 
     @torch.no_grad()
     def train_online(
@@ -752,6 +778,7 @@ class VisionTrainer:
         boundary_scores: list[float] = []
         learning_rate_multipliers: list[float] = []
         curiosity_replays = 0
+        maturation_transitions: list[dict[str, float | int]] = []
         progress_interval = max(1, max(effective_target, 1) // 10)
 
         for pass_index in range(num_passes):
@@ -833,9 +860,11 @@ class VisionTrainer:
                     if self.config.contrastive_curiosity:
                         boundary_score = self._boundary_score(preview_result.winner_confidences)
                         boundary_scores.append(boundary_score)
+                if self.maturation is not None:
+                    learning_rate_multiplier *= float(self.maturation.get_learning_rate_scale())
                 learning_rate_multipliers.append(float(learning_rate_multiplier))
 
-                prediction, abstained_flag, recruited, confidence = self._train_single_sample(
+                prediction, abstained_flag, recruited, confidence, step_result = self._train_single_sample(
                     tensor,
                     label,
                     learning_rate_multiplier=learning_rate_multiplier,
@@ -846,6 +875,30 @@ class VisionTrainer:
                     labeled += 1
                     correct += int(prediction == label)
                 abstained += int(abstained_flag)
+                if self.maturation is not None:
+                    previous_phase = self.maturation.phase
+                    if self.maturation.check_transition(
+                        step_result.winner_confidences.to(torch.float32).reshape(-1).tolist()
+                    ):
+                        self._apply_maturation_phase()
+                        variance = (
+                            0.0
+                            if self.maturation.last_transition_variance is None
+                            else float(self.maturation.last_transition_variance)
+                        )
+                        transition = {
+                            "from_phase": previous_phase,
+                            "to_phase": self.maturation.phase,
+                            "variance": variance,
+                            "processed_samples": processed,
+                        }
+                        maturation_transitions.append(transition)
+                        print(
+                            "[Maturation] "
+                            f"Phase {previous_phase}\N{RIGHTWARDS ARROW}"
+                            f"{self.maturation.phase}: "
+                            f"representations stabilized (variance={variance:.2f})"
+                        )
 
                 if self.curiosity_system is not None:
                     prediction_error = self._estimate_prediction_error(
@@ -915,6 +968,9 @@ class VisionTrainer:
                 sum(learning_rate_multipliers) / max(len(learning_rate_multipliers), 1)
             ),
             "peak_curiosity_drive": max(curiosity_drives, default=0.0),
+            "maturation_enabled": self.maturation is not None,
+            "maturation_phase": 1 if self.maturation is None else int(self.maturation.phase),
+            "maturation_transitions": maturation_transitions,
         }
         if self.curiosity_system is not None:
             result["curiosity_stats"] = self.curiosity_system.get_stats()
@@ -1038,6 +1094,8 @@ class VisionTrainer:
                 curiosity_weight=self.config.curiosity_weight,
                 curriculum=self.config.curriculum,
                 contrastive_curiosity=self.config.contrastive_curiosity,
+                workspace=copy.deepcopy(self.config.workspace),
+                maturation=copy.deepcopy(self.config.maturation),
             ),
             preprocessing=copy.deepcopy(self.preprocessing),
         )

@@ -17,6 +17,7 @@ from bioarn.training.text_training import (
     build_builtin_corpus,
 )
 from bioarn.training.curriculum import CurriculumScheduler
+from bioarn.training.maturation import MaturationConfig, MaturationSchedule
 from bioarn.training.vision_training import (
     SyntheticCIFAR10Stream,
     VisionTrainConfig,
@@ -41,6 +42,8 @@ __all__ = [
     "EvalResult",
     "ExpertTrainMetrics",
     "GenerationMetrics",
+    "MaturationConfig",
+    "MaturationSchedule",
     "MultimodalExample",
     "MultimodalTrainer",
     "MultimodalTrainingResult",

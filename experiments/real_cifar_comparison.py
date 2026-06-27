@@ -19,12 +19,13 @@ from bioarn.ensemble import DiversityManager, EnsembleConfig, EnsemblePool
 from bioarn.hierarchy import HierarchyConfig, VisualHierarchy
 from bioarn.training import (
     EnsembleTrainer,
+    MaturationConfig,
     VisionTrainConfig,
     VisionTrainer,
     load_cifar10_or_synthetic,
     take_samples,
 )
-from combined_config_sweep import run_best_combined
+from combined_config_sweep import CombinedConfigSpec, run_combined_config
 from sprint_d_benchmark import run_best_sprint_d
 
 TRAIN_N = 2000
@@ -460,6 +461,95 @@ def run_hierarchy(
     )
 
 
+def _combined_benchmark_spec(*, name: str, maturation: MaturationConfig | None = None) -> CombinedConfigSpec:
+    return CombinedConfigSpec(
+        name=name,
+        train_samples=TRAIN_N,
+        workspace=False,
+        curiosity_weight=0.8,
+        predictive=True,
+        stdp=True,
+        feedback_strength=0.2,
+        hierarchy_passes=2,
+        aux_train_passes=2,
+        maturation=maturation,
+    )
+
+
+def run_hierarchy_baseline(
+    train_samples: list[tuple[torch.Tensor, int | None]],
+    test_samples: list[tuple[torch.Tensor, int | None]],
+    ood_samples: list[torch.Tensor],
+) -> RunResult:
+    result = run_combined_config(
+        CombinedConfigSpec(
+            name="hierarchy-baseline",
+            train_samples=TRAIN_N,
+            workspace=False,
+            curiosity_weight=0.0,
+            predictive=False,
+            stdp=False,
+            feedback_strength=0.0,
+        ),
+        train_samples,
+        test_samples,
+        ood_samples,
+    )
+    return RunResult(
+        name=result.name,
+        accuracy=float(result.accuracy),
+        abstention_rate=float(result.abstention_rate),
+        ood_auroc=float(result.ood_auroc),
+    )
+
+
+def run_all_at_once(
+    train_samples: list[tuple[torch.Tensor, int | None]],
+    test_samples: list[tuple[torch.Tensor, int | None]],
+    ood_samples: list[torch.Tensor],
+) -> RunResult:
+    result = run_combined_config(
+        _combined_benchmark_spec(name="all-at-once"),
+        train_samples,
+        test_samples,
+        ood_samples,
+    )
+    return RunResult(
+        name=result.name,
+        accuracy=float(result.accuracy),
+        abstention_rate=float(result.abstention_rate),
+        ood_auroc=float(result.ood_auroc),
+    )
+
+
+def run_maturation(
+    train_samples: list[tuple[torch.Tensor, int | None]],
+    test_samples: list[tuple[torch.Tensor, int | None]],
+    ood_samples: list[torch.Tensor],
+) -> RunResult:
+    result = run_combined_config(
+        _combined_benchmark_spec(
+            name="maturation",
+            maturation=MaturationConfig(
+                enabled=True,
+                num_phases=3,
+                stability_threshold=0.05,
+                min_samples_per_phase=5000,
+                auto_transition=True,
+            ),
+        ),
+        train_samples,
+        test_samples,
+        ood_samples,
+    )
+    return RunResult(
+        name=result.name,
+        accuracy=float(result.accuracy),
+        abstention_rate=float(result.abstention_rate),
+        ood_auroc=float(result.ood_auroc),
+    )
+
+
 def run_ensemble(
     train_samples: list[tuple[torch.Tensor, int | None]],
     test_samples: list[tuple[torch.Tensor, int | None]],
@@ -699,59 +789,9 @@ def run_experiment() -> list[RunResult]:
     ood_samples = _make_ood_samples(OOD_N)
 
     runners = (
-        ("baseline", run_baseline),
-        ("workspace", run_workspace),
-        ("curriculum+curiosity", run_curriculum_curiosity),
-        ("gnw_consensus", run_gnw_consensus),
-        ("hierarchy", run_hierarchy),
-        (
-            "hierarchy+feedback",
-            lambda tr, te, od: run_hierarchy(tr, te, od, feedback_strength=0.2),
-        ),
-        (
-            "hierarchy+settling",
-            lambda tr, te, od: run_hierarchy(
-                tr,
-                te,
-                od,
-                predictive_config=_default_predictive_config(mode="settling"),
-                predictive_tag="settling",
-            ),
-        ),
-        (
-            "hierarchy+error_gated",
-            lambda tr, te, od: run_hierarchy(
-                tr,
-                te,
-                od,
-                predictive_config=_default_predictive_config(mode="error_gating"),
-                predictive_tag="error_gated",
-            ),
-        ),
-        (
-            "hierarchy+settling+tuned",
-            lambda tr, te, od: run_hierarchy(
-                tr,
-                te,
-                od,
-                predictive_config=_tuned_predictive_config(mode="settling"),
-                predictive_tag="settling+tuned",
-            ),
-        ),
-        (
-            "hierarchy+settling+tuned+feedback",
-            lambda tr, te, od: run_hierarchy(
-                tr,
-                te,
-                od,
-                predictive_config=_tuned_predictive_config(mode="settling"),
-                feedback_strength=0.2,
-                predictive_tag="settling+tuned",
-            ),
-        ),
-        ("ensemble", run_ensemble),
-        ("both", run_both),
-        ("best_d", run_best_d),
+        ("hierarchy-baseline", run_hierarchy_baseline),
+        ("all-at-once", run_all_at_once),
+        ("maturation", run_maturation),
     )
     results: list[RunResult] = []
     for index, (name, runner) in enumerate(runners, start=1):

@@ -8,7 +8,14 @@ from bioarn.core.consolidation import SynapticConsolidation
 from bioarn.core.math_utils import normalize
 from bioarn.loop import SensorimotorLoop
 from bioarn.scaling import BatchedCCCPool
-from bioarn.training import CurriculumScheduler, SyntheticCIFAR10Stream, VisionTrainConfig, VisionTrainer
+from bioarn.training import (
+    CurriculumScheduler,
+    MaturationConfig,
+    MaturationSchedule,
+    SyntheticCIFAR10Stream,
+    VisionTrainConfig,
+    VisionTrainer,
+)
 
 
 def make_config(
@@ -23,6 +30,7 @@ def make_config(
     curriculum: bool = False,
     contrastive_curiosity: bool = False,
     workspace: GNWConfig | None = None,
+    maturation: MaturationConfig | None = None,
 ) -> VisionTrainConfig:
     return VisionTrainConfig(
         input_dim=3072,
@@ -39,6 +47,7 @@ def make_config(
         curriculum=curriculum,
         contrastive_curiosity=contrastive_curiosity,
         workspace=workspace,
+        maturation=maturation,
     )
 
 
@@ -281,6 +290,88 @@ def test_workspace_training_path_runs() -> None:
     assert result["mean_learning_rate_multiplier"] > 1.0
     assert metrics["accuracy"] >= 0.0
     assert metrics["abstention_rate"] >= 0.0
+
+
+def test_maturation_schedule_advances_across_stable_phases() -> None:
+    schedule = MaturationSchedule(
+        MaturationConfig(
+            enabled=True,
+            min_samples_per_phase=3,
+            stability_threshold=0.001,
+        )
+    )
+
+    for _ in range(3):
+        schedule.check_transition([0.80, 0.81, 0.79])
+
+    assert schedule.phase == 2
+    assert schedule.get_active_modules()["workspace"] is True
+    assert schedule.get_learning_rate_scale() == 0.7
+
+    for _ in range(3):
+        schedule.check_transition([0.75, 0.75, 0.74])
+
+    assert schedule.phase == 3
+    assert schedule.get_active_modules()["feedback"] is True
+    assert len(schedule.transition_history) == 2
+
+
+def test_maturation_keeps_workspace_inactive_until_transition() -> None:
+    workspace = GNWConfig(
+        capacity=5,
+        broadcast_gain=2.2,
+        fatigue_rate=0.08,
+        fatigue_threshold=0.18,
+        competition_temp=0.45,
+        context_size=48,
+    )
+    trainer = VisionTrainer(
+        make_config(
+            num_train_samples=24,
+            workspace=workspace,
+            maturation=MaturationConfig(
+                enabled=True,
+                min_samples_per_phase=100,
+                stability_threshold=0.001,
+            ),
+        )
+    )
+
+    result = trainer.train_online(make_stream(24, seed=81), num_samples=24)
+
+    assert trainer.system.config.workspace is None
+    assert result["maturation_enabled"] is True
+    assert result["maturation_phase"] == 1
+    assert result["maturation_transitions"] == []
+
+
+def test_maturation_activates_workspace_after_stabilization() -> None:
+    workspace = GNWConfig(
+        capacity=5,
+        broadcast_gain=2.2,
+        fatigue_rate=0.08,
+        fatigue_threshold=0.18,
+        competition_temp=0.45,
+        context_size=48,
+    )
+    trainer = VisionTrainer(
+        make_config(
+            num_train_samples=40,
+            workspace=workspace,
+            maturation=MaturationConfig(
+                enabled=True,
+                min_samples_per_phase=5,
+                stability_threshold=1.0,
+            ),
+        )
+    )
+
+    result = trainer.train_online(make_stream(40, seed=82), num_samples=40)
+
+    assert trainer.system.config.workspace is not None
+    assert result["maturation_phase"] == 3
+    assert len(result["maturation_transitions"]) >= 2
+    assert result["mean_learning_rate_multiplier"] < 1.0
 
 
 def test_batched_vs_sequential() -> None:

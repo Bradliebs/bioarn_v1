@@ -195,6 +195,9 @@ class ConceptCellCluster(nn.Module):
     def _adapter_lr(self, base_lr: float) -> float:
         return min(0.05, max(1e-3, float(base_lr)))
 
+    def _stdp_enabled(self) -> bool:
+        return self.stdp_rule is not None and bool(getattr(self.config, "stdp_enabled", True))
+
     @staticmethod
     def _pre_spikes_from_f1(f1_batch: torch.Tensor) -> torch.Tensor:
         return (f1_batch > 0).to(torch.float32).amax(dim=0)
@@ -382,7 +385,7 @@ class ConceptCellCluster(nn.Module):
         gate_output = self.margin_gate(f2_batch, self.concept_direction)
         fired = bool(gate_output.fired.any().item())
         abstained = bool(gate_output.abstained.all().item())
-        pre_spikes = self._pre_spikes_from_f1(f1_batch) if self.stdp_rule is not None else None
+        pre_spikes = self._pre_spikes_from_f1(f1_batch) if self._stdp_enabled() else None
 
         prediction: torch.Tensor | None = None
         resonance: ResonanceOutput | None = None
@@ -398,14 +401,14 @@ class ConceptCellCluster(nn.Module):
                     timestep=timestep,
                     learning_rate_multiplier=learning_rate_multiplier,
                 )
-            elif self.stdp_rule is not None and pre_spikes is not None:
+            elif pre_spikes is not None:
                 self.stdp_rule.observe_pre_spikes(pre_spikes, timestep=timestep)
                 self.stdp_rule.observe_post_spike(
                     self._post_activity_from_f2(gate_output.output),
                     timestep=timestep,
                 )
             self.last_fired.fill_(int(timestep))
-        elif self.stdp_rule is not None and pre_spikes is not None:
+        elif pre_spikes is not None:
             self.stdp_rule.observe_pre_spikes(pre_spikes, timestep=timestep)
 
         formatted_gate = self._format_gate_output(gate_output, squeeze=squeeze)
@@ -484,7 +487,7 @@ class ConceptCellCluster(nn.Module):
         ).to(f2_batch.dtype)
         stdp_signal = torch.zeros(self.config.concept_dim, dtype=f2_batch.dtype, device=f2_batch.device)
         stdp_update = torch.zeros_like(self.feedback_weights)
-        if self.stdp_rule is not None and timestep is not None:
+        if self._stdp_enabled() and timestep is not None:
             stdp_update = self.stdp_rule.step(
                 self._pre_spikes_from_f1(f1_batch),
                 post_spike=True,
@@ -507,7 +510,7 @@ class ConceptCellCluster(nn.Module):
         residual = (f1_batch - prediction) * learn_signal.unsqueeze(-1)
         hebbian_update = residual.transpose(0, 1) @ f2_batch
         hebbian_update /= max(f1_batch.shape[0], 1)
-        if self.stdp_rule is not None and timestep is not None:
+        if self._stdp_enabled() and timestep is not None:
             hebbian_update = hebbian_update + stdp_update
         feedback_lr = self._effective_lr(self.config.feedback_lr) * lr_multiplier
         self.feedback_weights.add_(feedback_lr * hebbian_update)

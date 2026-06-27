@@ -21,7 +21,14 @@ if hasattr(sys.stdout, "reconfigure"):
 from bioarn.config import BioARNConfig, CCCConfig, GNWConfig, MarginGateConfig, PredictiveConfig, SDMConfig, STDPConfig
 from bioarn.hierarchy import HierarchyConfig, VisualHierarchy
 from bioarn.scaling import ScaledBioARN
-from bioarn.training import VisionTrainConfig, VisionTrainer, load_cifar10_or_synthetic, take_samples
+from bioarn.training import (
+    MaturationConfig,
+    MaturationSchedule,
+    VisionTrainConfig,
+    VisionTrainer,
+    load_cifar10_or_synthetic,
+    take_samples,
+)
 
 SEED = 7
 OOD_SEED = 42
@@ -43,6 +50,7 @@ class CombinedConfigSpec:
     hierarchy_pool_scale: float = 1.0
     hierarchy_passes: int = 1
     aux_train_passes: int = 2
+    maturation: MaturationConfig | None = None
 
 
 @dataclass
@@ -77,13 +85,27 @@ class WorkspaceClassifier:
     train_seconds: float
 
     def predict(self, tensor: torch.Tensor) -> tuple[int | None, float]:
-        fired_indices, concept, confidence, abstained = self.trainer._step_pool(  # noqa: SLF001
+        step_result = self.trainer._step_pool(  # noqa: SLF001
             self.trainer._prepare_tensor(tensor),  # noqa: SLF001
             allow_recruit=False,
         )
-        if abstained:
-            return None, float(confidence)
-        return self.trainer._recognition_label(concept, fired_indices), float(confidence)  # noqa: SLF001
+        if step_result.abstained:
+            return None, float(step_result.confidence)
+        return (
+            self.trainer._recognition_label(  # noqa: SLF001
+                step_result.concept_direction,
+                step_result.fired_indices,
+            ),
+            float(step_result.confidence),
+        )
+
+
+@dataclass(frozen=True)
+class _HierarchyRuntimeDefaults:
+    predictive_mode: str
+    feedback_strength: float
+    learning_rates: tuple[float, ...]
+    stdp_enabled: bool
 
 
 def _auroc(id_scores: list[float], ood_scores: list[float]) -> float:
@@ -199,14 +221,90 @@ def _build_hierarchy(spec: CombinedConfigSpec) -> VisualHierarchy:
     )
 
 
+def _hierarchy_runtime_defaults(hierarchy: VisualHierarchy) -> _HierarchyRuntimeDefaults:
+    return _HierarchyRuntimeDefaults(
+        predictive_mode=str(hierarchy.predictive_mode),
+        feedback_strength=float(hierarchy.config.feedback_strength),
+        learning_rates=tuple(float(layer.pool.core.config.slow_lr) for layer in hierarchy.layers),
+        stdp_enabled=bool(hierarchy.config.stdp is not None),
+    )
+
+
+def _apply_hierarchy_maturation_phase(
+    hierarchy: VisualHierarchy,
+    schedule: MaturationSchedule | None,
+    defaults: _HierarchyRuntimeDefaults | None,
+) -> None:
+    if schedule is None or defaults is None:
+        return
+
+    active_modules = schedule.get_active_modules()
+    hierarchy.predictive_mode = (
+        defaults.predictive_mode if active_modules["error_gating"] else "disabled"
+    )
+    hierarchy.config.feedback_strength = (
+        defaults.feedback_strength if active_modules["feedback"] else 0.0
+    )
+    stdp_enabled = bool(defaults.stdp_enabled and active_modules["stdp"])
+    setattr(hierarchy.config, "stdp_enabled", stdp_enabled)
+
+    learning_rate_scale = float(schedule.get_learning_rate_scale())
+    for layer, base_lr in zip(hierarchy.layers, defaults.learning_rates, strict=False):
+        layer.pool._sync_core()
+        layer.pool.core.config.slow_lr = base_lr * learning_rate_scale
+        layer.pool.core.config.feedback_lr = base_lr * learning_rate_scale
+        setattr(layer.pool.core.config, "stdp_enabled", stdp_enabled)
+        for ccc in getattr(layer.pool.core, "cccs", []):
+            ccc.config.slow_lr = layer.pool.core.config.slow_lr
+            ccc.config.feedback_lr = layer.pool.core.config.feedback_lr
+            setattr(ccc.config, "stdp_enabled", stdp_enabled)
+            if not stdp_enabled and getattr(ccc, "stdp_rule", None) is not None:
+                ccc.stdp_rule.reset_state()
+
+
+def _hierarchy_confidences(output) -> list[float]:
+    confidences: list[float] = []
+    for layer_confidences in output.confidences:
+        if layer_confidences.numel():
+            confidences.extend(layer_confidences.to(torch.float32).reshape(-1).tolist())
+    return confidences
+
+
+def _observe_hierarchy_maturation(
+    hierarchy: VisualHierarchy,
+    output,
+    schedule: MaturationSchedule | None,
+    defaults: _HierarchyRuntimeDefaults | None,
+) -> None:
+    if schedule is None or defaults is None:
+        return
+
+    previous_phase = schedule.phase
+    if not schedule.check_transition(_hierarchy_confidences(output)):
+        return
+
+    _apply_hierarchy_maturation_phase(hierarchy, schedule, defaults)
+    variance = (
+        0.0 if schedule.last_transition_variance is None else float(schedule.last_transition_variance)
+    )
+    print(
+        "[Maturation] "
+        f"Phase {previous_phase}\N{RIGHTWARDS ARROW}{schedule.phase}: "
+        f"representations stabilized (variance={variance:.2f})"
+    )
+
+
 def _train_hierarchy(
     hierarchy: VisualHierarchy,
     train_samples: list[tuple[torch.Tensor, int | None]],
     *,
     num_passes: int,
+    maturation: MaturationSchedule | None = None,
+    runtime_defaults: _HierarchyRuntimeDefaults | None = None,
 ) -> float:
     ordered = _interleave_by_class(train_samples)
     warmup_end = max(1, len(ordered) // 3)
+    _apply_hierarchy_maturation_phase(hierarchy, maturation, runtime_defaults)
     start = time.perf_counter()
     with torch.inference_mode():
         for pass_index in range(max(1, int(num_passes))):
@@ -217,9 +315,12 @@ def _train_hierarchy(
                 current = [ordered[index] for index in order]
             for sample_index, (tensor, label) in enumerate(current):
                 if pass_index == 0 and sample_index < warmup_end:
-                    hierarchy.learn(tensor)
+                    output = hierarchy.learn(tensor)
                 elif label is not None:
-                    hierarchy.learn(tensor, int(label))
+                    output = hierarchy.learn(tensor, int(label))
+                else:
+                    continue
+                _observe_hierarchy_maturation(hierarchy, output, maturation, runtime_defaults)
     return time.perf_counter() - start
 
 
@@ -254,6 +355,8 @@ def _apply_curiosity_replay(
     train_samples: list[tuple[torch.Tensor, int | None]],
     *,
     curiosity_weight: float,
+    maturation: MaturationSchedule | None = None,
+    runtime_defaults: _HierarchyRuntimeDefaults | None = None,
 ) -> tuple[int, float]:
     replay_samples = _replay_candidates(
         hierarchy,
@@ -268,13 +371,15 @@ def _apply_curiosity_replay(
         ordered = _interleave_by_class(replay_samples)
         for tensor, label in ordered:
             if label is not None:
-                hierarchy.learn(tensor, int(label))
+                output = hierarchy.learn(tensor, int(label))
+                _observe_hierarchy_maturation(hierarchy, output, maturation, runtime_defaults)
 
         if curiosity_weight > 1.0 and len(ordered) >= 4:
             focused = ordered[: max(1, len(ordered) // 2)]
             for tensor, label in focused:
                 if label is not None:
-                    hierarchy.learn(tensor, int(label))
+                    output = hierarchy.learn(tensor, int(label))
+                    _observe_hierarchy_maturation(hierarchy, output, maturation, runtime_defaults)
     return len(replay_samples), time.perf_counter() - replay_start
 
 
@@ -317,6 +422,7 @@ def _train_workspace_classifier(
     *,
     curiosity_weight: float,
     num_passes: int,
+    maturation: MaturationConfig | None = None,
 ) -> WorkspaceClassifier:
     config = VisionTrainConfig(
         input_dim=3072,
@@ -330,9 +436,11 @@ def _train_workspace_classifier(
         num_test_samples=TEST_N,
         curiosity_weight=curiosity_weight,
         workspace=_workspace_config(),
+        maturation=copy.deepcopy(maturation),
     )
     trainer = VisionTrainer(config)
     trainer.system = _build_workspace_system(config)
+    trainer._apply_maturation_phase()  # noqa: SLF001
     start = time.perf_counter()
     with contextlib.redirect_stdout(io.StringIO()):
         trainer.train_online(
@@ -419,15 +527,25 @@ def run_combined_config(
 ) -> CombinedRunResult:
     subset = train_samples[: spec.train_samples]
     hierarchy = _build_hierarchy(spec)
+    hierarchy_defaults = _hierarchy_runtime_defaults(hierarchy)
+    hierarchy_maturation = (
+        MaturationSchedule(copy.deepcopy(spec.maturation))
+        if spec.maturation is not None and spec.maturation.enabled
+        else None
+    )
     hierarchy_seconds = _train_hierarchy(
         hierarchy,
         subset,
         num_passes=spec.hierarchy_passes,
+        maturation=hierarchy_maturation,
+        runtime_defaults=hierarchy_defaults,
     )
     replay_samples, replay_seconds = _apply_curiosity_replay(
         hierarchy,
         subset,
         curiosity_weight=spec.curiosity_weight,
+        maturation=hierarchy_maturation,
+        runtime_defaults=hierarchy_defaults,
     )
 
     workspace_classifier: WorkspaceClassifier | None = None
@@ -437,6 +555,7 @@ def run_combined_config(
             subset,
             curiosity_weight=spec.curiosity_weight,
             num_passes=spec.aux_train_passes,
+            maturation=spec.maturation,
         )
         routing_policy = _calibrate_routing_policy(
             hierarchy,
