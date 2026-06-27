@@ -176,7 +176,31 @@ def _workspace_config() -> GNWConfig:
     )
 
 
-def _build_hierarchy(*, predictive: bool = False, feedback_strength: float = 0.0) -> VisualHierarchy:
+def _default_predictive_config() -> PredictiveConfig:
+    return PredictiveConfig(
+        gamma=0.12,
+        eta=0.008,
+        precision_init=1.0,
+        error_threshold=0.02,
+        settling_steps=6,
+    )
+
+
+def _tuned_predictive_config() -> PredictiveConfig:
+    return PredictiveConfig(
+        gamma=0.16,
+        eta=0.006,
+        precision_init=2.4,
+        error_threshold=0.01,
+        settling_steps=14,
+    )
+
+
+def _build_hierarchy(
+    *,
+    predictive_config: PredictiveConfig | None = None,
+    feedback_strength: float = 0.0,
+) -> VisualHierarchy:
     return VisualHierarchy(
         HierarchyConfig(
             image_size=(32, 32, 3),
@@ -187,17 +211,7 @@ def _build_hierarchy(*, predictive: bool = False, feedback_strength: float = 0.0
             learning_rates=[0.05, 0.03, 0.02, 0.01],
             class_count=10,
             feedback_strength=feedback_strength,
-            predictive=(
-                PredictiveConfig(
-                    gamma=0.12,
-                    eta=0.008,
-                    precision_init=1.0,
-                    error_threshold=0.02,
-                    settling_steps=6,
-                )
-                if predictive
-                else None
-            ),
+            predictive=predictive_config,
         )
     )
 
@@ -309,11 +323,12 @@ def run_hierarchy(
     test_samples: list[tuple[torch.Tensor, int | None]],
     ood_samples: list[torch.Tensor],
     *,
-    predictive: bool = False,
+    predictive_config: PredictiveConfig | None = None,
     feedback_strength: float = 0.0,
+    predictive_tag: str = "predictive",
 ) -> RunResult:
     hierarchy = _build_hierarchy(
-        predictive=predictive,
+        predictive_config=predictive_config,
         feedback_strength=feedback_strength,
     )
     interleaved_train = _interleave_by_class(train_samples)
@@ -339,10 +354,11 @@ def run_hierarchy(
             correct += 1
 
     ood_scores = [float(hierarchy.classify(tensor)[1]) for tensor in ood_samples]
-    if predictive and feedback_strength > 0.0:
-        name = "hierarchy+predictive+feedback"
-    elif predictive:
-        name = "hierarchy+predictive"
+    predictive_enabled = predictive_config is not None
+    if predictive_enabled and feedback_strength > 0.0:
+        name = f"hierarchy+{predictive_tag}+feedback"
+    elif predictive_enabled:
+        name = f"hierarchy+{predictive_tag}"
     elif feedback_strength > 0.0:
         name = "hierarchy+feedback"
     else:
@@ -587,7 +603,36 @@ def run_experiment() -> list[RunResult]:
             "hierarchy+feedback",
             lambda tr, te, od: run_hierarchy(tr, te, od, feedback_strength=0.2),
         ),
-        ("hierarchy+predictive", lambda tr, te, od: run_hierarchy(tr, te, od, predictive=True)),
+        (
+            "hierarchy+predictive",
+            lambda tr, te, od: run_hierarchy(
+                tr,
+                te,
+                od,
+                predictive_config=_default_predictive_config(),
+            ),
+        ),
+        (
+            "hierarchy+predictive+tuned",
+            lambda tr, te, od: run_hierarchy(
+                tr,
+                te,
+                od,
+                predictive_config=_tuned_predictive_config(),
+                predictive_tag="predictive+tuned",
+            ),
+        ),
+        (
+            "hierarchy+predictive+tuned+feedback",
+            lambda tr, te, od: run_hierarchy(
+                tr,
+                te,
+                od,
+                predictive_config=_tuned_predictive_config(),
+                feedback_strength=0.2,
+                predictive_tag="predictive+tuned",
+            ),
+        ),
         ("ensemble", run_ensemble),
         ("both", run_both),
     )

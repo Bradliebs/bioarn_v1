@@ -560,14 +560,17 @@ class VisualHierarchy:
         if self.predictive_hierarchy is None:
             return
         with torch.no_grad():
-            for layer in self.predictive_hierarchy.layers:
+            layer_count = max(len(self.predictive_hierarchy.layers), 1)
+            for layer_index, layer in enumerate(self.predictive_hierarchy.layers):
                 layer.W.copy_(
                     self._seed_predictive_weights(
                         input_dim=layer.input_dim,
                         output_dim=layer.output_dim,
                     )
                 )
-                layer.precision.fill_(float(layer.config.precision_init))
+                lower_level_bias = (layer_count - layer_index - 1) / layer_count
+                precision = float(layer.config.precision_init) * (1.0 + (0.75 * lower_level_bias))
+                layer.precision.fill_(precision)
                 layer.state.zero_()
 
     def _summarize_activations(
@@ -912,7 +915,14 @@ class VisualHierarchy:
         return labels[best_index], float(similarities[best_index].item()), margin
 
     def _label_signature_from_output(self, output: HierarchyOutput) -> torch.Tensor:
-        return self._raw_label_signature_from_output(output)
+        raw_signature = self._raw_label_signature_from_output(output)
+        if output.predictive_states and output.predictive_errors:
+            return self._predictive_signature(
+                raw_signature,
+                output.predictive_states,
+                output.predictive_errors,
+            )
+        return raw_signature
 
     def _predict_label(
         self,
