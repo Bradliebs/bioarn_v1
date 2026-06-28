@@ -64,3 +64,13 @@ Recovery commit (d99976c) included workspace improvements (context buffer, selec
 - Logged precision-weighted predictive processing as the new uncertainty-scaled CCC plasticity path
 - Logged the prediction-error-gated default predictive route plus the latest combined and Sprint D benchmark outcomes
 - Team context: Neo's concept locking and Morpheus's convolutional CCCs are now recorded as the companion Sprint E features
+
+
+## Session 2026-06-27T19:30:00Z
+
+**Mission:** Recording production demo delivery
+
+- Rebuilt `demo/app.py` into a four-tab Gradio demo for classification, online learning, continual learning, and architecture exploration
+- Added cached MNIST demo training with synthetic fallback and session-scoped online-learning flows
+- Demo validation passed, including `tests/test_demo.py` and HTTP 200 at `http://127.0.0.1:7860`
+- Team context: Sprint G deployment goals are complete and pushed

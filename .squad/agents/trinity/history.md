@@ -70,3 +70,13 @@
 - Observed real CIFAR-10 results moved to hierarchy 29.0% / 1.000 AUROC and both 30.0% / 1.000
 - Committed `faaa60f`
 - Team context: Neo's hierarchy upgrades simultaneously raised the standalone hierarchy ceiling to 30.0%
+
+
+## Session 2026-06-27T19:30:00Z
+
+**Mission:** Recording publication-figure and package-release delivery
+
+- Created `docs/figures/architecture_diagrams.py` plus five reproducible paper figures and a terminal-review companion
+- Made Bio-ARN editable-install friendly at version `2.0.0` with lazy imports, expanded exports, and updated README guidance
+- Validation covered editable install, import checks, figure generation, and targeted tests
+- Team context: publication readiness and deployment packaging are now aligned for release use

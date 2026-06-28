@@ -2,6 +2,42 @@
 
 ## Active Decisions
 
+### 2026-06-27: Formal benchmark suite now covers MNIST, Fashion-MNIST, and CIFAR-10
+**By:** Neo
+**What:** Added `experiments/formal_benchmarks.py`, a reproducible multi-dataset benchmark suite reporting accuracy, OOD AUROC, energy, committed concepts, locked concepts, fire rate, and wall-clock training time across MNIST, Fashion-MNIST, and CIFAR-10, plus direct Conv CCC CIFAR runs.
+**Why:** Establishes paper-quality benchmarking infrastructure even though this first run still used synthetic MNIST-family data and leaves CIFAR-10 at chance level pending tuning.
+**References:** `experiments/formal_benchmarks.py`, `tests/test_cifar_training.py`, `tests/test_conv_ccc.py`, `tests/test_mnist_accuracy.py`
+
+### 2026-06-27: Paper draft now reflects Sprint E retention gains and predictive framing
+**By:** Morpheus
+**What:** Updated `docs/paper_draft.md` to add concept locking, convolutional CCCs, precision-weighted predictive processing, and the Sprint E result that conv plus locking reduced mean forgetting from 34.7 percent to 20.7 percent.
+**Why:** Keeps the paper narrative aligned with the latest continual-learning evidence without overstating current accuracy.
+**References:** `docs/paper_draft.md`, `tests/test_ccc.py`, `tests/test_conv_ccc.py`
+
+### 2026-06-27: Paper architecture figures are now reproducible from source
+**By:** Trinity
+**What:** Added `docs/figures/architecture_diagrams.py` and a terminal-readable companion so all five paper figures can be regenerated at publication quality.
+**Why:** Ensures the paper's architecture visuals are versioned, reproducible, and consistent across sections.
+**References:** `docs/figures/architecture_diagrams.py`, `docs/figures/architecture_diagrams.txt`, `docs/figures/figure1_full_bioarn_pipeline.png`, `docs/figures/figure2_ccc_internal_architecture.png`, `docs/figures/figure3_precision_weighted_predictive_processing.png`, `docs/figures/figure4_concept_locking_lifecycle.png`, `docs/figures/figure5_energy_comparison.png`
+
+### 2026-06-27: Bio-ARN is packaged for editable pip install as version 2.0.0
+**By:** Trinity
+**What:** Updated packaging metadata, added `bioarn/__version__.py`, expanded top-level exports, and used lazy imports so `pip install -e .` exposes the Bio-ARN 2.0 API cleanly.
+**Why:** Makes the repository installable and import-stable for publication, demo, and downstream use.
+**References:** `pyproject.toml`, `bioarn/__init__.py`, `bioarn/__version__.py`, `bioarn/predictive/__init__.py`, `README.md`
+
+### 2026-06-27: Production Gradio demo now covers classification, online learning, and continual learning
+**By:** Tank
+**What:** Rebuilt `demo/app.py` as a four-tab Gradio experience with cached MNIST training, CCC and OOD diagnostics, session-scoped online learning, and a two-task continual-learning walkthrough.
+**Why:** Gives the project a deployable conference demo surface that stays usable even when dataset downloads fail.
+**References:** `demo/app.py`, `demo/README.md`, `demo/requirements.txt`, `tests/test_demo.py`
+
+### 2026-06-27: Sprint E combined benchmark shows conv locking lowers forgetting but not balanced CIFAR retention
+**By:** Switch
+**What:** On the modest CIFAR-10 and Split-CIFAR-10 benchmark, standard CCC variants tied at 13.0 percent accuracy, conv variants trailed slightly, and `conv_locked` and `conv_all` reduced mean forgetting to 20.7 percent while concentrating retention in the final task.
+**Why:** Records that concept locking and convolution currently help continual-retention metrics more than short-run top-1 accuracy, and that precision tracked pool entropy instead of decaying with familiarity.
+**References:** `experiments/sprint_e_benchmark.py`, `docs/paper_draft.md`
+
 ### 2026-06-27: Phase-gated maturation scheduling stages optional modules during training
 **By:** Neo
 **What:** Added a maturation schedule so hierarchy and curiosity dominate early training, workspace support turns on in phase 2, and predictive plus feedback modules activate in phase 3 with lower learning rates.
@@ -140,12 +176,6 @@
 **Why:** Suggests the main failure mode is class interference across tasks rather than generic inability to retain arbitrary pixel permutations.
 **References:** `experiments/continual_learning.py`, `experiments/continual_learning_mnist.py`
 
-### 2026-06-26: Demo UI now uses capability-focused tabs with graceful optional Gradio handling
-**By:** Trinity
-**What:** The demo keeps the existing digit, text, cross-modal, live-learning, and energy flows while adding dedicated OOD, multimodal binding, CCC recruitment, and architecture views.
-**Why:** Makes the demo easier to explore and keeps Gradio optional until launch time.
-**References:** `demo/app.py`, `demo/models.py`, `demo/visualizations.py`, `tests/test_demo.py`
-
 ### 2026-06-26: VisualHierarchy spatial attention and adaptive competition raised real CIFAR accuracy to 30.0 percent
 **By:** Neo
 **Date:** 2026-06-26
@@ -264,6 +294,12 @@
 **Status:** SUPERSEDED by the later 30.0 percent hierarchy and both results
 **What:** Before the spatial-attention and complementary-routing upgrades, `hierarchy-control` at 2000 training samples was the best-known real-CIFAR configuration at 26.4 percent accuracy.
 **References:** `experiments/cifar_tuning.py`, `experiments/cifar_scaling.py`, `commit eb2ea53`
+
+### 2026-06-26: Demo UI now uses capability-focused tabs with graceful optional Gradio handling
+**By:** Trinity
+**Status:** SUPERSEDED by the 2026-06-27 production Gradio demo decision
+**What:** The demo kept the existing digit, text, cross-modal, live-learning, and energy flows while adding dedicated OOD, multimodal binding, CCC recruitment, and architecture views.
+**References:** `demo/app.py`, `demo/models.py`, `demo/visualizations.py`, `tests/test_demo.py`
 
 ### 2026-06-24: Recovery commit preserved pre-crash work
 **By:** Squad Coordinator

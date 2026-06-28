@@ -59,3 +59,13 @@
 - Logged the severe continual-learning forgetting findings and the later Sprint D retest showing only marginal CIFAR gains with worse MNIST retention
 - Logged the paper-positioning decision that emphasizes efficiency, robustness, and biological plausibility over raw top-1 accuracy
 - Team context: the Sprint E combined benchmark on `experiments/sprint_e_benchmark.py` remains in progress per manifest
+
+
+## Session 2026-06-27T19:30:00Z
+
+**Mission:** Recording completed Sprint E combined benchmark
+
+- Benchmarked standard and convolutional CCC variants on CIFAR-10 and Split-CIFAR-10
+- Standard variants tied at 13.0% CIFAR-10 accuracy, while `conv_locked` and `conv_all` cut mean forgetting to 20.7% by retaining most performance on the final task
+- Precision rose with pool entropy instead of decreasing with familiarity
+- Team context: Morpheus folded these findings into the paper draft and Neo formalized the follow-on benchmark suite

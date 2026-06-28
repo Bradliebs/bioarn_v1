@@ -56,3 +56,13 @@
 - Logged concept locking as the active continual-learning protection path for stable CCCs
 - Logged phase-gated maturation scheduling as the current training-time activation policy for optional modules
 - Team context: Tank's precision weighting and Morpheus's convolutional CCCs complete the core Sprint E feature stack while Switch benchmarks the combined path
+
+
+## Session 2026-06-27T19:30:00Z
+
+**Mission:** Recording Sprint F benchmark-delivery results
+
+- Added `experiments/formal_benchmarks.py` as the publication benchmark harness for MNIST, Fashion-MNIST, and CIFAR-10
+- First end-to-end run reached 59.9% on synthetic MNIST, 31.2% on synthetic Fashion-MNIST, and chance-level CIFAR-10, confirming the suite works while flagging tuning follow-up
+- Targeted benchmark validation passed: 33 tests
+- Team context: Sprint F publication readiness and Sprint G deployment work are complete and pushed

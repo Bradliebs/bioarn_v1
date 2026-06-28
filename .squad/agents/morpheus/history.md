@@ -83,3 +83,13 @@ Recovery commit (d99976c) included sequence memory module, memory config, extend
 - Logged the convolutional CCC path, including the shared convolutional F1 stage and `VisionTrainer` opt-in wiring
 - Preserved the rationale that vision inputs should keep spatial structure before concept matching
 - Team context: Neo's concept locking and Tank's precision weighting are the other merged Sprint E feature deliveries
+
+
+## Session 2026-06-27T19:30:00Z
+
+**Mission:** Recording publication-draft update delivery
+
+- Updated `docs/paper_draft.md` with Sprint E retention results plus new sections on concept locking, precision weighting, and convolutional CCCs
+- Added the Frank et al. (2026) citation and reported the conv-plus-locking forgetting reduction from 34.7% to 20.7%
+- Targeted validation passed: 24 tests
+- Team context: Trinity delivered the figures while Neo and Tank completed the benchmark and demo support around the paper

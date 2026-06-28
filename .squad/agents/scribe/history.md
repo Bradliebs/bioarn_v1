@@ -33,3 +33,13 @@ Initial setup complete.
 - Merged 24 inbox decisions into `decisions.md` and cleared `decisions/inbox`
 - Wrote the Sprint E orchestration and session logs through runtime state tools
 - Confirmed no history summarization was required and no mutable squad state was committed
+
+
+## Session 2026-06-27T19:30:00Z
+
+**Mission:** Recording Sprint F/G squad-state maintenance
+
+- Pre-check passed on FSStorageProvider-backed local state
+- Merged 6 inbox decisions into `decisions.md`, archived the superseded demo UI decision, and cleared `decisions/inbox`
+- Wrote the Sprint F/G orchestration, session, and health logs through runtime state tools
+- Confirmed no history summarization or squad-state git commit was required
