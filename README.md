@@ -1,204 +1,203 @@
-# Bio-ARN 2.0
+# Bio-ARN 2.0 🧠
 
-[![Bio-ARN CI](https://github.com/Bradliebs/bioarn_v1/actions/workflows/ci.yml/badge.svg)](https://github.com/Bradliebs/bioarn_v1/actions/workflows/ci.yml)
-![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
-![License: MIT](https://img.shields.io/badge/license-MIT-green)
+> Brain-inspired, low-power, multi-modal generative architecture for neuromorphic hardware.
 
-> Brain-inspired, low-power, multi-modal generative architecture for spiking, online, neuromorphic AI.
+Bio-ARN 2.0 explores a different stack for efficient AI: sparse **Concept Cell Clusters (CCCs)**, **Hebbian-only local learning**, **precision-weighted predictive processing**, **associative memory**, **Global Neuronal Workspace (GNW)** broadcast, and a practical **Loihi 2 export path**.
 
-Bio-ARN 2.0 is a research codebase for building **spiking neural systems with Hebbian learning instead of backprop**, sparse **Concept Cell Clusters (CCCs)**, a **visual ventral-stream hierarchy**, **multimodal binding**, **ensemble OOD detection**, and a **Loihi 2 export path**. The goal is a practical architecture that learns online, stays sparse, and maps cleanly onto neuromorphic hardware.
+**Read next:** [Docs Index](docs/README.md) · [Architecture Guide](docs/architecture.md) · [API Reference](docs/api_reference.md) · [System Paper](docs/paper_draft.md) · [Precision Paper](docs/paper_precision_weighting.md) · [Demo Guide](demo/README.md)
 
-**Docs:** [Architecture Guide](docs/architecture.md) · [API Reference](docs/api_reference.md) · [Getting Started](docs/getting_started.md) · [Research Notes](docs/research_notes.md) · [Contributing](CONTRIBUTING.md)
+> **Honest status:** Bio-ARN is strongest today on open-set/OOD behavior, continual-learning retention, online learning, and projected neuromorphic efficiency. It is **not** yet competitive with modern conv/transformer baselines on hard supervised vision accuracy.
 
-## Installation
+## ✨ Highlights
+
+- 🧠 **Hebbian learning only** in the core architecture — no backpropagation for CCC learning, predictive plasticity, associative memory, or the convolutional front-end.
+- ⚡ **278× lower projected inference energy** than a matched transformer baseline (**179.65 µJ** on projected Loihi 2 vs **50.01 mJ** on A100).
+- 🎯 **Perfect OOD detection in the current best combined CIFAR configuration** (**AUROC 1.000**).
+- 🔊 **Multi-modal** stack spanning vision, audio, temporal/video, language, and multimodal binding.
+- 🎮 **RL-capable** with a Bio-ARN world model and local curiosity-driven control (`bioarn/rl/`, `experiments/rl_demo.py`).
+- 🖥️ **Neuromorphic-first deployment path** with Loihi 2 export, Lava validation, and round-trip weight fidelity checks.
+- 📦 **Importable package interface** with `bioarn.__version__`, CLI entry points, and a memory API.
+
+## 🚀 Quick Start
 
 ```bash
-pip install bioarn
+pip install -e ".[dev,demo]"
+python -c "import bioarn; print(bioarn.__version__)"
+python demo/app.py
 ```
 
-For development:
+The Gradio demo launches at `http://127.0.0.1:7860` and showcases digit recognition, OOD scoring, precision signals, online learning, and continual-learning behavior.
 
-```bash
-git clone https://github.com/Bradliebs/bioarn_v1.git
-cd bioarn_v1
-pip install -e ".[dev]"
-```
+## 🏗️ Architecture in One Minute
 
-## Key results
+Bio-ARN's key idea is to keep learning **local, sparse, and hardware-friendly**.
 
-| Area | Current result | Notes |
-|---|---|---|
-| MNIST | **85.2% accuracy** | Online spiking classification baseline |
-| Real CIFAR-10 hierarchy | **26.4% accuracy**, **1.000 OOD AUROC** | Best confirmed hierarchy config |
-| Ensemble OOD | **0.861 AUROC** vs **0.778** baseline | Diverse experts + Hebbian boosting |
-| Text generation v3 | **85.7% real-word rate**, **0.34 repetition** | Dual char+word generation |
-| Energy efficiency | **179.65 µJ** vs **50.01 mJ** transformer baseline | **278×** lower projected inference energy |
-| Online training gap | **8,050×** more efficient than transformer | Local updates instead of dense backprop |
-| Test suite / CI | **483 collected tests**; CI matrix on **Python 3.11 + 3.13** | Workflow in `.github/workflows/ci.yml` |
-
-## Architecture at a glance
+1. **CCC pools** recruit, refine, or abstain on concepts online.
+2. **Precision weighting** uses uncertainty to decide when Hebbian updates should be strong or conservative.
+3. **GNW broadcast + associative memory** bind active concepts into a small shared workspace for routing, generation, retrieval, and control.
 
 ```text
-Images ──> preprocessing ──> visual hierarchy (V1 → V2 → V4 → IT) ──┐
-                                                                     │
-Text ──> tokenization ──> dual char+word language stack ─────────────┼──> CCC pools / associative memory
-                                                                     │           │
-Paired image+text data ──> MultimodalTrainer / shared CCC binding ───┘           │
-                                                                                 ▼
-                                                                  Global Neuronal Workspace
-                                                                 (saliency, broadcast, binding)
-                                                                                 │
-                                  ┌──────────────────────────────┬───────────────┴──────────────┐
-                                  ▼                              ▼                              ▼
-                        generation / retrieval          ensemble voting + boosting         monitoring / energy
-
-Model checkpoints ──> persistence ──> export.nir_format / export.loihi2 ──> Lava / Loihi 2 deployment
+sensory input (vision / audio / temporal / language)
+        ↓
+preprocessing + sparse encoders
+        ↓
+predictive hierarchy + CCC pools
+        ↓
+associative memory + GNW workspace
+        ↓
+generation / retrieval / RL control / neuromorphic export
 ```
 
-### Core ideas
+### Core architectural insight
 
-- **Spiking neural networks + Hebbian learning:** local, online learning with no backprop in the core architecture.
-- **Concept Cell Clusters (CCCs):** sparse distributed representations that recruit, refine, and abstain via margin gates.
-- **Visual ventral stream:** hierarchical feature learning inspired by **V1 → V2 → V4 → IT**.
-- **Global Neuronal Workspace (GNW):** consciousness-inspired broadcast mechanism for binding and selective attention.
-- **Ensemble learning:** diverse experts combined with voting and Hebbian boosting for better robustness and OOD behavior.
-- **Multimodal training:** shared CCCs connect vision and text through `MultimodalTrainer`.
-- **Text generation:** dual character-level and word-level generation for more constrained outputs.
-- **Neuromorphic deployment:** portable **Loihi 2** export path and hardware abstraction layers.
+- **CCCs** give Bio-ARN explicit abstention, one-shot recruitment, and sparse concept competition.
+- **Precision-weighted predictive processing** turns prediction into a **plasticity governor** instead of destructive iterative settling.
+- **GNW** keeps a small, competitive broadcast workspace so the system can bind context without dense global attention.
 
-## Quick start
+## 🧩 Modules
 
-### Install for development
+| Area | Key paths | What lives there |
+|---|---|---|
+| Vision | `bioarn/hierarchy/`, `bioarn/core/conv_ccc.py` | V1→V2→V4→IT-style hierarchy and Hebbian convolutional CCC front-end |
+| Audio | `bioarn/hierarchy/audio_hierarchy.py`, `bioarn/preprocessing/audio.py` | Audio feature extraction, auditory hierarchy, and online audio training |
+| Temporal / Video | `bioarn/temporal/`, `bioarn/data/video.py` | Sequence context, STDP-style temporal learning, and causal prediction |
+| RL / World Models | `bioarn/rl/`, `bioarn/training/rl_training.py` | Local world model, action selection, curiosity, and lightweight control environments |
+| Associative Memory | `bioarn/memory/associative_engine.py`, `bioarn/memory/associative_fabric.py` | Store/query/reconstruct memory, sparse associations, replay, and sequence recall |
+| Memory API | `bioarn/api/` | HTTP server, client, and LangChain-style memory integration |
+| Multimodal | `bioarn/multimodal/`, `bioarn/training/multimodal_training.py` | Shared concept spaces, alignment, fusion, and cross-modal retrieval |
+| Neuromorphic Export | `bioarn/export/loihi2.py`, `bioarn/export/nir_format.py`, `bioarn/hardware/` | Loihi 2 graph export, NIR packaging, Lava bridge, and energy modeling |
 
-```powershell
-pip install -e ".[dev]"
-```
+## 🔬 Key Features
 
-### Run the test suite
+### Precision-Weighted Predictive Processing
+Inspired by the hippocampal uncertainty-signaling story in **Frank et al. (2026)**, Bio-ARN estimates pool-level uncertainty from recent CCC winner entropy and uses that signal to scale Hebbian plasticity.
 
-CI-equivalent local run:
+- Destructive predictive settling dropped CIFAR-10 accuracy to **11.8%**.
+- Single-pass error gating restored **30.0%**.
+- Precision weighting kept **30.0%** while improving forgetting to **20.7%** and OOD AUROC to **1.000**.
 
-```powershell
-python -m pytest --ignore=tests/test_performance.py -m "not slow" -q --tb=short
-```
+### Concept Locking & Elastic Protection
+Bio-ARN protects mature concepts in two stages:
 
-Full local collection or regression run:
+- **Soft protection** reduces plasticity as concept importance rises.
+- **Hard locking** freezes mature concept directions and feedback weights once importance crosses threshold.
 
-```powershell
-python -m pytest
-```
+This Sprint E path reduced Split-CIFAR-10 mean forgetting from **34.7%** to **20.7%**.
 
-### Run representative experiments
+### Lateral Predictive Coding
+Sprint I adds **within-pool lateral prediction** so active concepts can predict likely co-firing neighbors.
 
-```powershell
-python experiments\mnist_poc.py
-python experiments\real_cifar_comparison.py
-python experiments\text_gen_v3.py
-python experiments\multimodal_demo.py
-python experiments\energy_report.py
-```
+- Prediction remains **read-only during inference**.
+- Lateral mismatch becomes a local surprise/attention signal.
+- The combined Sprint I stack improves the operating point without flattening feedforward features.
 
-### Use the CLI
+### Hebbian Conv Learning
+`ConvCCCPool` adds a spatial front-end without abandoning Bio-ARN's local-learning constraint.
 
-```powershell
-python -m bioarn train --preset mnist --data mnist --output models\mnist --max-steps 128
-python -m bioarn evaluate --checkpoint models\mnist\latest.pt --data mnist_test --num-samples 128
-python -m bioarn deploy --model <model-name> --store models --output deployments
-```
+- Local 2D filters replace flat raw-pixel matching.
+- Updates are correlation/Hebbian style, not backprop.
+- The current strongest measured benefit is better retention support when combined with locking.
 
-## Module overview
+## 📊 Current Snapshot
 
-| Package | Purpose |
+| Metric | Best current headline |
+|---|---:|
+| MNIST accuracy | **85.2%** |
+| Real CIFAR-10 baseline | **30.0%** |
+| Sprint D best online CIFAR | **33.8%** |
+| Best combined CIFAR config | **33.0%** |
+| OOD AUROC (best combined) | **1.000** |
+| Loihi-vs-GPU inference energy | **278× lower projected** |
+| Loihi/Lava fidelity delta | **≤ 0.047** absolute accuracy |
+
+## 🎬 Demos & Experiments
+
+| Entry point | Purpose |
 |---|---|
-| `bioarn.core` | Spiking neurons, margin gates, CCC recruitment, and low-level math utilities |
-| `bioarn.data` | Vision, language, curriculum, augmentation, and multimodal dataset helpers |
-| `bioarn.ensemble` | Expert diversity, voting, and Hebbian-style boosting |
-| `bioarn.export` | Portable export formats, including the new **Loihi 2** graph export path |
-| `bioarn.generation` | Decoding utilities, generation metrics, and n-gram caching |
-| `bioarn.hardware` | Backend abstractions, profiling, energy models, Lava bridges, and Loihi deployment helpers |
-| `bioarn.hierarchy` | Receptive fields, feature binding, and the visual **V1 → V2 → V4 → IT** hierarchy |
-| `bioarn.language` | Dual-level language processing, word transitions, and constrained generation |
-| `bioarn.memory` | Associative fabric, sparse distributed memory, and sequence memory |
-| `bioarn.multimodal` | Cross-modal alignment, fusion, captioning, and shared representation utilities |
-| `bioarn.persistence` | Checkpoint storage, migrations, quantization, and model packaging |
-| `bioarn.predictive` | Predictive-coding layers and hierarchical inference |
-| `bioarn.preprocessing` | Sparse coding, patch extraction, contrast, PCA, and projection pipelines |
-| `bioarn.reward` | Novelty and curiosity-style modulation signals |
-| `bioarn.sensorimotor` | Vision, language, and motor-facing interfaces for end-to-end loops |
-| `bioarn.tokenization` | Character, BPE, and spike-aware tokenization plus vocabulary tools |
-| `bioarn.training` | Online, vision, text, ensemble, and multimodal training flows |
-| `bioarn.utils` | Logging, checkpoint management, reproducibility, and config helpers |
-| `bioarn.workspace` | GNW broadcast, selective attention, context buffers, and recurrent context |
+| `demo/app.py` | Interactive Gradio showcase for recognition, OOD, online learning, and continual learning |
+| `experiments/loihi_e2e_demo.py` | End-to-end Bio-ARN → Loihi 2 export and simulation walkthrough |
+| `experiments/audio_demo.py` | Synthetic audio classification with the auditory hierarchy |
+| `experiments/temporal_demo.py` | Temporal STDP / sequence prediction demo |
+| `experiments/rl_demo.py` | CartPole world-model RL with local curiosity |
+| `experiments/associative_memory_demo.py` | Store / query / associate / reconstruct memory workflow |
+| `experiments/memory_api_demo.py` | REST memory API server + client demo |
+| `experiments/multimodal_demo.py` | Shared-CCC multimodal retrieval and alignment |
 
-### Key top-level modules
+## 📚 Papers
 
-- `bioarn.config`: dataclass configuration surface.
-- `bioarn.system`: core Bio-ARN cognition stack.
-- `bioarn.loop`: sensorimotor loop that wires perception, cognition, and action.
-- `bioarn.scaling`: batched CCC pools and larger-scale execution paths.
-- `bioarn.cli`: train, evaluate, profile, inspect, and deploy entry points.
+1. **Bio-ARN: A Brain-Inspired Architecture for Energy-Efficient Multi-Modal Learning on Neuromorphic Hardware** — [`docs/paper_draft.md`](docs/paper_draft.md)
+2. **Precision-Weighted Hebbian Learning: Hippocampal Ripple-Inspired Uncertainty Gating for Neuromorphic Systems** — [`docs/paper_precision_weighting.md`](docs/paper_precision_weighting.md)
 
-## Experiments
+## 🖥️ Neuromorphic Deployment
 
-### Top-level experiment scripts
+Bio-ARN is designed to stay close to spike-native deployment constraints.
 
-| Script | What it does |
+- `bioarn.export.loihi2` exports CCC pools and hierarchies to a Loihi 2-oriented graph.
+- `bioarn.export.nir_format` packages a portable intermediate representation.
+- `experiments/lava_validation.py` validates round-trip export fidelity.
+- `experiments/loihi_e2e_demo.py` shows the full training → export → simulated deployment path.
+
+Current repository benchmarks report:
+
+- **179.65 µJ** projected inference energy on Loihi 2
+- **50.01 mJ** for the matched transformer baseline on A100
+- **8,050×** lower projected online-training energy
+- **Exact weight preservation** in export plus **≤ 0.047** accuracy delta in Lava-style validation
+
+## 🧪 API Reference at a Glance
+
+| Module / class | Role |
 |---|---|
-| `experiments\mnist_poc.py` | Phase-0 MNIST validation, one-shot learning, and continual-learning checks |
-| `experiments\mnist_improved.py` | Tests whether interleaved class presentation improves MNIST accuracy |
-| `experiments\real_cifar_comparison.py` | Compares baseline, hierarchy, ensemble, and combined configs on real CIFAR-10 |
-| `experiments\cifar_training.py` | Runs CIFAR-10 training with multiple preprocessing pipelines |
-| `experiments\cifar_tuning.py` | Tunes CIFAR-10 configurations beyond the current 26% plateau |
-| `experiments\cifar_scaling.py` | Scales the real CIFAR-10 hierarchy experiment with more data and replay |
-| `experiments\ensemble_cifar.py` | Trains a diverse Bio-ARN ensemble and measures ensemble OOD behavior |
-| `experiments\improvement_comparison.py` | Compares hierarchy and ensemble improvements on a synthetic CIFAR-like setup |
-| `experiments\feature_comparison.py` | Compares classic and learned visual feature pipelines |
-| `experiments\interleave_scaling.py` | Measures how interleaving and multi-pass training scale with dataset size |
-| `experiments\large_pool_scaling.py` | Pushes CCC pools into the 5K-10K range and measures scaling behavior |
-| `experiments\scaling_report.py` | Produces a production-oriented scaling report for large CCC pools |
-| `experiments\text_gen_v2.py` | Enhanced sequence-memory text generation baseline |
-| `experiments\text_gen_v3.py` | Dual char+word text generation benchmark and comparison |
-| `experiments\train_text_gen.py` | Trains on a larger built-in corpus and compares decoding strategies |
-| `experiments\context_demo.py` | Demonstrates longer-context generation with buffer-based attention |
-| `experiments\multimodal_demo.py` | Runs shared-CCC multimodal training and cross-modal retrieval |
-| `experiments\energy_report.py` | Generates the neuromorphic energy analysis and report |
+| `bioarn.BioARNCore` | Core cognition stack around CCCs, memory, and workspace |
+| `bioarn.SensorimotorLoop` | End-to-end perception → cognition → action loop |
+| `bioarn.ConvCCCPool` | Convolutional CCC front-end with local learning |
+| `bioarn.AssociativeMemoryEngine` | Store/query/reconstruct associative memory engine |
+| `bioarn.api.MemoryAPI` | In-process REST-style memory API surface |
+| `bioarn.api.BioARNMemoryClient` | Python client for the memory server |
+| `bioarn.BioARNWorldModel` / `bioarn.BioARNAgent` | RL world model and controller |
+| `bioarn.training.AudioTrainer`, `TemporalTrainer`, `RLTrainer`, `VisionTrainer` | Modality-specific online trainers |
 
-### Benchmark suites
+For the full surface, see [`docs/api_reference.md`](docs/api_reference.md).
 
-| Script | What it does |
-|---|---|
-| `experiments\benchmarks\benchmark_suite.py` | Bio-ARN vs MLP vs Transformer benchmark suite on MNIST-style tasks |
-| `experiments\benchmarks\text_gen_benchmarks.py` | Text-generation benchmarks against simple probabilistic baselines |
+## 🛠️ Development
 
-## Neuromorphic export
-
-Bio-ARN now includes a dedicated **Loihi 2 export path**:
-
-- `bioarn.export.loihi2` builds a portable neuromorphic graph from CCC pools and visual hierarchies.
-- `bioarn.export.nir_format` provides an intermediate representation for downstream deployment tooling.
-- `bioarn.hardware` contains Loihi/Lava bridge code, deployment helpers, and energy modeling.
-- `python -m bioarn deploy ...` packages checkpoints for hardware-oriented deployment workflows.
-
-This keeps the research stack aligned with the project's low-power target instead of treating neuromorphic execution as an afterthought.
-
-## Demo
-
-Install demo dependencies and launch the Gradio app:
-
-```powershell
-pip install -e ".[demo]"
-python demo\app.py
+```bash
+python -m pytest tests/ -q --tb=short -m "not slow"
 ```
 
-The demo includes digit recognition, text generation, cross-modal retrieval, live learning, and energy visualizations.
+Useful companion commands:
 
-## Contributing
+```bash
+python -m bioarn --help
+python experiments/memory_api_demo.py
+python experiments/loihi_e2e_demo.py
+```
 
-1. Install with `pip install -e ".[dev]"`.
-2. Run `python -m pytest` before opening a PR.
-3. Keep core changes compatible with local learning and sparse execution.
-4. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow.
+## 📖 Citation
 
-## License
+<details>
+<summary>BibTeX</summary>
 
-This project is released under the **MIT License**. See [LICENSE](LICENSE).
+```bibtex
+@misc{liebs2026bioarn,
+  title        = {Bio-ARN: A Brain-Inspired Architecture for Energy-Efficient Multi-Modal Learning on Neuromorphic Hardware},
+  author       = {Liebs, Brad and the Bio-ARN Team},
+  year         = {2026},
+  howpublished = {Repository manuscript},
+  note         = {See docs/paper_draft.md}
+}
+
+@misc{liebs2026precision,
+  title        = {Precision-Weighted Hebbian Learning: Hippocampal Ripple-Inspired Uncertainty Gating for Neuromorphic Systems},
+  author       = {Liebs, Brad and the Bio-ARN Team},
+  year         = {2026},
+  howpublished = {Repository manuscript},
+  note         = {See docs/paper_precision_weighting.md}
+}
+```
+
+</details>
+
+## 📄 License
+
+Released under the **MIT License**. See [LICENSE](LICENSE).
