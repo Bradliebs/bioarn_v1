@@ -159,6 +159,7 @@ class ConvCCCConfig:
     slow_lr: float = 0.01
     feedback_lr: float = 0.01
     conv_hebbian_lr: float = 0.0025
+    hebbian_batch_size: int = 32
     conv_competitive_k: int = 8
     spatial_top_k: int = 4
     conv_weight_norm: float = 1.0
@@ -194,6 +195,7 @@ class ConvCCCConfig:
             self.concept_dim = int(self.concept_dim)
         self.f1_top_k = int(max(1, self.f1_top_k))
         self.conv_hebbian_lr = float(max(0.0, self.conv_hebbian_lr))
+        self.hebbian_batch_size = int(max(1, self.hebbian_batch_size))
         self.conv_competitive_k = int(max(1, self.conv_competitive_k))
         self.spatial_top_k = int(max(1, self.spatial_top_k))
         self.conv_weight_norm = float(max(1e-6, self.conv_weight_norm))
@@ -425,6 +427,127 @@ class TemporalTrainConfig:
         else:
             self.temporal.context_window = int(max(1, self.temporal.context_window))
             self.temporal.concept_dim = int(max(1, self.concept_dim))
+
+
+@dataclass
+class MultimodalFusionConfig:
+    """Configuration for GNW-mediated multimodal fusion."""
+
+    vision_enabled: bool = True
+    audio_enabled: bool = True
+    temporal_enabled: bool = True
+    concept_dim: int = 256
+    vision_pool_size: int = 200
+    audio_pool_size: int = 100
+    workspace_size: int = 16
+    cross_modal_weight: float = 0.5
+    agreement_threshold: float = 0.6
+    margin_threshold: float = 0.35
+    learning_rate: float = 0.05
+    audio: AudioConfig = field(default_factory=AudioConfig)
+    audio_hierarchy: AudioHierarchyConfig = field(default_factory=AudioHierarchyConfig)
+    temporal: TemporalConfig = field(default_factory=TemporalConfig)
+    workspace: GNWConfig | None = None
+    precision: PrecisionConfig | None = None
+    sdm: SDMConfig | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.audio, Mapping):
+            self.audio = AudioConfig(**self.audio)
+        if isinstance(self.audio_hierarchy, Mapping):
+            self.audio_hierarchy = AudioHierarchyConfig(**self.audio_hierarchy)
+        if isinstance(self.temporal, Mapping):
+            self.temporal = TemporalConfig(**self.temporal)
+        if isinstance(self.workspace, Mapping):
+            self.workspace = GNWConfig(**self.workspace)
+        if isinstance(self.precision, Mapping):
+            self.precision = PrecisionConfig(**self.precision)
+        if isinstance(self.sdm, Mapping):
+            self.sdm = SDMConfig(**self.sdm)
+
+        self.vision_enabled = bool(self.vision_enabled)
+        self.audio_enabled = bool(self.audio_enabled)
+        self.temporal_enabled = bool(self.temporal_enabled)
+        self.concept_dim = int(max(1, self.concept_dim))
+        self.vision_pool_size = int(max(1, self.vision_pool_size))
+        self.audio_pool_size = int(max(1, self.audio_pool_size))
+        self.workspace_size = int(max(1, self.workspace_size))
+        self.cross_modal_weight = float(min(max(self.cross_modal_weight, 0.0), 1.0))
+        self.agreement_threshold = float(min(max(self.agreement_threshold, 0.0), 1.0))
+        self.margin_threshold = float(min(max(self.margin_threshold, 0.0), 1.0))
+        self.learning_rate = float(max(0.0, self.learning_rate))
+
+        self.temporal.concept_dim = int(self.concept_dim)
+        self.audio_hierarchy.n_mels = int(self.audio.n_mels)
+
+        if self.workspace is None:
+            self.workspace = GNWConfig(
+                capacity=self.workspace_size,
+                concept_dim=self.concept_dim,
+            )
+        else:
+            self.workspace.capacity = int(self.workspace_size)
+            self.workspace.concept_dim = int(self.concept_dim)
+
+        precision_pool = max(
+            8,
+            self.vision_pool_size + self.audio_pool_size + max(1, self.concept_dim // 8),
+        )
+        if self.precision is None:
+            self.precision = PrecisionConfig(
+                enabled=True,
+                pool_size=precision_pool,
+                entropy_window=64,
+                precision_alpha=6.0,
+                precision_threshold=0.4,
+                min_precision=0.15,
+                max_precision=1.0,
+                lateral_error_weight=1.0,
+                hierarchy_error_weight=0.25,
+                external_signal_decay=0.7,
+                surprise_gain=1.0,
+            )
+        else:
+            self.precision.enabled = True
+            self.precision.pool_size = int(precision_pool)
+
+        if self.sdm is None:
+            self.sdm = SDMConfig(
+                address_dim=max(256, self.concept_dim * 4),
+                hamming_radius=max(16, self.concept_dim // 4),
+                num_hard_locations=max(128, self.concept_dim * 4),
+                data_dim=self.concept_dim,
+                decay_rate=0.999,
+                stdp_window=max(4, self.temporal.context_window),
+            )
+        else:
+            self.sdm.data_dim = int(self.concept_dim)
+            self.sdm.stdp_window = int(max(1, self.temporal.context_window))
+
+
+@dataclass
+class MultimodalTrainConfig:
+    """Streaming training configuration for multimodal fusion."""
+
+    fusion: MultimodalFusionConfig = field(default_factory=MultimodalFusionConfig)
+    num_samples: int = 96
+    num_passes: int = 2
+    num_classes: int = 4
+    vision_size: int = 16
+    shuffle: bool = True
+    seed: int = 0
+    learning_rate_multiplier: float = 1.0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.fusion, Mapping):
+            self.fusion = MultimodalFusionConfig(**self.fusion)
+        self.num_samples = int(max(1, self.num_samples))
+        self.num_passes = int(max(1, self.num_passes))
+        self.num_classes = int(max(2, self.num_classes))
+        self.vision_size = int(max(8, self.vision_size))
+        self.shuffle = bool(self.shuffle)
+        self.seed = int(self.seed)
+        self.learning_rate_multiplier = float(max(0.0, self.learning_rate_multiplier))
 
 
 @dataclass

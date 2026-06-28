@@ -1,308 +1,200 @@
-"""Interleaved multimodal training on a shared CCC pool."""
+"""Streaming training utilities for cross-modal fusion."""
 
 from __future__ import annotations
 
+import copy
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Any, Iterable, Iterator
 
 import torch
-from torch import Tensor
+import torch.nn.functional as F
 
-from bioarn.multimodal import ModalityAligner, MultimodalConfig, MultimodalFusion
+from bioarn.config import MultimodalTrainConfig
+from bioarn.data.multimodal import SyntheticMultimodalStream
+from bioarn.multimodal.fusion import MultimodalFusionEngine, MultimodalInput
 
 
 @dataclass(frozen=True)
 class MultimodalExample:
-    """Paired multimodal supervision for a single concept."""
+    """Lightweight training example compatible with ``MultimodalInput``."""
 
-    vision: Tensor
-    text: str | Tensor | Iterable[int]
+    vision: torch.Tensor | None = None
+    audio: torch.Tensor | None = None
+    temporal_context: list[int] | None = None
     label: str | None = None
+    metadata: dict[str, Any] | None = None
+
+    def to_input(self) -> MultimodalInput:
+        metadata = dict(self.metadata or {})
+        if self.label is not None:
+            metadata.setdefault("label", self.label)
+        return MultimodalInput(
+            vision=None if self.vision is None else self.vision.detach().clone(),
+            audio=None if self.audio is None else self.audio.detach().clone(),
+            temporal_context=None if self.temporal_context is None else list(self.temporal_context),
+            metadata=metadata,
+        )
 
 
 @dataclass
 class MultimodalTrainingResult:
-    """Summary metrics for multimodal training or evaluation."""
+    """Compact training summary returned by ``train_online``."""
 
-    num_pairs: int
-    num_steps: int
-    epochs: int
-    committed_cccs: int
-    shared_cccs: int
-    concept_sharing_ratio: float
-    mean_association_strength: float
-    cross_modal_retrieval_accuracy: float
-    mean_reciprocal_rank: float
-    converged_pairs: int
-    modality_sequence: tuple[str, ...] = field(default_factory=tuple)
+    num_samples: int
+    num_passes: int
+    mean_agreement: float
+    mean_confidence: float
+    label_consistency: float
+    precision: float
+    num_associations: int
+    winner_histogram: dict[str, int] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "num_samples": int(self.num_samples),
+            "num_passes": int(self.num_passes),
+            "mean_agreement": float(self.mean_agreement),
+            "mean_confidence": float(self.mean_confidence),
+            "label_consistency": float(self.label_consistency),
+            "precision": float(self.precision),
+            "num_associations": int(self.num_associations),
+            "winner_histogram": dict(self.winner_histogram),
+        }
 
 
-@dataclass(frozen=True)
-class _StepObservation:
-    modality: str
-    ccc_id: int
-    confidence: float
+def _iter_inputs(
+    stream: Iterable[MultimodalInput | MultimodalExample] | object,
+) -> Iterator[MultimodalInput]:
+    if hasattr(stream, "stream"):
+        yield from _iter_inputs(stream.stream())  # type: ignore[misc]
+        return
+    for item in stream:  # type: ignore[operator]
+        if isinstance(item, MultimodalInput):
+            yield item
+        elif isinstance(item, MultimodalExample):
+            yield item.to_input()
+        else:
+            raise ValueError("Multimodal training expects MultimodalInput or MultimodalExample items.")
 
 
 class MultimodalTrainer:
-    """Train shared visual and text concepts by alternating paired samples."""
+    """Train the fusion engine on paired multimodal samples."""
 
-    def __init__(
-        self,
-        config: MultimodalConfig | None = None,
-        fusion: MultimodalFusion | None = None,
-    ) -> None:
-        self.config = config or MultimodalConfig()
-        self.fusion = fusion or MultimodalFusion(self.config)
-        self.aligner = ModalityAligner(self.fusion, self.config)
-        self.shared_label_to_ccc: dict[str, int] = {}
-
-    def train(
-        self,
-        examples: Iterable[MultimodalExample | tuple[Tensor, str | Tensor | Iterable[int]] | tuple[Tensor, str | Tensor | Iterable[int], str]],
-        *,
-        epochs: int = 1,
-        start_modality: str = "vision",
-    ) -> MultimodalTrainingResult:
-        dataset = self._coerce_examples(examples)
-        if not dataset:
-            return self._build_result([], epochs=0, modality_sequence=(), converged_pairs=0)
-
-        first_modality = self._canonical_modality(start_modality)
-        modality_sequence: list[str] = []
-        converged_pairs = 0
-
-        for _ in range(max(1, int(epochs))):
-            for example in dataset:
-                if first_modality == "vision":
-                    first = self._process_vision(example)
-                    second = self._process_text(example, anchor_ccc_id=first.ccc_id)
-                    modality_sequence.extend(("vision", "text"))
-                else:
-                    first = self._process_text(example)
-                    second = self._process_vision(example, anchor_ccc_id=first.ccc_id)
-                    modality_sequence.extend(("text", "vision"))
-
-                vision_step, text_step = (
-                    (first, second) if first.modality == "vision" else (second, first)
-                )
-                self._bind_pair(vision_step, text_step)
-                converged_pairs += int(vision_step.ccc_id == text_step.ccc_id)
-
-        return self._build_result(
-            dataset,
-            epochs=max(1, int(epochs)),
-            modality_sequence=tuple(modality_sequence),
-            converged_pairs=converged_pairs,
-        )
-
-    def evaluate(
-        self,
-        examples: Iterable[MultimodalExample | tuple[Tensor, str | Tensor | Iterable[int]] | tuple[Tensor, str | Tensor | Iterable[int], str]],
-    ) -> MultimodalTrainingResult:
-        dataset = self._coerce_examples(examples)
-        return self._build_result(dataset, epochs=0, modality_sequence=(), converged_pairs=0)
+    def __init__(self, config: MultimodalTrainConfig):
+        self.config = copy.deepcopy(config)
+        self.engine = MultimodalFusionEngine(self.config.fusion)
+        self._label_prototypes: defaultdict[str, dict[str, torch.Tensor]] = defaultdict(dict)
+        self._label_counts: Counter[tuple[str, str]] = Counter()
 
     @staticmethod
-    def _canonical_modality(modality: str) -> str:
-        lowered = modality.strip().lower()
-        if lowered in {"vision", "visual", "image"}:
-            return "vision"
-        if lowered in {"text", "language", "linguistic"}:
-            return "text"
-        raise ValueError(f"Unsupported modality: {modality}")
+    def _normalize(vector: torch.Tensor) -> torch.Tensor:
+        flattened = vector.detach().reshape(-1).to(torch.float32)
+        if float(flattened.norm().item()) <= 1e-8:
+            return torch.zeros_like(flattened)
+        return F.normalize(flattened.unsqueeze(0), dim=1).squeeze(0)
 
-    def _coerce_examples(
-        self,
-        examples: Iterable[MultimodalExample | tuple[Tensor, str | Tensor | Iterable[int]] | tuple[Tensor, str | Tensor | Iterable[int], str]],
-    ) -> list[MultimodalExample]:
-        dataset: list[MultimodalExample] = []
-        for item in examples:
-            if isinstance(item, MultimodalExample):
-                dataset.append(item)
-                continue
-            if len(item) == 2:
-                vision, text = item
-                label = text.strip() if isinstance(text, str) else None
-                dataset.append(MultimodalExample(vision=vision, text=text, label=label))
-                continue
-            if len(item) == 3:
-                vision, text, label = item
-                dataset.append(
-                    MultimodalExample(
-                        vision=vision,
-                        text=text,
-                        label=None if label is None else str(label).strip(),
-                    )
-                )
-                continue
-            raise ValueError("Each multimodal example must contain (vision, text) or (vision, text, label).")
-        return dataset
-
-    def _label_for(self, example: MultimodalExample) -> str | None:
-        if example.label is not None and example.label.strip():
-            return example.label.strip()
-        if isinstance(example.text, str) and example.text.strip():
-            return example.text.strip()
-        return None
-
-    def _recruit_new_ccc(
-        self,
-        *,
-        modality: str,
-        feature: Tensor,
-        label: str | None,
-        visual_input: Tensor | None = None,
-    ) -> _StepObservation:
-        ccc_id, confidence = self.fusion._recruit_ccc(feature, modality, label)
-        if modality == "vision" and visual_input is not None:
-            self.fusion._register_visual_pattern(ccc_id, visual_input)
-        if label is not None:
-            self.shared_label_to_ccc[label] = int(ccc_id)
-        return _StepObservation(modality=modality, ccc_id=int(ccc_id), confidence=float(confidence))
-
-    def _attach_to_ccc(
-        self,
-        ccc_id: int,
-        *,
-        modality: str,
-        feature: Tensor,
-        label: str | None,
-        visual_input: Tensor | None = None,
-    ) -> _StepObservation:
-        existing = self.fusion.feature_prototypes.get((int(ccc_id), modality))
-        confidence = self.fusion._cosine(feature, existing) if existing is not None else 1.0
-        self.fusion.ccc_modalities[int(ccc_id)].add(modality)
-        self.fusion._register_feature(int(ccc_id), modality, feature)
-        if modality == "vision" and visual_input is not None:
-            self.fusion._register_visual_pattern(int(ccc_id), visual_input)
-        self.fusion._register_label(int(ccc_id), modality, label)
-        if label is not None:
-            self.shared_label_to_ccc[label] = int(ccc_id)
-        return _StepObservation(modality=modality, ccc_id=int(ccc_id), confidence=float(confidence))
-
-    def _process_vision(
-        self,
-        example: MultimodalExample,
-        *,
-        anchor_ccc_id: int | None = None,
-    ) -> _StepObservation:
-        label = self._label_for(example)
-        feature = self.fusion._encode_visual(example.vision)
-        if anchor_ccc_id is not None:
-            return self._attach_to_ccc(
-                anchor_ccc_id,
-                modality="vision",
-                feature=feature,
-                label=label,
-                visual_input=example.vision,
-            )
-        if label is not None and label in self.shared_label_to_ccc:
-            return self._attach_to_ccc(
-                self.shared_label_to_ccc[label],
-                modality="vision",
-                feature=feature,
-                label=label,
-                visual_input=example.vision,
-            )
-        if label is not None:
-            return self._recruit_new_ccc(
-                modality="vision",
-                feature=feature,
-                label=label,
-                visual_input=example.vision,
-            )
-        ccc_id, confidence = self.fusion._resolve_visual_ccc(example.vision, feature, label=None, learn=True)
-        if ccc_id is None:
-            raise RuntimeError("Failed to resolve a shared visual CCC.")
-        return _StepObservation(modality="vision", ccc_id=int(ccc_id), confidence=float(confidence))
-
-    def _process_text(
-        self,
-        example: MultimodalExample,
-        *,
-        anchor_ccc_id: int | None = None,
-    ) -> _StepObservation:
-        feature, decoded_text = self.fusion._encode_text(example.text)
-        label = self._label_for(example) or decoded_text or None
-        if anchor_ccc_id is not None:
-            return self._attach_to_ccc(
-                anchor_ccc_id,
-                modality="text",
-                feature=feature,
-                label=label,
-            )
-        if label is not None and label in self.shared_label_to_ccc:
-            return self._attach_to_ccc(
-                self.shared_label_to_ccc[label],
-                modality="text",
-                feature=feature,
-                label=label,
-            )
-        if label is not None:
-            return self._recruit_new_ccc(modality="text", feature=feature, label=label)
-        ccc_id, confidence = self.fusion._resolve_ccc(feature, "text", label=None, learn=True)
-        if ccc_id is None:
-            raise RuntimeError("Failed to resolve a shared text CCC.")
-        return _StepObservation(modality="text", ccc_id=int(ccc_id), confidence=float(confidence))
-
-    def _bind_pair(self, vision_step: _StepObservation, text_step: _StepObservation) -> float:
-        timestep = self.fusion.timestep
-        activation_map = {
-            int(vision_step.ccc_id): float(vision_step.confidence),
-            int(text_step.ccc_id): max(float(text_step.confidence), float(vision_step.confidence))
-            if int(text_step.ccc_id) == int(vision_step.ccc_id)
-            else float(text_step.confidence),
-        }
-        self.fusion._activate(list(activation_map.items()), timestep)
-        strength = float(self.config.cross_modal_strength) + (0.5 * (vision_step.confidence + text_step.confidence))
-        strength = max(0.05, strength)
-        if int(vision_step.ccc_id) == int(text_step.ccc_id):
-            ccc_id = int(vision_step.ccc_id)
-            self.fusion.ccc_modalities[ccc_id].update({"vision", "text"})
-            self.fusion.explicit_bindings[(ccc_id, ccc_id)] = self.fusion.explicit_bindings.get((ccc_id, ccc_id), 0.0) + strength
-            self.fusion.fabric._add_association(ccc_id, ccc_id, strength, temporal=False)  # noqa: SLF001
+    def _update_label_prototype(self, label: str, modality: str, concept: torch.Tensor) -> None:
+        normalized = self._normalize(concept)
+        key = (label, modality)
+        count = self._label_counts.get(key, 0)
+        existing = self._label_prototypes[label].get(modality)
+        if existing is None:
+            self._label_prototypes[label][modality] = normalized
         else:
-            self.fusion.bind_visual_to_text(int(vision_step.ccc_id), int(text_step.ccc_id), strength=strength)
-        self.fusion.timestep += 1
-        return strength
+            updated = ((existing * count) + normalized) / float(count + 1)
+            self._label_prototypes[label][modality] = self._normalize(updated)
+        self._label_counts[key] = count + 1
 
-    def _build_result(
+    def _label_consistency(self) -> float:
+        similarities: list[float] = []
+        for prototypes in self._label_prototypes.values():
+            if len(prototypes) < 2:
+                continue
+            modalities = list(prototypes.keys())
+            for left_index, left_modality in enumerate(modalities[:-1]):
+                left = prototypes[left_modality]
+                for right_modality in modalities[left_index + 1 :]:
+                    right = prototypes[right_modality]
+                    similarity = float(
+                        F.cosine_similarity(
+                            left.unsqueeze(0).to(right),
+                            right.unsqueeze(0),
+                        ).item()
+                    )
+                    similarities.append(max(0.0, min(1.0, 0.5 * (similarity + 1.0))))
+        return float(sum(similarities) / len(similarities)) if similarities else 0.0
+
+    def train_online(
         self,
-        dataset: list[MultimodalExample],
-        *,
-        epochs: int,
-        modality_sequence: tuple[str, ...],
-        converged_pairs: int,
-    ) -> MultimodalTrainingResult:
-        evaluation_pairs = [
-            (example.vision, example.text, label)
-            if label is not None
-            else (example.vision, example.text)
-            for example in dataset
-            for label in [self._label_for(example)]
-        ]
-        alignment = self.aligner.measure_alignment(evaluation_pairs)
-        pool_stats = self.fusion.ccc_pool.get_pool_stats()
-        committed_cccs = int(pool_stats["num_committed"])
-        shared_cccs = sum(
-            1
-            for modalities in self.fusion.ccc_modalities.values()
-            if "vision" in modalities and "text" in modalities
+        stream: Iterable[MultimodalInput | MultimodalExample] | object | None = None,
+    ) -> dict[str, object]:
+        """Train on streaming multimodal samples."""
+
+        source = stream or SyntheticMultimodalStream(
+            self.config.num_samples,
+            num_classes=self.config.num_classes,
+            image_size=self.config.vision_size,
+            sample_rate=self.config.fusion.audio.sample_rate,
+            duration_ms=self.config.fusion.audio.max_duration_ms,
+            shuffle=self.config.shuffle,
+            seed=self.config.seed,
         )
-        return MultimodalTrainingResult(
-            num_pairs=len(dataset),
-            num_steps=len(modality_sequence),
-            epochs=int(epochs),
-            committed_cccs=committed_cccs,
-            shared_cccs=shared_cccs,
-            concept_sharing_ratio=(shared_cccs / committed_cccs) if committed_cccs else 0.0,
-            mean_association_strength=float(alignment.mean_association_strength),
-            cross_modal_retrieval_accuracy=float(alignment.retrieval_accuracy),
-            mean_reciprocal_rank=float(alignment.mean_reciprocal_rank),
-            converged_pairs=int(converged_pairs),
-            modality_sequence=modality_sequence,
+        examples = list(_iter_inputs(source))
+        agreements: list[float] = []
+        confidences: list[float] = []
+
+        for pass_index in range(self.config.num_passes):
+            order = list(range(len(examples)))
+            if self.config.shuffle:
+                order = torch.randperm(
+                    len(examples),
+                    generator=torch.Generator().manual_seed(self.config.seed + pass_index),
+                ).tolist()
+            for sample_index in order:
+                sample = examples[sample_index]
+                self.engine.learn(
+                    sample,
+                    learning_rate_multiplier=self.config.learning_rate_multiplier,
+                )
+                output = self.engine.last_output
+                if output is None:
+                    continue
+
+                label = None
+                if sample.metadata is not None:
+                    raw_label = sample.metadata.get("label")
+                    if raw_label is not None:
+                        label = str(raw_label)
+                if label is not None:
+                    if sample.vision is not None and "vision" in output.per_modality:
+                        result = output.per_modality["vision"]
+                        if result.concept_direction is not None:
+                            self._update_label_prototype(label, "vision", result.concept_direction)
+                    if sample.audio is not None and "audio" in output.per_modality:
+                        result = output.per_modality["audio"]
+                        if result.concept_direction is not None:
+                            self._update_label_prototype(label, "audio", result.concept_direction)
+                    if sample.temporal_context and "temporal" in output.per_modality:
+                        result = output.per_modality["temporal"]
+                        if result.concept_direction is not None:
+                            self._update_label_prototype(label, "temporal", result.concept_direction)
+
+                agreements.append(float(output.cross_modal_agreement))
+                confidences.append(float(output.confidence))
+
+        stats = self.engine.stats
+        result = MultimodalTrainingResult(
+            num_samples=len(examples),
+            num_passes=int(self.config.num_passes),
+            mean_agreement=float(sum(agreements) / len(agreements)) if agreements else 0.0,
+            mean_confidence=float(sum(confidences) / len(confidences)) if confidences else 0.0,
+            label_consistency=self._label_consistency(),
+            precision=float(stats.get("precision", 1.0)),
+            num_associations=int(stats.get("associations", {}).get("num_associations", 0)),
+            winner_histogram=dict(stats.get("winner_counts", {})),
         )
+        return result.to_dict()
 
 
 __all__ = [

@@ -2,21 +2,37 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from collections import Counter, defaultdict
-from dataclasses import dataclass
-from typing import Iterable
+from dataclasses import dataclass, field
+from typing import Any, Iterable
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 
-from bioarn.config import CCCConfig, GNWConfig, MarginGateConfig, SDMConfig, SpikingConfig
+from bioarn.config import (
+    AudioConfig,
+    AudioHierarchyConfig,
+    CCCConfig,
+    GNWConfig,
+    MarginGateConfig,
+    MultimodalFusionConfig,
+    PrecisionConfig,
+    SDMConfig,
+    SpikingConfig,
+    TemporalConfig,
+)
 from bioarn.core.ccc import CCCPool
 from bioarn.core.math_utils import normalize
+from bioarn.hierarchy.audio_hierarchy import AudioHierarchy
 from bioarn.memory.associative_fabric import AssociativeFabric
+from bioarn.predictive.precision_weighting import PrecisionWeightedGate
+from bioarn.preprocessing.audio import AudioPreprocessor
 from bioarn.sensorimotor.language import LanguageEncoder
 from bioarn.sensorimotor.vision import VisualEncoder
+from bioarn.temporal.sequence_layer import TemporalSequenceLayer
 from bioarn.tokenization import CharTokenizer
 from bioarn.workspace.gnw import GlobalNeuronalWorkspace, StreamOfConsciousness
 
@@ -34,6 +50,765 @@ class CrossModalAssociation:
     target_modality: str
     label: str | None = None
     temporal: bool = False
+
+
+@dataclass
+class MultimodalInput:
+    """Container for simultaneous multimodal evidence."""
+
+    vision: torch.Tensor | None = None
+    audio: torch.Tensor | None = None
+    temporal_context: list[int] | None = None
+    metadata: dict[str, Any] | None = None
+
+
+@dataclass
+class ModalityResult:
+    """Compact result for a single modality branch."""
+
+    fired_indices: list[int]
+    top_confidence: float
+    concept_direction: torch.Tensor | None
+
+
+@dataclass
+class MultimodalOutput:
+    """Unified workspace decision across modalities."""
+
+    winner_modality: str
+    concept_direction: torch.Tensor
+    confidence: float
+    per_modality: dict[str, ModalityResult] = field(default_factory=dict)
+    cross_modal_agreement: float = 0.0
+    precision: float = 1.0
+
+
+class MultimodalFusionEngine(nn.Module):
+    """Unified multimodal processing via GNW workspace competition."""
+
+    _OFFSETS = {
+        "vision": 0,
+        "audio": 100_000,
+        "temporal": 200_000,
+    }
+    _PROVISIONAL_IDS = {
+        "vision": -1,
+        "audio": -2,
+        "temporal": -3,
+    }
+
+    def __init__(self, config: MultimodalFusionConfig):
+        super().__init__()
+        self.config = copy.deepcopy(config)
+        workspace_config = copy.deepcopy(self.config.workspace)
+        workspace_config.capacity = int(self.config.workspace_size)
+        workspace_config.concept_dim = int(self.config.concept_dim)
+
+        self.vision_pool: CCCPool | None = None
+        self.audio_pool: CCCPool | None = None
+        self.audio_preprocessor: AudioPreprocessor | None = None
+        self.audio_hierarchy: AudioHierarchy | None = None
+        if self.config.audio_enabled:
+            self.audio_preprocessor = AudioPreprocessor(copy.deepcopy(self.config.audio))
+            self.audio_hierarchy = AudioHierarchy(copy.deepcopy(self.config.audio_hierarchy))
+
+        self.temporal_layer: TemporalSequenceLayer | None = None
+        if self.config.temporal_enabled:
+            temporal_config = copy.deepcopy(self.config.temporal)
+            temporal_config.concept_dim = int(self.config.concept_dim)
+            self.temporal_layer = TemporalSequenceLayer(temporal_config)
+
+        self.workspace = GlobalNeuronalWorkspace(workspace_config)
+        precision_config = copy.deepcopy(self.config.precision or PrecisionConfig(enabled=True))
+        precision_config.enabled = True
+        self.precision_gate = PrecisionWeightedGate(precision_config)
+        self.precision_gate.set_pool_size(int(self.config.precision.pool_size if self.config.precision else 8))
+
+        association_ccc = CCCConfig(
+            input_dim=int(self.config.concept_dim),
+            concept_dim=int(self.config.concept_dim),
+            num_f1_features=max(16, int(self.config.concept_dim // 2)),
+            f1_top_k=max(4, int(self.config.concept_dim // 8)),
+            max_pool_size=max(
+                8,
+                int(self.config.vision_pool_size + self.config.audio_pool_size + self.config.concept_dim),
+            ),
+        )
+        self.fabric = AssociativeFabric(copy.deepcopy(self.config.sdm), association_ccc)
+
+        self.timestep = 0
+        self._winner_counts: Counter[str] = Counter()
+        self._agreement_history: list[float] = []
+        self._temporal_surprise_history: list[float] = []
+        self._binding_events = 0
+        self._last_output: MultimodalOutput | None = None
+
+    @property
+    def last_output(self) -> MultimodalOutput | None:
+        return self._last_output
+
+    @staticmethod
+    def _normalize(vector: torch.Tensor) -> torch.Tensor:
+        flattened = vector.detach().reshape(-1).to(torch.float32)
+        if float(flattened.norm().item()) <= 1e-8:
+            return torch.zeros_like(flattened)
+        return normalize(flattened.unsqueeze(0)).squeeze(0)
+
+    def _align_dim(self, vector: torch.Tensor) -> torch.Tensor:
+        flattened = vector.detach().reshape(-1).to(torch.float32)
+        if flattened.numel() > self.config.concept_dim:
+            flattened = flattened[: self.config.concept_dim]
+        elif flattened.numel() < self.config.concept_dim:
+            flattened = F.pad(flattened, (0, self.config.concept_dim - flattened.numel()))
+        return self._normalize(flattened)
+
+    def _committed_count(self, pool: CCCPool | None) -> int:
+        if pool is None:
+            return 0
+        return sum(bool(ccc.is_committed.item()) for ccc in pool.cccs)
+
+    def _pool_config(self, input_dim: int, pool_size: int) -> tuple[CCCConfig, MarginGateConfig]:
+        concept_dim = int(self.config.concept_dim)
+        num_f1_features = max(16, min(int(input_dim), max(concept_dim * 2, 32)))
+        ccc_config = CCCConfig(
+            input_dim=int(max(1, input_dim)),
+            concept_dim=concept_dim,
+            num_f1_features=num_f1_features,
+            f1_top_k=max(4, min(num_f1_features, max(8, num_f1_features // 4))),
+            fast_lr=1.0,
+            slow_lr=float(self.config.learning_rate),
+            feedback_lr=float(self.config.learning_rate),
+            max_pool_size=int(max(1, pool_size)),
+        )
+        margin = MarginGateConfig(
+            theta_margin=float(self.config.margin_threshold),
+            theta_margin_lr=0.01,
+            theta_resonance=min(0.95, float(self.config.margin_threshold) + 0.3),
+        )
+        return ccc_config, margin
+
+    def _ensure_vision_pool(self, vision: torch.Tensor) -> CCCPool:
+        if self.vision_pool is None:
+            ccc_config, margin = self._pool_config(int(vision.numel()), int(self.config.vision_pool_size))
+            self.vision_pool = CCCPool(ccc_config, margin)
+        return self.vision_pool
+
+    def _ensure_audio_pool(self) -> CCCPool:
+        if self.audio_pool is None:
+            if self.audio_hierarchy is None:
+                raise RuntimeError("Audio hierarchy is not available.")
+            ccc_config, margin = self._pool_config(
+                int(self.audio_hierarchy.output_dim),
+                int(self.config.audio_pool_size),
+            )
+            self.audio_pool = CCCPool(ccc_config, margin)
+        return self.audio_pool
+
+    @staticmethod
+    def _confidence_score(confidence: torch.Tensor) -> float:
+        return float(confidence.reshape(-1).mean().item())
+
+    def _aggregate_pool_result(self, pool: CCCPool, pool_output) -> ModalityResult:
+        if not pool_output.fired_indices:
+            return ModalityResult([], 0.0, None)
+        directions = torch.stack(
+            [pool.cccs[index].concept_direction.detach().clone() for index in pool_output.fired_indices],
+            dim=0,
+        )
+        if pool_output.winner_confidences.numel() == len(pool_output.fired_indices):
+            weights = pool_output.winner_confidences.to(directions).reshape(-1, 1)
+        else:
+            weights = torch.ones(len(pool_output.fired_indices), 1, device=directions.device, dtype=directions.dtype)
+        concept = self._normalize((directions * weights).sum(dim=0))
+        return ModalityResult(
+            fired_indices=[int(index) for index in pool_output.fired_indices],
+            top_confidence=float(weights.max().item()),
+            concept_direction=concept,
+        )
+
+    def _provisional_result(self, tensor: torch.Tensor, confidence: float = 0.25) -> ModalityResult:
+        return ModalityResult(
+            fired_indices=[],
+            top_confidence=float(confidence),
+            concept_direction=self._align_dim(tensor),
+        )
+
+    def _preview_vision(self, vision: torch.Tensor) -> tuple[ModalityResult, list[tuple[int, torch.Tensor, float]], int | None]:
+        pool = self._ensure_vision_pool(vision)
+        flat = vision.detach().reshape(-1).to(torch.float32)
+        if self._committed_count(pool) == 0:
+            return self._provisional_result(flat), [], None
+        pool_output = pool.preview(flat)
+        result = self._aggregate_pool_result(pool, pool_output)
+        activations = [
+            (
+                int(index),
+                pool.cccs[index].concept_direction.detach().clone(),
+                self._confidence_score(pool_output.outputs[index].confidence),
+            )
+            for index in pool_output.fired_indices
+        ]
+        top_index = int(pool_output.fired_indices[0]) if pool_output.fired_indices else None
+        return result, activations, top_index
+
+    def _learn_vision(
+        self,
+        vision: torch.Tensor,
+        *,
+        learning_rate_multiplier: float,
+    ) -> tuple[ModalityResult, list[tuple[int, torch.Tensor, float]], int | None]:
+        pool = self._ensure_vision_pool(vision)
+        flat = vision.detach().reshape(-1).to(torch.float32)
+        pool_output = pool(
+            flat,
+            timestep=self.timestep,
+            learning_rate_multiplier=learning_rate_multiplier,
+        )
+        result = self._aggregate_pool_result(pool, pool_output)
+        activations = [
+            (
+                int(index),
+                pool.cccs[index].concept_direction.detach().clone(),
+                self._confidence_score(pool_output.outputs[index].confidence),
+            )
+            for index in pool_output.fired_indices
+        ]
+        top_index = int(pool_output.fired_indices[0]) if pool_output.fired_indices else pool_output.recruited_index
+        if result.concept_direction is None:
+            result = self._provisional_result(flat, confidence=0.1)
+        return result, activations, top_index
+
+    def _encode_audio(self, audio: torch.Tensor) -> torch.Tensor:
+        if self.audio_preprocessor is None or self.audio_hierarchy is None:
+            raise RuntimeError("Audio processing is disabled.")
+        audio_tensor = audio.detach().to(torch.float32)
+        if audio_tensor.dim() == 1:
+            mel = self.audio_preprocessor.waveform_to_mel(audio_tensor)
+        elif audio_tensor.dim() == 2:
+            mel = audio_tensor
+        elif audio_tensor.dim() == 3 and audio_tensor.shape[0] == 1:
+            mel = audio_tensor.squeeze(0)
+        else:
+            raise ValueError("audio must be a waveform or mel spectrogram.")
+        return self.audio_hierarchy(mel)
+
+    def _preview_audio(self, audio: torch.Tensor) -> tuple[ModalityResult, list[tuple[int, torch.Tensor, float]], int | None]:
+        encoded = self._encode_audio(audio)
+        pool = self._ensure_audio_pool()
+        if self._committed_count(pool) == 0:
+            return self._provisional_result(encoded), [], None
+        pool_output = pool.preview(encoded)
+        result = self._aggregate_pool_result(pool, pool_output)
+        activations = [
+            (
+                int(index),
+                pool.cccs[index].concept_direction.detach().clone(),
+                self._confidence_score(pool_output.outputs[index].confidence),
+            )
+            for index in pool_output.fired_indices
+        ]
+        top_index = int(pool_output.fired_indices[0]) if pool_output.fired_indices else None
+        return result, activations, top_index
+
+    def _learn_audio(
+        self,
+        audio: torch.Tensor,
+        *,
+        learning_rate_multiplier: float,
+    ) -> tuple[ModalityResult, list[tuple[int, torch.Tensor, float]], int | None]:
+        encoded = self._encode_audio(audio)
+        pool = self._ensure_audio_pool()
+        pool_output = pool(
+            encoded,
+            timestep=self.timestep,
+            learning_rate_multiplier=learning_rate_multiplier,
+        )
+        result = self._aggregate_pool_result(pool, pool_output)
+        activations = [
+            (
+                int(index),
+                pool.cccs[index].concept_direction.detach().clone(),
+                self._confidence_score(pool_output.outputs[index].confidence),
+            )
+            for index in pool_output.fired_indices
+        ]
+        top_index = int(pool_output.fired_indices[0]) if pool_output.fired_indices else pool_output.recruited_index
+        if result.concept_direction is None:
+            result = self._provisional_result(encoded, confidence=0.1)
+        return result, activations, top_index
+
+    @staticmethod
+    def _sanitize_temporal_indices(indices: list[int] | None, concept_dim: int) -> list[int]:
+        if indices is None:
+            return []
+        sanitized = {
+            int(index)
+            for index in indices
+            if 0 <= int(index) < int(concept_dim)
+        }
+        return sorted(sanitized)
+
+    def _temporal_vector(self, indices: list[int]) -> torch.Tensor:
+        vector = torch.zeros(self.config.concept_dim, dtype=torch.float32)
+        if indices:
+            vector[torch.tensor(indices, dtype=torch.long)] = 1.0
+        return vector
+
+    def _preview_temporal(self, indices: list[int]) -> tuple[ModalityResult, list[tuple[int, torch.Tensor, float]], int | None, float]:
+        sanitized = self._sanitize_temporal_indices(indices, self.config.concept_dim)
+        if self.temporal_layer is None or not sanitized:
+            return ModalityResult([], 0.0, None), [], None, 0.0
+        actual = self._temporal_vector(sanitized)
+        prediction = self.temporal_layer.last_prediction.detach().clone()
+        surprise = float(self.temporal_layer.temporal_surprise(sanitized))
+        concept = self._normalize((0.7 * actual) + (0.3 * prediction))
+        confidence = max(0.05, 1.0 - surprise)
+        top_index = sanitized[0]
+        return (
+            ModalityResult(fired_indices=sanitized, top_confidence=confidence, concept_direction=concept),
+            [(top_index, concept.detach().clone(), confidence)],
+            top_index,
+            surprise,
+        )
+
+    def _learn_temporal(self, indices: list[int]) -> tuple[ModalityResult, list[tuple[int, torch.Tensor, float]], int | None, float]:
+        sanitized = self._sanitize_temporal_indices(indices, self.config.concept_dim)
+        if self.temporal_layer is None or not sanitized:
+            return ModalityResult([], 0.0, None), [], None, 0.0
+        actual = self._temporal_vector(sanitized)
+        temporal_output = self.temporal_layer.observe_frame(actual, sanitized)
+        concept = self._normalize((0.7 * actual) + (0.3 * temporal_output.prediction))
+        confidence = max(0.05, 1.0 - float(temporal_output.surprise))
+        top_index = sanitized[0]
+        return (
+            ModalityResult(fired_indices=sanitized, top_confidence=confidence, concept_direction=concept),
+            [(top_index, concept.detach().clone(), confidence)],
+            top_index,
+            float(temporal_output.surprise),
+        )
+
+    def _global_id(self, modality: str, local_index: int | None) -> int:
+        if local_index is None:
+            return int(self._PROVISIONAL_IDS[modality])
+        return int(self._OFFSETS[modality] + int(local_index))
+
+    def _decode_global_id(self, global_id: int) -> tuple[str | None, int | None]:
+        for modality, provisional_id in self._PROVISIONAL_IDS.items():
+            if int(global_id) == int(provisional_id):
+                return modality, None
+        for modality, offset in self._OFFSETS.items():
+            if int(global_id) >= offset and int(global_id) < offset + 100_000:
+                return modality, int(global_id - offset)
+        return None, None
+
+    def _direction_for_global_id(self, global_id: int) -> torch.Tensor | None:
+        stored = self.fabric.concept_directions.get(int(global_id))
+        if stored is not None:
+            return stored.detach().clone()
+        modality, local = self._decode_global_id(global_id)
+        if modality == "vision" and self.vision_pool is not None and local is not None and 0 <= local < len(self.vision_pool.cccs):
+            return self.vision_pool.cccs[local].concept_direction.detach().clone()
+        if modality == "audio" and self.audio_pool is not None and local is not None and 0 <= local < len(self.audio_pool.cccs):
+            return self.audio_pool.cccs[local].concept_direction.detach().clone()
+        if modality == "temporal" and local is not None:
+            return self._temporal_vector([local])
+        return None
+
+    def _collect_modalities(
+        self,
+        inputs: MultimodalInput,
+        *,
+        learn: bool,
+        learning_rate_multiplier: float = 1.0,
+    ) -> tuple[
+        dict[str, ModalityResult],
+        dict[str, list[tuple[int, torch.Tensor, float]]],
+        dict[str, int | None],
+        float,
+    ]:
+        results: dict[str, ModalityResult] = {}
+        activations: dict[str, list[tuple[int, torch.Tensor, float]]] = {}
+        top_indices: dict[str, int | None] = {}
+        temporal_surprise = 0.0
+
+        if self.config.vision_enabled and inputs.vision is not None:
+            if learn:
+                result, modality_activations, top_index = self._learn_vision(
+                    inputs.vision,
+                    learning_rate_multiplier=learning_rate_multiplier,
+                )
+            else:
+                result, modality_activations, top_index = self._preview_vision(inputs.vision)
+            results["vision"] = result
+            activations["vision"] = modality_activations
+            top_indices["vision"] = top_index
+
+        if self.config.audio_enabled and inputs.audio is not None:
+            if learn:
+                result, modality_activations, top_index = self._learn_audio(
+                    inputs.audio,
+                    learning_rate_multiplier=learning_rate_multiplier,
+                )
+            else:
+                result, modality_activations, top_index = self._preview_audio(inputs.audio)
+            results["audio"] = result
+            activations["audio"] = modality_activations
+            top_indices["audio"] = top_index
+
+        if self.config.temporal_enabled and inputs.temporal_context is not None:
+            if learn:
+                result, modality_activations, top_index, temporal_surprise = self._learn_temporal(inputs.temporal_context)
+            else:
+                result, modality_activations, top_index, temporal_surprise = self._preview_temporal(inputs.temporal_context)
+            results["temporal"] = result
+            activations["temporal"] = modality_activations
+            top_indices["temporal"] = top_index
+
+        return results, activations, top_indices, temporal_surprise
+
+    def _cross_modal_agreement(self, results: dict[str, ModalityResult]) -> float:
+        active = [result for result in results.values() if result.concept_direction is not None]
+        if len(active) <= 1:
+            return 1.0 if active else 0.0
+        similarities: list[float] = []
+        for left_index, left_result in enumerate(active[:-1]):
+            left = left_result.concept_direction
+            if left is None:
+                continue
+            for right_result in active[left_index + 1 :]:
+                right = right_result.concept_direction
+                if right is None:
+                    continue
+                similarity = float(F.cosine_similarity(left.unsqueeze(0).to(right), right.unsqueeze(0)).item())
+                similarities.append(max(0.0, min(1.0, 0.5 * (similarity + 1.0))))
+        return float(sum(similarities) / len(similarities)) if similarities else 0.0
+
+    def _candidate_support(self, modality: str, results: dict[str, ModalityResult]) -> float:
+        source = results[modality].concept_direction
+        if source is None:
+            return 0.0
+        others = [
+            other.concept_direction
+            for other_modality, other in results.items()
+            if other_modality != modality and other.concept_direction is not None
+        ]
+        if not others:
+            return 1.0
+        support = [
+            max(
+                0.0,
+                min(
+                    1.0,
+                    0.5 * (
+                        float(F.cosine_similarity(source.unsqueeze(0).to(other), other.unsqueeze(0)).item()) + 1.0
+                    ),
+                ),
+            )
+            for other in others
+        ]
+        return float(sum(support) / len(support)) if support else 1.0
+
+    def _workspace_candidates(
+        self,
+        results: dict[str, ModalityResult],
+        top_indices: dict[str, int | None],
+    ) -> list[tuple[int, torch.Tensor, float]]:
+        active_modalities = [
+            modality for modality, result in results.items()
+            if result.concept_direction is not None and result.top_confidence > 0.0
+        ]
+        candidates: list[tuple[int, torch.Tensor, float]] = []
+        for modality in active_modalities:
+            result = results[modality]
+            if result.concept_direction is None:
+                continue
+            support = self._candidate_support(modality, results)
+            confidence = float(result.top_confidence)
+            if len(active_modalities) > 1:
+                confidence = (
+                    (1.0 - float(self.config.cross_modal_weight)) * confidence
+                    + (float(self.config.cross_modal_weight) * support)
+                )
+            candidates.append(
+                (
+                    self._global_id(modality, top_indices.get(modality)),
+                    result.concept_direction.detach().clone(),
+                    float(max(0.05, min(1.0, confidence))),
+                )
+            )
+        return candidates
+
+    def _fused_target(self, results: dict[str, ModalityResult], workspace_direction: torch.Tensor | None) -> torch.Tensor:
+        vectors: list[torch.Tensor] = []
+        weights: list[float] = []
+        for result in results.values():
+            if result.concept_direction is None:
+                continue
+            vectors.append(result.concept_direction)
+            weights.append(max(0.05, float(result.top_confidence)))
+        if workspace_direction is not None:
+            vectors.append(workspace_direction.detach().clone())
+            weights.append(1.0)
+        if not vectors:
+            return torch.zeros(self.config.concept_dim, dtype=torch.float32)
+        stacked = torch.stack(vectors, dim=0)
+        weight_tensor = torch.tensor(weights, dtype=stacked.dtype, device=stacked.device).unsqueeze(-1)
+        return self._normalize((stacked * weight_tensor).sum(dim=0))
+
+    def _align_pool_concepts(
+        self,
+        pool: CCCPool | None,
+        activations: list[tuple[int, torch.Tensor, float]],
+        target: torch.Tensor,
+        *,
+        learning_rate: float,
+    ) -> None:
+        if pool is None or not activations or learning_rate <= 0.0:
+            return
+        for local_index, _, confidence in activations:
+            if local_index < 0 or local_index >= len(pool.cccs):
+                continue
+            ccc = pool.cccs[local_index]
+            if not bool(ccc.is_committed.item()):
+                continue
+            current = ccc.concept_direction.detach().clone().to(target)
+            updated = self._normalize(
+                ((1.0 - learning_rate) * current) + (learning_rate * float(max(0.05, confidence)) * target)
+            )
+            ccc.concept_direction.copy_(updated.to(ccc.concept_direction))
+
+    def _register_bindings(
+        self,
+        activations: dict[str, list[tuple[int, torch.Tensor, float]]],
+    ) -> None:
+        registered = 0
+        for modality, modality_activations in activations.items():
+            for local_index, direction, confidence in modality_activations:
+                global_id = self._global_id(modality, local_index)
+                self.fabric.register_activation(
+                    global_id,
+                    direction,
+                    max(0.05, float(confidence)),
+                    self.timestep,
+                )
+                registered += 1
+        if registered >= 2:
+            self.fabric.form_associations(self.timestep)
+            self._binding_events += 1
+
+    def _project_associations(
+        self,
+        winner_direction: torch.Tensor,
+        per_modality: dict[str, ModalityResult],
+    ) -> dict[str, ModalityResult]:
+        projected = dict(per_modality)
+        associates = self.fabric.retrieve_associates(winner_direction, k=12)
+        for global_id, strength in zip(associates.indices, associates.strengths, strict=False):
+            modality, local_index = self._decode_global_id(int(global_id))
+            if modality is None or local_index is None:
+                continue
+            if modality in projected and projected[modality].concept_direction is not None:
+                continue
+            direction = self._direction_for_global_id(int(global_id))
+            if direction is None:
+                continue
+            projected[modality] = ModalityResult(
+                fired_indices=[int(local_index)],
+                top_confidence=float(max(0.0, min(1.0, strength))),
+                concept_direction=self._normalize(direction),
+            )
+        return projected
+
+    def _finalize_output(
+        self,
+        candidates: list[tuple[int, torch.Tensor, float]],
+        per_modality: dict[str, ModalityResult],
+        *,
+        agreement: float,
+        precision: float,
+    ) -> MultimodalOutput:
+        if candidates:
+            self.workspace.update(candidates, timestep=self.timestep)
+            broadcast = self.workspace.broadcast()
+        else:
+            broadcast = self.workspace.broadcast()
+
+        if broadcast.indices:
+            winner_id = int(broadcast.indices[0])
+            winner_modality, _ = self._decode_global_id(winner_id)
+            winner_direction = broadcast.directions[0].detach().clone()
+            confidence = float(self.workspace.slots[0].confidence) if self.workspace.slots else 0.0
+        elif candidates:
+            winner_id, winner_direction, confidence = max(candidates, key=lambda candidate: candidate[2])
+            winner_modality, _ = self._decode_global_id(int(winner_id))
+        else:
+            winner_modality, winner_direction, confidence = "none", torch.zeros(self.config.concept_dim), 0.0
+
+        if winner_modality is None:
+            winner_modality = "none"
+        if winner_modality != "none":
+            per_modality = self._project_associations(winner_direction, per_modality)
+
+        output = MultimodalOutput(
+            winner_modality=str(winner_modality),
+            concept_direction=self._align_dim(winner_direction),
+            confidence=float(max(0.0, min(1.0, confidence))),
+            per_modality=per_modality,
+            cross_modal_agreement=float(max(0.0, min(1.0, agreement))),
+            precision=float(max(0.0, min(1.0, precision))),
+        )
+        self._winner_counts[output.winner_modality] += 1
+        self._agreement_history.append(float(output.cross_modal_agreement))
+        self._last_output = output
+        return output
+
+    @torch.no_grad()
+    def process(self, inputs: MultimodalInput) -> MultimodalOutput:
+        """Process multimodal inputs through workspace competition."""
+
+        results, _, top_indices, temporal_surprise = self._collect_modalities(inputs, learn=False)
+        active_results = {
+            modality: result
+            for modality, result in results.items()
+            if result.concept_direction is not None and result.top_confidence > 0.0
+        }
+        if not active_results:
+            output = MultimodalOutput(
+                winner_modality="none",
+                concept_direction=torch.zeros(self.config.concept_dim, dtype=torch.float32),
+                confidence=0.0,
+                per_modality={},
+                cross_modal_agreement=0.0,
+                precision=float(self.precision_gate.current_precision),
+            )
+            self._last_output = output
+            return output
+
+        agreement = self._cross_modal_agreement(active_results)
+        candidates = self._workspace_candidates(active_results, top_indices)
+        precision = self.precision_gate.preview_pool_output(
+            [int(candidate[0]) for candidate in candidates],
+            lateral_error=1.0 - agreement,
+            hierarchy_error=temporal_surprise,
+        )
+        output = self._finalize_output(
+            candidates,
+            results,
+            agreement=agreement,
+            precision=float(precision),
+        )
+        self.timestep += 1
+        return output
+
+    @torch.no_grad()
+    def learn(
+        self,
+        inputs: MultimodalInput,
+        *,
+        learning_rate_multiplier: float = 1.0,
+    ) -> None:
+        """Hebbian learning across modalities, gated by workspace broadcast."""
+
+        results, activations, top_indices, temporal_surprise = self._collect_modalities(
+            inputs,
+            learn=True,
+            learning_rate_multiplier=learning_rate_multiplier,
+        )
+        active_results = {
+            modality: result
+            for modality, result in results.items()
+            if result.concept_direction is not None and result.top_confidence > 0.0
+        }
+        if not active_results:
+            self._last_output = None
+            return
+
+        agreement = self._cross_modal_agreement(active_results)
+        candidates = self._workspace_candidates(active_results, top_indices)
+        precision = self.precision_gate.observe_pool_output(
+            [int(candidate[0]) for candidate in candidates],
+            lateral_error=1.0 - agreement,
+            hierarchy_error=temporal_surprise,
+        )
+
+        self.workspace.update(candidates, timestep=self.timestep)
+        winner_direction = self.workspace.slots[0].direction.detach().clone() if self.workspace.slots else None
+        fused_target = self._fused_target(active_results, winner_direction)
+        effective_lr = float(self.config.learning_rate) * float(learning_rate_multiplier) * float(precision)
+        self._align_pool_concepts(self.vision_pool, activations.get("vision", []), fused_target, learning_rate=effective_lr)
+        self._align_pool_concepts(self.audio_pool, activations.get("audio", []), fused_target, learning_rate=effective_lr)
+        if self.workspace.slots:
+            self.workspace.inject(self.workspace.slots[0].ccc_index, fused_target, priority=max(0.1, agreement))
+
+        self._register_bindings(activations)
+        if self.temporal_layer is not None and results.get("temporal") is not None:
+            self._temporal_surprise_history.append(float(temporal_surprise))
+
+        refreshed_results = dict(results)
+        if activations.get("vision") and self.vision_pool is not None:
+            refreshed_results["vision"] = self._aggregate_pool_result(
+                self.vision_pool,
+                type(
+                    "_PoolProxy",
+                    (),
+                    {
+                        "fired_indices": [index for index, _, _ in activations["vision"]],
+                        "winner_confidences": torch.tensor(
+                            [confidence for _, _, confidence in activations["vision"]],
+                            dtype=torch.float32,
+                        ),
+                    },
+                )(),
+            )
+        if activations.get("audio") and self.audio_pool is not None:
+            refreshed_results["audio"] = self._aggregate_pool_result(
+                self.audio_pool,
+                type(
+                    "_PoolProxy",
+                    (),
+                    {
+                        "fired_indices": [index for index, _, _ in activations["audio"]],
+                        "winner_confidences": torch.tensor(
+                            [confidence for _, _, confidence in activations["audio"]],
+                            dtype=torch.float32,
+                        ),
+                    },
+                )(),
+            )
+        if "temporal" in refreshed_results and refreshed_results["temporal"].concept_direction is not None:
+            refreshed_results["temporal"] = ModalityResult(
+                fired_indices=list(refreshed_results["temporal"].fired_indices),
+                top_confidence=float(refreshed_results["temporal"].top_confidence),
+                concept_direction=fused_target.detach().clone(),
+            )
+
+        self._last_output = self._finalize_output(
+            candidates,
+            refreshed_results,
+            agreement=agreement,
+            precision=float(precision),
+        )
+        self.timestep += 1
+
+    @property
+    def stats(self) -> dict[str, Any]:
+        """Per-modality and fusion statistics."""
+
+        def _mean(values: list[float]) -> float:
+            return float(sum(values) / len(values)) if values else 0.0
+
+        return {
+            "timestep": int(self.timestep),
+            "precision": float(self.precision_gate.current_precision),
+            "mean_agreement": _mean(self._agreement_history[-64:]),
+            "winner_counts": dict(self._winner_counts),
+            "bindings_formed": int(self._binding_events),
+            "workspace": self.workspace.get_stats(),
+            "associations": self.fabric.get_stats(),
+            "vision": None if self.vision_pool is None else self.vision_pool.get_pool_stats(),
+            "audio": None if self.audio_pool is None else self.audio_pool.get_pool_stats(),
+            "temporal_mean_surprise": _mean(self._temporal_surprise_history[-64:]),
+        }
 
 
 class MultimodalFusion:
@@ -542,4 +1317,11 @@ class MultimodalFusion:
         return pattern.detach().clone()
 
 
-__all__ = ["CrossModalAssociation", "MultimodalFusion"]
+__all__ = [
+    "CrossModalAssociation",
+    "ModalityResult",
+    "MultimodalFusion",
+    "MultimodalFusionEngine",
+    "MultimodalInput",
+    "MultimodalOutput",
+]

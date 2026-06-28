@@ -5,9 +5,9 @@ from bioarn.data.audio import SyntheticAudioStream
 from bioarn.data.base import DataBatch, DataSample, StreamingDataSource
 from bioarn.data.curriculum import CurriculumScheduler
 from bioarn.data.language import CharacterStream, TinyStoriesStream, WikiTextStream
-from bioarn.data.multimodal import MultimodalStream
+from bioarn.data.multimodal import MultimodalStream, SyntheticMultimodalStream
 from bioarn.data.video import SyntheticVideoStream, VideoSequence
-from bioarn.data.vision import CIFAR10Stream, CIFAR100Stream, ImageFolderStream, MNISTStream
+from bioarn.data.vision import CIFAR10Stream, CIFAR100Stream, FashionMNISTStream, ImageFolderStream, MNISTStream
 
 __all__ = [
     "CIFAR10Stream",
@@ -16,11 +16,13 @@ __all__ = [
     "CurriculumScheduler",
     "DataBatch",
     "DataSample",
+    "FashionMNISTStream",
     "ImageFolderStream",
     "MNISTStream",
     "MultimodalStream",
     "OnlineAugmenter",
     "StreamingDataSource",
+    "SyntheticMultimodalStream",
     "SyntheticAudioStream",
     "SyntheticVideoStream",
     "TinyStoriesStream",
