@@ -18,6 +18,7 @@ from bioarn.core.margin_gate import MarginGateOutput, ResonanceOutput
 from bioarn.core.math_utils import cosine_similarity, normalize
 from bioarn.memory.associative_fabric import AssociativeFabric
 from bioarn.memory.sdm import SparseDistributedMemory, TemporalAssociator
+from bioarn.predictive.lateral_prediction import LateralPredictionNetwork
 from bioarn.predictive.precision_weighting import PrecisionWeightedGate
 from bioarn.system import BioARNCore
 
@@ -250,6 +251,18 @@ class BatchedCCCPool(nn.Module):
         )
         if self.precision_gate is not None:
             self.precision_gate.set_pool_size(num_cccs)
+        lateral_config = getattr(self.config, "lateral_prediction", None)
+        self.lateral_network = (
+            LateralPredictionNetwork(
+                num_cccs,
+                self.config.concept_dim,
+                lateral_config,
+            )
+            if lateral_config is not None and bool(lateral_config.enabled)
+            else None
+        )
+        self.last_lateral_prediction_error = 0.0
+        self.last_hierarchy_prediction_error = 0.0
 
     @staticmethod
     def _ensure_batch(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -304,6 +317,21 @@ class BatchedCCCPool(nn.Module):
             )
             if self.precision_gate is not None:
                 self.precision_gate.set_pool_size(int(self.config.max_pool_size))
+        if not hasattr(self, "lateral_network"):
+            lateral_config = getattr(self.config, "lateral_prediction", None)
+            self.lateral_network = (
+                LateralPredictionNetwork(
+                    int(self.config.max_pool_size),
+                    self.config.concept_dim,
+                    lateral_config,
+                )
+                if lateral_config is not None and bool(lateral_config.enabled)
+                else None
+            )
+        if not hasattr(self, "last_lateral_prediction_error"):
+            self.last_lateral_prediction_error = 0.0
+        if not hasattr(self, "last_hierarchy_prediction_error"):
+            self.last_hierarchy_prediction_error = 0.0
 
     def freeze_f1(self) -> None:
         self._ensure_runtime_state()
@@ -365,6 +393,21 @@ class BatchedCCCPool(nn.Module):
         self.precision_gate.load_state_from(source_precision)
         self.precision_gate.set_pool_size(int(self.config.max_pool_size))
 
+    def _copy_lateral_state_from(self, source: CCCPool | "BatchedCCCPool") -> None:
+        if self.lateral_network is None:
+            return
+        source_lateral = getattr(source, "lateral_network", None)
+        if source_lateral is None:
+            return
+        self.lateral_network.copy_state_from(source_lateral)
+        self.lateral_network.set_pool_size(int(self.config.max_pool_size))
+        self.last_lateral_prediction_error = float(
+            getattr(source, "last_lateral_prediction_error", 0.0)
+        )
+        self.last_hierarchy_prediction_error = float(
+            getattr(source, "last_hierarchy_prediction_error", 0.0)
+        )
+
     def _adapter_lr(self, base_lr: float) -> float:
         return min(0.05, max(1e-3, float(base_lr)))
 
@@ -405,8 +448,11 @@ class BatchedCCCPool(nn.Module):
         grown.base_config = self.base_config
         _copy_batched_pool_slice(self, grown, length=current_size)
         grown._copy_precision_state_from(self)
+        grown._copy_lateral_state_from(self)
         if grown.precision_gate is not None:
             grown.precision_gate.set_pool_size(target)
+        if grown.lateral_network is not None:
+            grown.lateral_network.set_pool_size(target)
         return grown
 
     def update_importance(
@@ -420,6 +466,50 @@ class BatchedCCCPool(nn.Module):
             current_size=int(self.config.max_pool_size),
             confidences=confidences,
         )
+
+    def set_hierarchy_prediction_error(self, error: float | None) -> None:
+        self.last_hierarchy_prediction_error = 0.0 if error is None else max(0.0, min(1.0, float(error)))
+
+    def _lateral_attention_map(self, errors: dict[int, float], fired_indices: list[int]) -> dict[int, float]:
+        if not fired_indices:
+            return {}
+        gain = (
+            float(self.lateral_network.config.surprise_gain)
+            if self.lateral_network is not None
+            else 1.0
+        )
+        if self.precision_gate is None:
+            return {
+                int(index): float(1.0 + (max(0.0, min(1.0, errors.get(int(index), 0.0))) * gain))
+                for index in fired_indices
+            }
+        return {
+            int(index): float(
+                self.precision_gate.compute_error_attention(
+                    errors.get(int(index), 0.0),
+                    gain=gain,
+                )
+            )
+            for index in fired_indices
+        }
+
+    def _update_lateral_prediction_state(self, fired_indices: list[int]) -> float:
+        if self.lateral_network is None:
+            self.last_lateral_prediction_error = 0.0
+            return 0.0
+        predictions = self.lateral_network.predict_lateral(fired_indices, self.concept_directions)
+        errors = self.lateral_network.compute_lateral_errors(predictions, fired_indices)
+        attention = self._lateral_attention_map(errors, fired_indices)
+        self.lateral_network.cache_error_state(predictions, errors, attention=attention)
+        self.last_lateral_prediction_error = self.lateral_network.summarize_errors(errors)
+        return self.last_lateral_prediction_error
+
+    @torch.no_grad()
+    def hebbian_update_lateral(self, fired_indices: list[int] | None = None) -> None:
+        if self.lateral_network is None:
+            return
+        active_indices = [] if fired_indices is None else [int(index) for index in fired_indices]
+        self.lateral_network.hebbian_update(active_indices, self.concept_directions)
 
     def _row_f1_encode(self, index: int, raw_batch: torch.Tensor) -> torch.Tensor:
         self._ensure_runtime_state()
@@ -1018,8 +1108,13 @@ class BatchedCCCPool(nn.Module):
             if fired_indices
             else torch.empty(0, dtype=torch.float32, device=self.f1_weights.device)
         )
+        lateral_error = self._update_lateral_prediction_state(fired_indices)
         if self.precision_gate is not None:
-            self.precision_gate.preview_pool_output(fired_indices)
+            self.precision_gate.preview_pool_output(
+                fired_indices,
+                lateral_error=lateral_error,
+                hierarchy_error=self.last_hierarchy_prediction_error,
+            )
         return CCCPoolOutput(
             outputs=outputs,
             fired_indices=fired_indices,
@@ -1068,8 +1163,13 @@ class BatchedCCCPool(nn.Module):
             if fired_indices
             else torch.empty(0, dtype=torch.float32, device=self.f1_weights.device)
         )
+        lateral_error = self._update_lateral_prediction_state(fired_indices)
         if self.precision_gate is not None:
-            self.precision_gate.observe_pool_output(fired_indices)
+            self.precision_gate.observe_pool_output(
+                fired_indices,
+                lateral_error=lateral_error,
+                hierarchy_error=self.last_hierarchy_prediction_error,
+            )
 
         return CCCPoolOutput(
             outputs=outputs,
@@ -1122,6 +1222,9 @@ class BatchedCCCPool(nn.Module):
             return 1.0
         return float(self.precision_gate.current_precision)
 
+    def get_lateral_prediction_error(self) -> float:
+        return float(getattr(self, "last_lateral_prediction_error", 0.0))
+
     @torch.no_grad()
     def load_from_pool(self, pool: CCCPool | "BatchedCCCPool") -> "BatchedCCCPool":
         self._ensure_runtime_state()
@@ -1145,6 +1248,7 @@ class BatchedCCCPool(nn.Module):
             self.consolidation.copy_from(pool.consolidation)
             self._copy_shared_state_from(pool)
             self._copy_precision_state_from(pool)
+            self._copy_lateral_state_from(pool)
             return self
 
         for index, ccc in enumerate(pool.cccs):
@@ -1188,6 +1292,7 @@ class BatchedCCCPool(nn.Module):
         if hasattr(pool, "f1_frozen"):
             self.f1_frozen.copy_(pool.f1_frozen)
         self._copy_precision_state_from(pool)
+        self._copy_lateral_state_from(pool)
         return self
 
 

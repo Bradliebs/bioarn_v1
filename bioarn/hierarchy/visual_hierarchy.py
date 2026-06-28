@@ -52,6 +52,8 @@ class HierarchyOutput:
     predictive_converged: bool = False
     predictive_surprise: float = 0.0
     predictive_mode: str = "disabled"
+    hierarchy_prediction_errors: dict[str, float] = field(default_factory=dict)
+    hierarchy_uncertainty: float = 0.0
 
     @property
     def final_features(self) -> torch.Tensor:
@@ -503,6 +505,11 @@ class VisualHierarchy:
             config.concept_dims[3],
             dtype=torch.float32,
         )
+        self.hierarchy_predictors = [
+            self._seed_predictive_weights(config.concept_dims[0], config.concept_dims[1]),
+            self._seed_predictive_weights(config.concept_dims[1], config.concept_dims[2]),
+            self._seed_predictive_weights(config.concept_dims[2], config.concept_dims[3]),
+        ]
         self.l4_label_counts: defaultdict[int, Counter[int]] = defaultdict(Counter)
         self.label_prototypes: dict[int, torch.Tensor] = {}
         self.label_counts: Counter[int] = Counter()
@@ -674,6 +681,117 @@ class VisualHierarchy:
             target_dim=projection.shape[1],
         ).to(device=projection.device, dtype=projection.dtype)
         return torch.tanh(projection @ higher_summary)
+
+    def _project_hierarchy_prediction(
+        self,
+        lower_activations: torch.Tensor,
+        projection: torch.Tensor,
+        *,
+        target_dim: int,
+    ) -> torch.Tensor:
+        if lower_activations.numel() == 0:
+            return torch.zeros(target_dim, dtype=torch.float32, device=projection.device)
+        lower_summary = self._summarize_layer_activity(
+            lower_activations,
+            target_dim=projection.shape[1],
+        ).to(device=projection.device, dtype=projection.dtype)
+        predicted = torch.tanh(projection @ lower_summary)
+        return self._normalize_feature(predicted)
+
+    @staticmethod
+    def _prediction_error(predicted: torch.Tensor, actual: torch.Tensor) -> float:
+        if float(predicted.norm().item()) <= 1e-8 or float(actual.norm().item()) <= 1e-8:
+            return 0.0
+        similarity = float(
+            cosine_similarity(
+                predicted.reshape(1, -1).to(actual),
+                actual.reshape(1, -1),
+            ).item()
+        )
+        return float(max(0.0, min(1.0, 1.0 - similarity)))
+
+    @staticmethod
+    def _mean_prediction_error(errors: dict[str, float]) -> float:
+        if not errors:
+            return 0.0
+        return float(sum(errors.values()) / max(len(errors), 1))
+
+    @torch.no_grad()
+    def compute_hierarchy_prediction_errors(
+        self,
+        layer_activations: dict[str, torch.Tensor],
+    ) -> dict[str, float]:
+        """Compute one-shot bottom-up prediction errors between adjacent layers."""
+
+        errors: dict[str, float] = {}
+        names = ["V1", "V2", "V4", "IT"]
+        for index, (lower_name, higher_name) in enumerate(zip(names[:-1], names[1:], strict=False)):
+            lower = layer_activations.get(lower_name)
+            higher = layer_activations.get(higher_name)
+            if lower is None or higher is None:
+                continue
+            actual = self._summarize_layer_activity(
+                higher,
+                target_dim=self.layers[index + 1].concept_dim,
+            )
+            predicted = self._project_hierarchy_prediction(
+                lower,
+                self.hierarchy_predictors[index],
+                target_dim=self.layers[index + 1].concept_dim,
+            )
+            errors[f"{lower_name}->{higher_name}"] = self._prediction_error(predicted, actual)
+        return errors
+
+    @torch.no_grad()
+    def _update_hierarchy_predictors(
+        self,
+        layer_activations: dict[str, torch.Tensor],
+        *,
+        learning_rate_scale: float = 1.0,
+    ) -> None:
+        base_lr = (
+            float(self.config.predictive.eta)
+            if self.config.predictive is not None
+            else float(sum(self.config.learning_rates[:3]) / 3.0)
+        )
+        effective_lr = max(0.0, base_lr * float(learning_rate_scale))
+        if effective_lr <= 0.0:
+            return
+        names = ["V1", "V2", "V4", "IT"]
+        for index, (lower_name, higher_name) in enumerate(zip(names[:-1], names[1:], strict=False)):
+            lower = layer_activations.get(lower_name)
+            higher = layer_activations.get(higher_name)
+            if lower is None or higher is None:
+                continue
+            lower_summary = self._summarize_layer_activity(
+                lower,
+                target_dim=self.layers[index].concept_dim,
+            )
+            higher_summary = self._summarize_layer_activity(
+                higher,
+                target_dim=self.layers[index + 1].concept_dim,
+            )
+            if (
+                float(lower_summary.norm().item()) <= 1e-8
+                or float(higher_summary.norm().item()) <= 1e-8
+            ):
+                continue
+            predictor = self.hierarchy_predictors[index]
+            predictor.copy_(
+                normalize(
+                    predictor
+                    + (
+                        effective_lr
+                        * torch.outer(higher_summary.to(predictor), lower_summary.to(predictor))
+                    )
+                )
+            )
+
+    def _propagate_hierarchy_prediction_error(self, hierarchy_uncertainty: float) -> None:
+        for layer in self.layers:
+            setter = getattr(layer.pool.core, "set_hierarchy_prediction_error", None)
+            if callable(setter):
+                setter(hierarchy_uncertainty)
 
     def _previous_feedback_signals(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.config.feedback_strength <= 0.0 or self.last_output is None:
@@ -1275,6 +1393,15 @@ class VisualHierarchy:
         l1_result, l2_result, l3_result, l4_result = layer_results
         grouping12, grouping23, grouping34 = groupings
         l1_inputs, l2_inputs, l3_inputs, l4_inputs = layer_inputs
+        hierarchy_activations = {
+            "V1": l1_result.activations,
+            "V2": l2_result.activations,
+            "V4": l3_result.activations,
+            "IT": l4_result.activations,
+        }
+        hierarchy_prediction_errors = self.compute_hierarchy_prediction_errors(hierarchy_activations)
+        hierarchy_uncertainty = self._mean_prediction_error(hierarchy_prediction_errors)
+        self._propagate_hierarchy_prediction_error(hierarchy_uncertainty)
 
         output = HierarchyOutput(
             patches=patches,
@@ -1318,9 +1445,12 @@ class VisualHierarchy:
             predictive_converged=predictive_converged,
             predictive_surprise=predictive_surprise,
             predictive_mode=self.predictive_mode,
+            hierarchy_prediction_errors=hierarchy_prediction_errors,
+            hierarchy_uncertainty=hierarchy_uncertainty,
         )
 
         if learn:
+            self._update_hierarchy_predictors(hierarchy_activations)
             self._update_bindings(output)
             self._update_feedback_connections(output)
             if label is not None and l4_result.activations.shape[0] > 0:
