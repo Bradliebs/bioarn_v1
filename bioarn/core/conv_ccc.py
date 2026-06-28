@@ -41,6 +41,12 @@ class ConvCCCPoolOutput:
     winner_confidences: torch.Tensor
 
 
+@dataclass
+class _ConvHebbianTrace:
+    pre_activations: tuple[torch.Tensor, ...]
+    post_activations: tuple[torch.Tensor, ...]
+
+
 class ConvF1Layer(nn.Module):
     """Convolutional F1 encoder that preserves spatial structure."""
 
@@ -51,25 +57,56 @@ class ConvF1Layer(nn.Module):
         spatial_size: int = 32,
         top_k: int = 32,
         spatial_grid: int = 4,
+        *,
+        num_layers: int = 3,
+        hidden_channels: tuple[int, int] = (32, 64),
+        spatial_top_k: int = 4,
+        competitive_k: int = 8,
+        hebbian_lr: float = 0.0025,
+        weight_norm_target: float = 1.0,
     ) -> None:
         super().__init__()
-        hidden_features = max(1, int(num_features) // 2)
         self.in_channels = int(in_channels)
         self.num_features = int(num_features)
         self.spatial_size = int(spatial_size)
         self.spatial_grid = int(spatial_grid)
         self.top_k = int(max(1, top_k))
+        self.num_layers = int(min(max(1, num_layers), 3))
+        hidden1 = int(max(1, hidden_channels[0]))
+        hidden2 = int(max(1, hidden_channels[1]))
+        self.hidden_channels = (hidden1, hidden2)
+        self.spatial_top_k = int(max(1, spatial_top_k))
+        self.competitive_k = int(max(1, competitive_k))
+        self.hebbian_lr = float(max(0.0, hebbian_lr))
+        self.weight_norm_target = float(max(1e-6, weight_norm_target))
 
-        self.conv1 = nn.Conv2d(self.in_channels, hidden_features, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(hidden_features, self.num_features, kernel_size=3, padding=1)
-        self.pool = nn.AdaptiveAvgPool2d((self.spatial_grid, self.spatial_grid))
+        if self.num_layers == 1:
+            self.conv1 = nn.Conv2d(self.in_channels, self.num_features, kernel_size=3, padding=1)
+            self.conv2 = None
+            self.conv3 = None
+        elif self.num_layers == 2:
+            self.conv1 = nn.Conv2d(self.in_channels, hidden1, kernel_size=3, padding=1)
+            self.conv2 = nn.Conv2d(hidden1, self.num_features, kernel_size=3, padding=1)
+            self.conv3 = None
+        else:
+            self.conv1 = nn.Conv2d(self.in_channels, hidden1, kernel_size=3, padding=1)
+            self.conv2 = nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1)
+            self.conv3 = nn.Conv2d(hidden2, self.num_features, kernel_size=3, padding=1)
         self.register_buffer("is_frozen", torch.tensor(False, dtype=torch.bool))
         for parameter in self.parameters():
             parameter.requires_grad_(False)
 
     @property
     def output_dim(self) -> int:
-        return self.num_features * self.spatial_grid * self.spatial_grid
+        return sum(self.feature_channels) * self.spatial_grid * self.spatial_grid
+
+    @property
+    def feature_channels(self) -> tuple[int, ...]:
+        if self.num_layers <= 1:
+            return (self.num_features,)
+        if self.num_layers == 2:
+            return (self.hidden_channels[0], self.num_features)
+        return (self.hidden_channels[0], self.hidden_channels[1], self.num_features)
 
     def freeze(self) -> None:
         self.is_frozen.fill_(True)
@@ -108,18 +145,86 @@ class ConvF1Layer(nn.Module):
     def _maybe_squeeze(x: torch.Tensor, squeeze: bool) -> torch.Tensor:
         return x.squeeze(0) if squeeze else x
 
-    def _forward_dense(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def _downsample(x: torch.Tensor) -> torch.Tensor:
+        if min(x.shape[-2:]) <= 1:
+            return x
+        return F.avg_pool2d(x, kernel_size=2, stride=2)
+
+    def _competitive_spatial_pool(self, feature_map: torch.Tensor) -> torch.Tensor:
+        flat = feature_map.flatten(2)
+        top_k = min(self.spatial_top_k, flat.shape[-1])
+        top_values, top_indices = torch.topk(flat, k=top_k, dim=-1)
+        sparse_flat = torch.zeros_like(flat)
+        sparse_flat.scatter_(2, top_indices, top_values)
+        sparse_map = sparse_flat.view_as(feature_map)
+        pooled = F.adaptive_max_pool2d(sparse_map, (self.spatial_grid, self.spatial_grid))
+        return normalize(pooled.flatten(1))
+
+    def _forward_dense(self, x: torch.Tensor) -> tuple[torch.Tensor, _ConvHebbianTrace]:
         batch = x.to(self.conv1.weight.dtype)
-        h1 = F.relu(self.conv1(batch))
-        h2 = F.relu(self.conv2(h1))
-        pooled = self.pool(h2).flatten(1)
-        return pooled, h1, h2
+        pre_activations: list[torch.Tensor] = []
+        post_activations: list[torch.Tensor] = []
+        feature_maps: list[torch.Tensor] = []
+
+        pre_activations.append(batch)
+        current = F.relu(self.conv1(batch))
+        post_activations.append(current)
+        feature_maps.append(current)
+
+        if self.conv2 is not None:
+            pre_conv2 = self._downsample(current)
+            pre_activations.append(pre_conv2)
+            current = F.relu(self.conv2(pre_conv2))
+            post_activations.append(current)
+            feature_maps.append(current)
+
+        if self.conv3 is not None:
+            pre_conv3 = self._downsample(current)
+            pre_activations.append(pre_conv3)
+            current = F.relu(self.conv3(pre_conv3))
+            post_activations.append(current)
+            feature_maps.append(current)
+
+        pooled_scales = [self._competitive_spatial_pool(feature_map) for feature_map in feature_maps]
+        dense = torch.cat(pooled_scales, dim=1)
+        return dense, _ConvHebbianTrace(tuple(pre_activations), tuple(post_activations))
+
+    def _scale_top_k_budgets(self) -> tuple[int, ...]:
+        channels = self.feature_channels
+        total_channels = max(sum(channels), 1)
+        budgets = [
+            max(1, int(round(self.top_k * (channel_count / total_channels))))
+            for channel_count in channels
+        ]
+        difference = self.top_k - sum(budgets)
+        index = 0
+        while difference != 0 and budgets:
+            position = index % len(budgets)
+            if difference > 0:
+                budgets[position] += 1
+                difference -= 1
+            elif budgets[position] > 1:
+                budgets[position] -= 1
+                difference += 1
+            index += 1
+            if index > len(budgets) * max(self.top_k, 1) * 2:
+                break
+        return tuple(max(1, budget) for budget in budgets)
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raw_batch, squeeze = self._ensure_spatial_batch(x)
-        dense, _, _ = self._forward_dense(raw_batch)
-        sparse = sparse_top_k(dense, self.top_k)
+        dense, _ = self._forward_dense(raw_batch)
+        scale_sizes = [channel_count * self.spatial_grid * self.spatial_grid for channel_count in self.feature_channels]
+        budgets = self._scale_top_k_budgets()
+        sparse_scales: list[torch.Tensor] = []
+        start = 0
+        for size, budget in zip(scale_sizes, budgets, strict=True):
+            scale = dense[:, start : start + size]
+            sparse_scales.append(sparse_top_k(scale, min(budget, size)))
+            start += size
+        sparse = normalize(torch.cat(sparse_scales, dim=1))
         return self._maybe_squeeze(sparse, squeeze)
 
     @staticmethod
@@ -143,9 +248,19 @@ class ConvF1Layer(nn.Module):
     @staticmethod
     def _clamp_filter_norms(weight: torch.Tensor, *, max_norm: float = 1.0) -> None:
         flat = weight.view(weight.shape[0], -1)
-        norms = flat.norm(dim=1, keepdim=True)
-        scale = torch.clamp(norms / max(max_norm, 1e-6), min=1.0)
-        flat.div_(scale)
+        flat.sub_(flat.mean(dim=1, keepdim=True))
+        norms = flat.norm(dim=1, keepdim=True).clamp_min(1e-6)
+        flat.mul_(float(max_norm) / norms)
+
+    @staticmethod
+    def _competitive_channel_mask(post: torch.Tensor, competitive_k: int) -> torch.Tensor:
+        if competitive_k >= post.shape[1]:
+            return torch.ones(post.shape[0], post.shape[1], 1, device=post.device, dtype=post.dtype)
+        channel_energy = post.mean(dim=(2, 3))
+        _, top_indices = torch.topk(channel_energy, k=min(competitive_k, channel_energy.shape[1]), dim=1)
+        mask = torch.zeros_like(channel_energy)
+        mask.scatter_(1, top_indices, 1.0)
+        return mask.unsqueeze(-1)
 
     @staticmethod
     def _hebbian_conv_update(
@@ -155,6 +270,8 @@ class ConvF1Layer(nn.Module):
         signal: torch.Tensor,
         *,
         lr: float,
+        competitive_k: int,
+        weight_norm_target: float,
     ) -> None:
         if lr <= 0.0 or not bool((signal > 0).any().item()):
             return
@@ -166,13 +283,14 @@ class ConvF1Layer(nn.Module):
             stride=layer.stride,
         )
         post_flat = post.to(layer.weight.dtype).reshape(post.shape[0], post.shape[1], -1)
-        weighted_post = post_flat * signal.to(post_flat.dtype).view(-1, 1, 1)
+        channel_mask = ConvF1Layer._competitive_channel_mask(post, competitive_k).to(post_flat.dtype)
+        weighted_post = post_flat * channel_mask * signal.to(post_flat.dtype).view(-1, 1, 1)
         denom = max(pre.shape[0] * post_flat.shape[-1], 1)
         delta = torch.einsum("bol,bil->oi", weighted_post, patches) / denom
         layer.weight.add_(float(lr) * delta.reshape_as(layer.weight))
         if layer.bias is not None:
-            layer.bias.add_(float(lr) * weighted_post.mean(dim=(0, 2)))
-        ConvF1Layer._clamp_filter_norms(layer.weight.data)
+            layer.bias.mul_(0.99).add_(float(lr) * weighted_post.mean(dim=(0, 2)))
+        ConvF1Layer._clamp_filter_norms(layer.weight.data, max_norm=weight_norm_target)
 
     @torch.no_grad()
     def hebbian_update(
@@ -180,20 +298,34 @@ class ConvF1Layer(nn.Module):
         x: torch.Tensor,
         *,
         learning_signal: torch.Tensor | None = None,
-        lr: float = 0.01,
+        lr: float | None = None,
     ) -> None:
-        if bool(self.is_frozen.item()) or lr <= 0.0:
+        effective_lr = self.hebbian_lr if lr is None else float(lr)
+        if bool(self.is_frozen.item()) or effective_lr <= 0.0:
             return
         raw_batch, _ = self._ensure_spatial_batch(x)
-        _, h1, h2 = self._forward_dense(raw_batch)
+        _, traces = self._forward_dense(raw_batch)
         signal = self._align_signal(
             learning_signal,
             raw_batch.shape[0],
             raw_batch.device,
             self.conv1.weight.dtype,
         ).clamp_min(0.0)
-        self._hebbian_conv_update(self.conv1, raw_batch, h1, signal, lr=lr)
-        self._hebbian_conv_update(self.conv2, h1, h2, signal, lr=lr)
+        layers = [self.conv1]
+        if self.conv2 is not None:
+            layers.append(self.conv2)
+        if self.conv3 is not None:
+            layers.append(self.conv3)
+        for layer, pre, post in zip(layers, traces.pre_activations, traces.post_activations, strict=True):
+            self._hebbian_conv_update(
+                layer,
+                pre,
+                post,
+                signal,
+                lr=effective_lr,
+                competitive_k=self.competitive_k,
+                weight_norm_target=self.weight_norm_target,
+            )
 
 
 class ConvConceptCellCluster(nn.Module):
@@ -214,6 +346,12 @@ class ConvConceptCellCluster(nn.Module):
             spatial_size=config.spatial_size,
             top_k=config.f1_top_k,
             spatial_grid=config.spatial_grid,
+            num_layers=config.num_conv_layers,
+            hidden_channels=config.conv_hidden_channels,
+            spatial_top_k=config.spatial_top_k,
+            competitive_k=config.conv_competitive_k,
+            hebbian_lr=config.conv_hebbian_lr,
+            weight_norm_target=config.conv_weight_norm,
         )
         self.margin_gate = MarginGate(margin_config)
         self.register_buffer("feedback_template", torch.zeros(config.concept_dim, dtype=torch.float32))
@@ -377,7 +515,7 @@ class ConvConceptCellCluster(nn.Module):
                     device=raw_batch.device,
                     dtype=torch.float32,
                 ),
-                lr=float(self.config.fast_lr) * lr_multiplier,
+                lr=float(self.config.conv_hebbian_lr) * 1.5 * lr_multiplier,
             )
             f1_batch = self._ensure_feature_batch(self.f1_encode(raw_batch))[0]
         else:
@@ -416,7 +554,7 @@ class ConvConceptCellCluster(nn.Module):
             self.f1_layer.hebbian_update(
                 raw_batch,
                 learning_signal=learn_signal,
-                lr=float(self.config.slow_lr) * lr_multiplier,
+                lr=float(self.config.conv_hebbian_lr) * lr_multiplier,
             )
             f1_batch = self._ensure_feature_batch(self.f1_encode(raw_batch))[0]
         else:
@@ -524,6 +662,12 @@ class ConvCCCPool(nn.Module):
             spatial_size=config.spatial_size,
             top_k=config.f1_top_k,
             spatial_grid=config.spatial_grid,
+            num_layers=config.num_conv_layers,
+            hidden_channels=config.conv_hidden_channels,
+            spatial_top_k=config.spatial_top_k,
+            competitive_k=config.conv_competitive_k,
+            hebbian_lr=config.conv_hebbian_lr,
+            weight_norm_target=config.conv_weight_norm,
         )
         self.cccs = nn.ModuleList(
             [
@@ -608,6 +752,44 @@ class ConvCCCPool(nn.Module):
             if not bool(ccc.is_committed.item()):
                 return index
         return None
+
+    @torch.no_grad()
+    def hebbian_update(
+        self,
+        raw_input: torch.Tensor,
+        *,
+        fired_indices: list[int] | None = None,
+        winner_confidences: torch.Tensor | None = None,
+        recruited: bool = False,
+        learning_rate_multiplier: float | torch.Tensor = 1.0,
+    ) -> None:
+        if bool(self.shared_f1.is_frozen.item()) or float(self.config.conv_hebbian_lr) <= 0.0:
+            return
+        if recruited or (fired_indices and len(fired_indices) > 0):
+            return
+
+        raw_batch, _ = self.shared_f1._ensure_spatial_batch(raw_input)
+        lr_multiplier = max(
+            0.0,
+            float(torch.as_tensor(learning_rate_multiplier, dtype=torch.float32).mean().item()),
+        )
+        if lr_multiplier <= 0.0:
+            return
+
+        confidence_signal = 0.25
+        if winner_confidences is not None and winner_confidences.numel() > 0:
+            confidence_signal = max(confidence_signal, float(winner_confidences.mean().item()))
+        learning_signal = torch.full(
+            (raw_batch.shape[0],),
+            confidence_signal,
+            device=raw_batch.device,
+            dtype=torch.float32,
+        )
+        self.shared_f1.hebbian_update(
+            raw_batch,
+            learning_signal=learning_signal,
+            lr=float(self.config.conv_hebbian_lr) * 0.5 * lr_multiplier,
+        )
 
     @torch.no_grad()
     def preview(self, raw_input: torch.Tensor) -> ConvCCCPoolOutput:
