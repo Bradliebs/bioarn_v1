@@ -47,6 +47,13 @@ class _ConvHebbianTrace:
     post_activations: tuple[torch.Tensor, ...]
 
 
+@dataclass
+class _PendingConvHebbianCall:
+    pre_activations: tuple[torch.Tensor, ...]
+    post_activations: tuple[torch.Tensor, ...]
+    scaled_signal: torch.Tensor
+
+
 class ConvF1Layer(nn.Module):
     """Convolutional F1 encoder that preserves spatial structure."""
 
@@ -63,6 +70,7 @@ class ConvF1Layer(nn.Module):
         spatial_top_k: int = 4,
         competitive_k: int = 8,
         hebbian_lr: float = 0.0025,
+        hebbian_batch_size: int = 1,
         weight_norm_target: float = 1.0,
     ) -> None:
         super().__init__()
@@ -78,7 +86,10 @@ class ConvF1Layer(nn.Module):
         self.spatial_top_k = int(max(1, spatial_top_k))
         self.competitive_k = int(max(1, competitive_k))
         self.hebbian_lr = float(max(0.0, hebbian_lr))
+        self.hebbian_batch_size = int(max(1, hebbian_batch_size))
         self.weight_norm_target = float(max(1e-6, weight_norm_target))
+        self._pending_hebbian_calls: list[_PendingConvHebbianCall] = []
+        self._pending_hebbian_samples = 0
 
         if self.num_layers == 1:
             self.conv1 = nn.Conv2d(self.in_channels, self.num_features, kernel_size=3, padding=1)
@@ -109,6 +120,7 @@ class ConvF1Layer(nn.Module):
         return (self.hidden_channels[0], self.hidden_channels[1], self.num_features)
 
     def freeze(self) -> None:
+        self.flush_hebbian_updates()
         self.is_frozen.fill_(True)
 
     def _ensure_spatial_batch(self, x: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -190,6 +202,20 @@ class ConvF1Layer(nn.Module):
         dense = torch.cat(pooled_scales, dim=1)
         return dense, _ConvHebbianTrace(tuple(pre_activations), tuple(post_activations))
 
+    def _sparsify_dense(self, dense: torch.Tensor) -> torch.Tensor:
+        scale_sizes = [
+            channel_count * self.spatial_grid * self.spatial_grid
+            for channel_count in self.feature_channels
+        ]
+        budgets = self._scale_top_k_budgets()
+        sparse_scales: list[torch.Tensor] = []
+        start = 0
+        for size, budget in zip(scale_sizes, budgets, strict=True):
+            scale = dense[:, start : start + size]
+            sparse_scales.append(sparse_top_k(scale, min(budget, size)))
+            start += size
+        return normalize(torch.cat(sparse_scales, dim=1))
+
     def _scale_top_k_budgets(self) -> tuple[int, ...]:
         channels = self.feature_channels
         total_channels = max(sum(channels), 1)
@@ -216,15 +242,7 @@ class ConvF1Layer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raw_batch, squeeze = self._ensure_spatial_batch(x)
         dense, _ = self._forward_dense(raw_batch)
-        scale_sizes = [channel_count * self.spatial_grid * self.spatial_grid for channel_count in self.feature_channels]
-        budgets = self._scale_top_k_budgets()
-        sparse_scales: list[torch.Tensor] = []
-        start = 0
-        for size, budget in zip(scale_sizes, budgets, strict=True):
-            scale = dense[:, start : start + size]
-            sparse_scales.append(sparse_top_k(scale, min(budget, size)))
-            start += size
-        sparse = normalize(torch.cat(sparse_scales, dim=1))
+        sparse = self._sparsify_dense(dense)
         return self._maybe_squeeze(sparse, squeeze)
 
     @staticmethod
@@ -263,18 +281,14 @@ class ConvF1Layer(nn.Module):
         return mask.unsqueeze(-1)
 
     @staticmethod
-    def _hebbian_conv_update(
+    def _compute_hebbian_conv_delta(
         layer: nn.Conv2d,
         pre: torch.Tensor,
         post: torch.Tensor,
-        signal: torch.Tensor,
+        scaled_signal: torch.Tensor,
         *,
-        lr: float,
         competitive_k: int,
-        weight_norm_target: float,
-    ) -> None:
-        if lr <= 0.0 or not bool((signal > 0).any().item()):
-            return
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         patches = F.unfold(
             pre.to(layer.weight.dtype),
             kernel_size=layer.kernel_size,
@@ -284,13 +298,58 @@ class ConvF1Layer(nn.Module):
         )
         post_flat = post.to(layer.weight.dtype).reshape(post.shape[0], post.shape[1], -1)
         channel_mask = ConvF1Layer._competitive_channel_mask(post, competitive_k).to(post_flat.dtype)
-        weighted_post = post_flat * channel_mask * signal.to(post_flat.dtype).view(-1, 1, 1)
-        denom = max(pre.shape[0] * post_flat.shape[-1], 1)
-        delta = torch.einsum("bol,bil->oi", weighted_post, patches) / denom
-        layer.weight.add_(float(lr) * delta.reshape_as(layer.weight))
-        if layer.bias is not None:
-            layer.bias.mul_(0.99).add_(float(lr) * weighted_post.mean(dim=(0, 2)))
-        ConvF1Layer._clamp_filter_norms(layer.weight.data, max_norm=weight_norm_target)
+        weighted_post = post_flat * channel_mask * scaled_signal.to(post_flat.dtype).view(-1, 1, 1)
+        spatial_positions = max(post_flat.shape[-1], 1)
+        delta = torch.einsum("bol,bil->oi", weighted_post, patches) / spatial_positions
+        return delta.reshape_as(layer.weight), weighted_post.mean(dim=2)
+
+    @torch.no_grad()
+    def flush_hebbian_updates(self) -> bool:
+        if not self._pending_hebbian_calls:
+            return False
+
+        pending_calls = self._pending_hebbian_calls
+        layers = [self.conv1]
+        if self.conv2 is not None:
+            layers.append(self.conv2)
+        if self.conv3 is not None:
+            layers.append(self.conv3)
+
+        for layer_index, layer in enumerate(layers):
+            pre_batch = torch.cat(
+                [call.pre_activations[layer_index] for call in pending_calls],
+                dim=0,
+            )
+            post_batch = torch.cat(
+                [call.post_activations[layer_index] for call in pending_calls],
+                dim=0,
+            )
+            scaled_signal = torch.cat(
+                [call.scaled_signal.to(layer.weight.dtype) for call in pending_calls],
+                dim=0,
+            )
+            if not bool((scaled_signal > 0).any().item()):
+                continue
+
+            weight_delta, bias_terms = self._compute_hebbian_conv_delta(
+                layer,
+                pre_batch,
+                post_batch,
+                scaled_signal,
+                competitive_k=self.competitive_k,
+            )
+            layer.weight.add_(weight_delta)
+            if layer.bias is not None:
+                start = 0
+                for call in pending_calls:
+                    end = start + call.scaled_signal.numel()
+                    layer.bias.mul_(0.99).add_(bias_terms[start:end].sum(dim=0))
+                    start = end
+            self._clamp_filter_norms(layer.weight.data, max_norm=self.weight_norm_target)
+
+        self._pending_hebbian_calls.clear()
+        self._pending_hebbian_samples = 0
+        return True
 
     @torch.no_grad()
     def hebbian_update(
@@ -299,33 +358,37 @@ class ConvF1Layer(nn.Module):
         *,
         learning_signal: torch.Tensor | None = None,
         lr: float | None = None,
-    ) -> None:
+        trace: _ConvHebbianTrace | None = None,
+    ) -> bool:
         effective_lr = self.hebbian_lr if lr is None else float(lr)
         if bool(self.is_frozen.item()) or effective_lr <= 0.0:
-            return
+            return False
         raw_batch, _ = self._ensure_spatial_batch(x)
-        _, traces = self._forward_dense(raw_batch)
+        traces = trace if trace is not None else self._forward_dense(raw_batch)[1]
         signal = self._align_signal(
             learning_signal,
             raw_batch.shape[0],
             raw_batch.device,
             self.conv1.weight.dtype,
         ).clamp_min(0.0)
-        layers = [self.conv1]
-        if self.conv2 is not None:
-            layers.append(self.conv2)
-        if self.conv3 is not None:
-            layers.append(self.conv3)
-        for layer, pre, post in zip(layers, traces.pre_activations, traces.post_activations, strict=True):
-            self._hebbian_conv_update(
-                layer,
-                pre,
-                post,
-                signal,
-                lr=effective_lr,
-                competitive_k=self.competitive_k,
-                weight_norm_target=self.weight_norm_target,
+        if not bool((signal > 0).any().item()):
+            return False
+
+        scaled_signal = signal.to(self.conv1.weight.dtype) * (effective_lr / max(raw_batch.shape[0], 1))
+        self._pending_hebbian_calls.append(
+            _PendingConvHebbianCall(
+                pre_activations=traces.pre_activations,
+                post_activations=traces.post_activations,
+                scaled_signal=scaled_signal.reshape(-1),
             )
+        )
+        self._pending_hebbian_samples += raw_batch.shape[0]
+        if (
+            self.hebbian_batch_size <= 1
+            or self._pending_hebbian_samples >= self.hebbian_batch_size
+        ):
+            return self.flush_hebbian_updates()
+        return False
 
 
 class ConvConceptCellCluster(nn.Module):
@@ -351,6 +414,7 @@ class ConvConceptCellCluster(nn.Module):
             spatial_top_k=config.spatial_top_k,
             competitive_k=config.conv_competitive_k,
             hebbian_lr=config.conv_hebbian_lr,
+            hebbian_batch_size=config.hebbian_batch_size,
             weight_norm_target=config.conv_weight_norm,
         )
         self.margin_gate = MarginGate(margin_config)
@@ -395,6 +459,14 @@ class ConvConceptCellCluster(nn.Module):
             )
         return vector
 
+    def _encode_f1(
+        self,
+        raw_input: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, _ConvHebbianTrace, bool]:
+        raw_batch, squeeze = self.f1_layer._ensure_spatial_batch(raw_input)
+        dense, trace = self.f1_layer._forward_dense(raw_batch)
+        return raw_batch, self.f1_layer._sparsify_dense(dense), trace, squeeze
+
     def maybe_lock(self) -> None:
         if bool(self.is_locked.item()) or not bool(self.is_committed.item()):
             return
@@ -434,7 +506,8 @@ class ConvConceptCellCluster(nn.Module):
 
     @torch.no_grad()
     def f1_encode(self, raw_input: torch.Tensor) -> torch.Tensor:
-        return self.f1_layer(raw_input)
+        _, f1_batch, _, squeeze = self._encode_f1(raw_input)
+        return self._maybe_squeeze(f1_batch, squeeze)
 
     @torch.no_grad()
     def f2_activate(self, f1_output: torch.Tensor) -> torch.Tensor:
@@ -453,8 +526,17 @@ class ConvConceptCellCluster(nn.Module):
 
     @torch.no_grad()
     def preview(self, raw_input: torch.Tensor) -> ConvCCCOutput:
-        raw_batch, squeeze = self.f1_layer._ensure_spatial_batch(raw_input)
-        f1_batch = self._ensure_feature_batch(self.f1_encode(raw_batch))[0]
+        raw_batch, f1_batch, _, squeeze = self._encode_f1(raw_input)
+        return self.preview_encoded(raw_batch, f1_batch, squeeze=squeeze)
+
+    @torch.no_grad()
+    def preview_encoded(
+        self,
+        raw_batch: torch.Tensor,
+        f1_batch: torch.Tensor,
+        *,
+        squeeze: bool = False,
+    ) -> ConvCCCOutput:
         f2_batch = self._ensure_feature_batch(self.f2_activate(f1_batch))[0]
         if not bool(self.is_committed.item()):
             return self.empty_output(raw_batch if not squeeze else raw_batch.squeeze(0))
@@ -498,6 +580,7 @@ class ConvConceptCellCluster(nn.Module):
         raw_input: torch.Tensor,
         f1_output: torch.Tensor,
         *,
+        f1_trace: _ConvHebbianTrace | None = None,
         learning_rate_multiplier: float | torch.Tensor = 1.0,
     ) -> None:
         if bool(self.is_locked.item()):
@@ -508,7 +591,7 @@ class ConvConceptCellCluster(nn.Module):
             float(torch.as_tensor(learning_rate_multiplier, dtype=torch.float32).mean().item()),
         )
         if not bool(self.f1_layer.is_frozen.item()):
-            self.f1_layer.hebbian_update(
+            applied = self.f1_layer.hebbian_update(
                 raw_batch,
                 learning_signal=torch.ones(
                     raw_batch.shape[0],
@@ -516,8 +599,12 @@ class ConvConceptCellCluster(nn.Module):
                     dtype=torch.float32,
                 ),
                 lr=float(self.config.conv_hebbian_lr) * 1.5 * lr_multiplier,
+                trace=f1_trace,
             )
-            f1_batch = self._ensure_feature_batch(self.f1_encode(raw_batch))[0]
+            if applied:
+                _, f1_batch, _, _ = self._encode_f1(raw_batch)
+            else:
+                f1_batch = self._ensure_feature_batch(f1_output)[0]
         else:
             f1_batch = self._ensure_feature_batch(f1_output)[0]
         prototype = f1_batch.mean(dim=0)
@@ -532,6 +619,7 @@ class ConvConceptCellCluster(nn.Module):
         f1_output: torch.Tensor,
         resonance: ResonanceOutput,
         *,
+        f1_trace: _ConvHebbianTrace | None = None,
         timestep: int | None = None,
         learning_rate_multiplier: float | torch.Tensor = 1.0,
     ) -> None:
@@ -551,12 +639,16 @@ class ConvConceptCellCluster(nn.Module):
             return
 
         if not bool(self.f1_layer.is_frozen.item()):
-            self.f1_layer.hebbian_update(
+            applied = self.f1_layer.hebbian_update(
                 raw_batch,
                 learning_signal=learn_signal,
                 lr=float(self.config.conv_hebbian_lr) * lr_multiplier,
+                trace=f1_trace,
             )
-            f1_batch = self._ensure_feature_batch(self.f1_encode(raw_batch))[0]
+            if applied:
+                _, f1_batch, _, _ = self._encode_f1(raw_batch)
+            else:
+                f1_batch = self._ensure_feature_batch(f1_output)[0]
         else:
             f1_batch = self._ensure_feature_batch(f1_output)[0]
         learn_signal = learn_signal.to(f1_batch.dtype)
@@ -581,8 +673,27 @@ class ConvConceptCellCluster(nn.Module):
         *,
         learning_rate_multiplier: float | torch.Tensor = 1.0,
     ) -> ConvCCCOutput:
-        raw_batch, squeeze = self.f1_layer._ensure_spatial_batch(raw_input)
-        f1_batch = self._ensure_feature_batch(self.f1_encode(raw_batch))[0]
+        raw_batch, f1_batch, f1_trace, squeeze = self._encode_f1(raw_input)
+        return self.forward_encoded(
+            raw_batch,
+            f1_batch,
+            f1_trace=f1_trace,
+            squeeze=squeeze,
+            timestep=timestep,
+            learning_rate_multiplier=learning_rate_multiplier,
+        )
+
+    @torch.no_grad()
+    def forward_encoded(
+        self,
+        raw_batch: torch.Tensor,
+        f1_batch: torch.Tensor,
+        *,
+        f1_trace: _ConvHebbianTrace | None = None,
+        squeeze: bool = False,
+        timestep: int = 0,
+        learning_rate_multiplier: float | torch.Tensor = 1.0,
+    ) -> ConvCCCOutput:
         f2_batch = self._ensure_feature_batch(self.f2_activate(f1_batch))[0]
         self.age.add_(raw_batch.shape[0])
 
@@ -603,6 +714,7 @@ class ConvConceptCellCluster(nn.Module):
                     raw_batch,
                     f1_batch,
                     resonance,
+                    f1_trace=f1_trace,
                     timestep=timestep,
                     learning_rate_multiplier=learning_rate_multiplier,
                 )
@@ -667,6 +779,7 @@ class ConvCCCPool(nn.Module):
             spatial_top_k=config.spatial_top_k,
             competitive_k=config.conv_competitive_k,
             hebbian_lr=config.conv_hebbian_lr,
+            hebbian_batch_size=config.hebbian_batch_size,
             weight_norm_target=config.conv_weight_norm,
         )
         self.cccs = nn.ModuleList(
@@ -683,6 +796,14 @@ class ConvCCCPool(nn.Module):
         )
         self._sync_importance_buffers()
 
+    def _encode_shared_f1(
+        self,
+        raw_input: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, _ConvHebbianTrace, bool]:
+        raw_batch, squeeze = self.shared_f1._ensure_spatial_batch(raw_input)
+        dense, trace = self.shared_f1._forward_dense(raw_batch)
+        return raw_batch, self.shared_f1._sparsify_dense(dense), trace, squeeze
+
     @property
     def concept_directions(self) -> torch.Tensor:
         if not self.cccs:
@@ -692,6 +813,10 @@ class ConvCCCPool(nn.Module):
     def freeze_f1(self) -> None:
         self.shared_f1.freeze()
         self.f1_frozen.fill_(True)
+
+    @torch.no_grad()
+    def flush_hebbian_updates(self) -> bool:
+        return self.shared_f1.flush_hebbian_updates()
 
     def observe_samples(self, sample_count: int) -> None:
         count = int(max(0, sample_count))
@@ -793,12 +918,14 @@ class ConvCCCPool(nn.Module):
 
     @torch.no_grad()
     def preview(self, raw_input: torch.Tensor) -> ConvCCCPoolOutput:
+        raw_batch, f1_batch, _, squeeze = self._encode_shared_f1(raw_input)
+        encoded_input = raw_batch if not squeeze else raw_batch.squeeze(0)
         outputs: list[ConvCCCOutput] = []
         for ccc in self.cccs:
             if bool(ccc.is_committed.item()):
-                outputs.append(ccc.preview(raw_input))
+                outputs.append(ccc.preview_encoded(raw_batch, f1_batch, squeeze=squeeze))
             else:
-                outputs.append(ccc.empty_output(raw_input))
+                outputs.append(ccc.empty_output(encoded_input))
 
         fired_indices = [index for index, output in enumerate(outputs) if output.fired]
         abstained_indices = [index for index, output in enumerate(outputs) if output.abstained]
@@ -825,21 +952,25 @@ class ConvCCCPool(nn.Module):
         *,
         learning_rate_multiplier: float | torch.Tensor = 1.0,
     ) -> ConvCCCPoolOutput:
-        raw_batch, _ = self.shared_f1._ensure_spatial_batch(raw_input)
+        raw_batch, f1_batch, f1_trace, squeeze = self._encode_shared_f1(raw_input)
+        encoded_input = raw_batch if not squeeze else raw_batch.squeeze(0)
         self.observe_samples(raw_batch.shape[0])
 
         outputs: list[ConvCCCOutput] = []
         for ccc in self.cccs:
             if bool(ccc.is_committed.item()):
                 outputs.append(
-                    ccc(
-                        raw_input,
+                    ccc.forward_encoded(
+                        raw_batch,
+                        f1_batch,
+                        f1_trace=f1_trace,
+                        squeeze=squeeze,
                         timestep=timestep,
                         learning_rate_multiplier=learning_rate_multiplier,
                     )
                 )
             else:
-                outputs.append(ccc.empty_output(raw_input))
+                outputs.append(ccc.empty_output(encoded_input))
 
         recruited = False
         recruited_index = None
@@ -850,21 +981,27 @@ class ConvCCCPool(nn.Module):
                 new_size = self.grow()
                 if new_size > previous_size:
                     outputs.extend(
-                        self.cccs[index].empty_output(raw_input)
+                        self.cccs[index].empty_output(encoded_input)
                         for index in range(previous_size, new_size)
                     )
                     recruited_index = self._first_uncommitted_index()
             if recruited_index is not None:
                 recruited = True
                 recruited_ccc = self.cccs[recruited_index]
-                f1_output = recruited_ccc.f1_encode(raw_input)
                 recruited_ccc.learn_fast(
-                    raw_input,
-                    f1_output,
+                    raw_batch,
+                    f1_batch,
+                    f1_trace=f1_trace,
                     learning_rate_multiplier=learning_rate_multiplier,
                 )
-                outputs[recruited_index] = recruited_ccc(
-                    raw_input,
+                refreshed_raw_batch, refreshed_f1_batch, refreshed_trace, _ = self._encode_shared_f1(
+                    raw_batch
+                )
+                outputs[recruited_index] = recruited_ccc.forward_encoded(
+                    refreshed_raw_batch,
+                    refreshed_f1_batch,
+                    f1_trace=refreshed_trace,
+                    squeeze=squeeze,
                     timestep=timestep,
                     learning_rate_multiplier=learning_rate_multiplier,
                 )

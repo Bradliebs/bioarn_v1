@@ -66,6 +66,8 @@ class VisionTrainConfig:
     maturation: MaturationConfig | None = None
     precision: PrecisionConfig | None = None
     lateral_prediction: LateralPredictionConfig | None = None
+    num_f1_features: int | None = None
+    f1_top_k: int | None = None
 
 
 @dataclass
@@ -378,6 +380,7 @@ class VisionTrainer:
                 slow_lr=config.learning_rate,
                 feedback_lr=config.learning_rate,
                 conv_hebbian_lr=max(0.0005, min(0.005, float(config.learning_rate) * 0.25)),
+                hebbian_batch_size=max(1, int(config.batch_size)) if config.use_batched else 1,
                 conv_competitive_k=16,
                 spatial_top_k=6,
                 conv_weight_norm=1.0,
@@ -391,11 +394,21 @@ class VisionTrainer:
             lateral_config = copy.deepcopy(config.lateral_prediction)
             if precision_config is not None:
                 precision_config.pool_size = int(config.max_pool_size)
+            conv_f1_features = (
+                int(config.num_f1_features)
+                if config.num_f1_features is not None
+                else max(16, min(64, input_dim))
+            )
+            conv_f1_top_k = (
+                int(config.f1_top_k)
+                if config.f1_top_k is not None
+                else max(8, min(64, conv_f1_features) // 4)
+            )
             placeholder_ccc = CCCConfig(
                 input_dim=input_dim,
                 concept_dim=conv_config.concept_dim,
-                num_f1_features=max(16, min(64, input_dim)),
-                f1_top_k=max(8, min(64, input_dim) // 4),
+                num_f1_features=conv_f1_features,
+                f1_top_k=conv_f1_top_k,
                 freeze_f1_after=config.freeze_f1_after,
                 f1_adapter_dim=config.f1_adapter_dim,
                 fast_lr=1.0,
@@ -441,7 +454,16 @@ class VisionTrainer:
             system.fabric.ccc_config = system.config.ccc
             return system
 
-        ccc_features = 64 if input_dim >= 1024 else max(16, min(64, input_dim))
+        ccc_features = (
+            int(config.num_f1_features)
+            if config.num_f1_features is not None
+            else (64 if input_dim >= 1024 else max(16, min(64, input_dim)))
+        )
+        ccc_top_k = (
+            int(config.f1_top_k)
+            if config.f1_top_k is not None
+            else max(8, ccc_features // 4)
+        )
         workspace_config = copy.deepcopy(config.workspace)
         precision_config = copy.deepcopy(config.precision)
         lateral_config = copy.deepcopy(config.lateral_prediction)
@@ -452,7 +474,7 @@ class VisionTrainer:
                 input_dim=input_dim,
                 concept_dim=config.concept_dim,
                 num_f1_features=ccc_features,
-                f1_top_k=max(8, ccc_features // 4),
+                f1_top_k=ccc_top_k,
                 freeze_f1_after=config.freeze_f1_after,
                 f1_adapter_dim=config.f1_adapter_dim,
                 fast_lr=1.0,
@@ -575,6 +597,7 @@ class VisionTrainer:
             observer(int(sample_count))
 
     def _freeze_pool_f1_if_ready(self) -> None:
+        self._flush_pool_hebbian_updates()
         freezer = getattr(self.system.ccc_pool, "freeze_f1", None)
         pool_config = getattr(self.system.config, "ccc", None)
         if not callable(freezer) or pool_config is None:
@@ -583,9 +606,15 @@ class VisionTrainer:
             return
         freezer()
 
+    def _flush_pool_hebbian_updates(self) -> None:
+        flusher = getattr(self.system.ccc_pool, "flush_hebbian_updates", None)
+        if callable(flusher):
+            flusher()
+
     def start_new_task(self) -> None:
         if int(getattr(self.system.config.ccc, "freeze_f1_after", 0)) <= 0:
             return
+        self._flush_pool_hebbian_updates()
         self._freeze_pool_f1_if_ready()
         creator = getattr(self.system.ccc_pool, "create_task_adapter", None)
         if callable(creator):
@@ -921,6 +950,7 @@ class VisionTrainer:
                 particularly useful when the source stream is sorted by class.
         """
         target_samples = self.config.num_train_samples if num_samples is None else int(num_samples)
+        self._flush_pool_hebbian_updates()
         auto_conv_benchmark = data_stream is None and bool(self.config.use_conv_ccc)
         num_passes = max(1, int(num_passes))
         if data_stream is None:
@@ -1148,7 +1178,9 @@ class VisionTrainer:
                         f"acc={accuracy_curve[-1]:.3f} "
                         f"abstain={abstention_curve[-1]:.3f}"
                     )
+            self._flush_pool_hebbian_updates()
 
+        self._flush_pool_hebbian_updates()
         result = {
             "processed_samples": processed,
             "raw_samples_seen": len(samples),
@@ -1190,6 +1222,7 @@ class VisionTrainer:
         test_stream: StreamingDataSource | Iterable[DataSample | tuple[torch.Tensor, int]],
         num_samples: int | None = None,
     ) -> dict[str, object]:
+        self._flush_pool_hebbian_updates()
         target_samples = self.config.num_test_samples if num_samples is None else int(num_samples)
         total = 0
         labeled = 0
@@ -1251,6 +1284,7 @@ class VisionTrainer:
         self,
         noise_samples: torch.Tensor | Iterable[torch.Tensor],
     ) -> dict[str, float]:
+        self._flush_pool_hebbian_updates()
         if isinstance(noise_samples, torch.Tensor):
             iterable: Iterable[torch.Tensor] = noise_samples
         else:

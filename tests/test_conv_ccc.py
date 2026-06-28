@@ -18,6 +18,7 @@ def make_config(*, max_pool_size: int = 4, lock_threshold: float = 0.8) -> ConvC
         slow_lr=0.2,
         feedback_lr=0.2,
         conv_hebbian_lr=0.01,
+        hebbian_batch_size=1,
         conv_competitive_k=4,
         spatial_top_k=4,
         max_pool_size=max_pool_size,
@@ -73,6 +74,7 @@ def test_conv_f1_layer_hebbian_updates_all_layers() -> None:
         top_k=4,
         hidden_channels=(12, 16),
         hebbian_lr=0.01,
+        hebbian_batch_size=1,
         competitive_k=4,
         spatial_top_k=4,
     )
@@ -88,6 +90,65 @@ def test_conv_f1_layer_hebbian_updates_all_layers() -> None:
     for weight in (layer.conv1.weight, layer.conv2.weight, layer.conv3.weight):
         flat = weight.view(weight.shape[0], -1)
         assert torch.allclose(flat.norm(dim=1), torch.ones(weight.shape[0]), atol=1e-4, rtol=1e-4)
+
+
+def test_conv_f1_layer_batched_hebbian_flushes_at_threshold() -> None:
+    layer = ConvF1Layer(
+        in_channels=3,
+        num_features=8,
+        spatial_size=32,
+        top_k=4,
+        hidden_channels=(12, 16),
+        hebbian_lr=0.01,
+        hebbian_batch_size=4,
+        competitive_k=4,
+        spatial_top_k=4,
+    )
+    before_conv1 = layer.conv1.weight.clone()
+
+    for seed in range(3):
+        applied = layer.hebbian_update(
+            make_image(seed),
+            learning_signal=torch.tensor([1.0]),
+        )
+        assert applied is False
+        assert torch.allclose(layer.conv1.weight, before_conv1)
+
+    applied = layer.hebbian_update(
+        make_image(3),
+        learning_signal=torch.tensor([1.0]),
+    )
+
+    assert applied is True
+    assert not torch.allclose(layer.conv1.weight, before_conv1)
+    for weight in (layer.conv1.weight, layer.conv2.weight, layer.conv3.weight):
+        flat = weight.view(weight.shape[0], -1)
+        assert torch.allclose(flat.norm(dim=1), torch.ones(weight.shape[0]), atol=1e-4, rtol=1e-4)
+
+
+def test_conv_f1_layer_manual_flush_applies_pending_updates() -> None:
+    layer = ConvF1Layer(
+        in_channels=3,
+        num_features=8,
+        spatial_size=32,
+        top_k=4,
+        hidden_channels=(12, 16),
+        hebbian_lr=0.01,
+        hebbian_batch_size=8,
+        competitive_k=4,
+        spatial_top_k=4,
+    )
+    before_conv1 = layer.conv1.weight.clone()
+
+    applied = layer.hebbian_update(
+        make_image(10),
+        learning_signal=torch.tensor([1.0]),
+    )
+
+    assert applied is False
+    assert torch.allclose(layer.conv1.weight, before_conv1)
+    assert layer.flush_hebbian_updates() is True
+    assert not torch.allclose(layer.conv1.weight, before_conv1)
 
 
 def test_conv_ccc_pool_recruits_from_images() -> None:
