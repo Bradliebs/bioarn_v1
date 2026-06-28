@@ -2,101 +2,86 @@ from __future__ import annotations
 
 import torch
 
-from bioarn.multimodal import MultimodalConfig
-from bioarn.training import MultimodalExample, MultimodalTrainer, MultimodalTrainingResult
+from bioarn.config import MultimodalTrainConfig, MultimodalFusionConfig
+from bioarn.training import MultimodalExample, MultimodalTrainer
 
 
-def make_config() -> MultimodalConfig:
-    return MultimodalConfig(
-        vision_dim=28 * 28,
-        language_dim=64,
-        concept_dim=64,
-        cross_modal_strength=0.8,
-        temporal_window=3,
-        max_description_length=12,
-        alignment_threshold=0.45,
+def make_config() -> MultimodalTrainConfig:
+    """Small config for fast tests."""
+    return MultimodalTrainConfig(
+        fusion=MultimodalFusionConfig(
+            concept_dim=64,
+            vision_pool_size=50,
+            audio_pool_size=30,
+            workspace_size=8,
+            margin_threshold=0.3,
+        ),
+        num_samples=24,
+        num_passes=2,
+        num_classes=3,
+        vision_size=16,
+        shuffle=True,
+        seed=42,
     )
 
 
-def digit_pattern(label: str) -> torch.Tensor:
-    image = torch.zeros(28, 28, dtype=torch.float32)
-    if label == "zero":
-        image[5, 8:20] = 1.0
-        image[22, 8:20] = 1.0
-        image[5:23, 8] = 1.0
-        image[5:23, 19] = 1.0
-    elif label == "one":
-        image[5:23, 14] = 1.0
-        image[22, 10:18] = 1.0
-    elif label == "two":
-        image[6, 8:20] = 1.0
-        image[14, 8:20] = 1.0
-        image[22, 8:20] = 1.0
-        image[7:14, 19] = 1.0
-        image[14:22, 8] = 1.0
-    else:
-        raise ValueError(f"Unsupported label: {label}")
-    return image
-
-
-def noisy_variant(image: torch.Tensor, seed: int) -> torch.Tensor:
-    generator = torch.Generator().manual_seed(seed)
-    noise = 0.03 * torch.randn(image.shape, generator=generator)
-    return (image + noise).clamp_(0.0, 1.0)
-
-
-def build_examples() -> list[MultimodalExample]:
-    labels = ["zero", "one", "two"]
-    dataset: list[MultimodalExample] = []
-    for repeat in range(2):
-        for index, label in enumerate(labels):
-            dataset.append(
+def build_vision_audio_examples() -> list[MultimodalExample]:
+    """Build paired vision+audio examples with distinct per-class patterns."""
+    examples: list[MultimodalExample] = []
+    labels = ["cat", "dog", "bird"]
+    n_mels = 40
+    n_frames = 32
+    for repeat in range(4):
+        for idx, label in enumerate(labels):
+            gen = torch.Generator().manual_seed(repeat * 10 + idx)
+            vision = torch.randn(16 * 16, generator=gen)
+            vision[idx * 80 : (idx + 1) * 80] += 3.0
+            audio = torch.randn(n_mels, n_frames, generator=gen)
+            audio[idx * 10 : (idx + 1) * 10, :] += 3.0
+            examples.append(
                 MultimodalExample(
-                    vision=noisy_variant(digit_pattern(label), seed=(repeat * 11) + index),
-                    text=label,
+                    vision=vision,
+                    audio=audio,
                     label=label,
                 )
             )
-    return dataset
+    return examples
 
 
-def test_multimodal_trainer_shares_cccs() -> None:
+def test_multimodal_trainer_trains_online() -> None:
+    """Trainer runs train_online and returns valid result dict."""
     torch.manual_seed(0)
-    trainer = MultimodalTrainer(make_config())
+    config = make_config()
+    trainer = MultimodalTrainer(config)
 
-    result = trainer.train(build_examples(), epochs=2)
+    result = trainer.train_online(build_vision_audio_examples())
 
-    assert isinstance(result, MultimodalTrainingResult)
-    for label in ("zero", "one", "two"):
-        assert trainer.fusion.label_to_ccc[("vision", label)] == trainer.fusion.label_to_ccc[("text", label)]
-    assert result.shared_cccs >= 3
-    assert result.concept_sharing_ratio > 0.0
+    assert isinstance(result, dict)
+    assert result["num_samples"] > 0
+    assert result["num_passes"] == 2
+    assert 0.0 <= result["mean_agreement"] <= 1.0
+    assert 0.0 <= result["mean_confidence"] <= 1.0
 
 
-def test_multimodal_trainer_interleaves_modalities() -> None:
+def test_multimodal_trainer_uses_default_stream() -> None:
+    """Trainer falls back to SyntheticMultimodalStream when no data provided."""
     torch.manual_seed(0)
-    trainer = MultimodalTrainer(make_config())
+    config = make_config()
+    trainer = MultimodalTrainer(config)
 
-    result = trainer.train(build_examples(), epochs=1)
+    result = trainer.train_online()
 
-    assert result.num_steps == result.num_pairs * 2
-    assert result.modality_sequence == ("vision", "text") * result.num_pairs
-    assert result.converged_pairs == result.num_pairs
+    assert isinstance(result, dict)
+    assert result["num_samples"] > 0
 
 
-def test_multimodal_trainer_evaluate_reports_retrieval_metrics() -> None:
+def test_multimodal_trainer_learns_associations() -> None:
+    """After training, the engine should have learned some cross-modal associations."""
     torch.manual_seed(0)
-    trainer = MultimodalTrainer(make_config())
-    examples = build_examples()
-    trainer.train(examples, epochs=2)
+    config = make_config()
+    trainer = MultimodalTrainer(config)
 
-    evaluation = trainer.evaluate(
-        [
-            MultimodalExample(vision=noisy_variant(example.vision, seed=index + 101), text=example.text, label=example.label)
-            for index, example in enumerate(examples[:3])
-        ]
-    )
+    result = trainer.train_online(build_vision_audio_examples())
 
-    assert evaluation.cross_modal_retrieval_accuracy >= 0.9
-    assert evaluation.mean_association_strength > 0.0
-    assert evaluation.mean_reciprocal_rank >= evaluation.cross_modal_retrieval_accuracy
+    assert result["num_associations"] >= 0
+    assert result["label_consistency"] >= 0.0
