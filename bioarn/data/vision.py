@@ -15,6 +15,7 @@ from typing import Iterator
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from bioarn.data.base import DataSample, StreamingDataSource
 
@@ -125,6 +126,68 @@ class _VisionStreamBase(StreamingDataSource):
         if self.flatten:
             image = image.reshape(-1)
         return self._move_tensor(image)
+
+
+class HebbianAugmentation:
+    """Training-time augmentations for Hebbian feature learning."""
+
+    def __init__(
+        self,
+        random_flip: bool = True,
+        random_crop: bool = True,
+        color_jitter: bool = False,
+        cutout: bool = False,
+        cutout_size: int = 8,
+    ) -> None:
+        self.random_flip = bool(random_flip)
+        self.random_crop = bool(random_crop)
+        self.color_jitter = bool(color_jitter)
+        self.cutout = bool(cutout)
+        self.cutout_size = int(max(1, cutout_size))
+        self.generator = torch.Generator()
+
+    @property
+    def is_active(self) -> bool:
+        return self.random_flip or self.random_crop or self.color_jitter or self.cutout
+
+    def _rand(self) -> float:
+        return float(torch.rand(1, generator=self.generator).item())
+
+    def _randint(self, low: int, high: int) -> int:
+        return int(torch.randint(low, high, (1,), generator=self.generator).item())
+
+    def __call__(self, image: torch.Tensor) -> torch.Tensor:
+        """Apply augmentations to a single image tensor [C, H, W]."""
+        if image.ndim != 3:
+            raise ValueError("HebbianAugmentation expects a [C, H, W] tensor.")
+
+        augmented = image.to(torch.float32).clone()
+        _, height, width = augmented.shape
+
+        if self.random_flip and self._rand() < 0.5:
+            augmented = torch.flip(augmented, dims=[2])
+
+        if self.random_crop:
+            padded = F.pad(augmented.unsqueeze(0), (4, 4, 4, 4), mode="constant", value=0.0).squeeze(0)
+            max_top = max(1, padded.shape[1] - height + 1)
+            max_left = max(1, padded.shape[2] - width + 1)
+            top = self._randint(0, max_top)
+            left = self._randint(0, max_left)
+            augmented = padded[:, top : top + height, left : left + width]
+
+        if self.color_jitter:
+            channel_scale = 0.8 + (0.4 * torch.rand((augmented.shape[0], 1, 1), generator=self.generator))
+            augmented = augmented * channel_scale.to(device=augmented.device, dtype=augmented.dtype)
+
+        if self.cutout:
+            size = min(self.cutout_size, height, width)
+            max_top = max(1, height - size + 1)
+            max_left = max(1, width - size + 1)
+            top = self._randint(0, max_top)
+            left = self._randint(0, max_left)
+            augmented[:, top : top + size, left : left + size] = 0.0
+
+        return augmented.clamp_(0.0, 1.0)
 
 
 class MNISTStream(_VisionStreamBase):
@@ -393,6 +456,69 @@ class CIFAR10Stream(_CIFARStreamBase):
         )
 
 
+class AugmentedCIFARStream(StreamingDataSource):
+    """CIFAR-10 stream with training-time augmentation."""
+
+    def __init__(
+        self,
+        num_samples: int = 1000,
+        augmentation: HebbianAugmentation | None = None,
+        augmentation_factor: int = 2,
+        seed: int = 42,
+        *,
+        data_dir: str | os.PathLike[str] = "data/",
+        base_stream: StreamingDataSource | None = None,
+    ) -> None:
+        super().__init__()
+        self.num_samples = int(max(0, num_samples))
+        self.augmentation = augmentation
+        self.augmentation_factor = int(max(1, augmentation_factor))
+        self.seed = int(seed)
+        self.base_stream = (
+            base_stream
+            if base_stream is not None
+            else CIFAR10Stream(
+                split="train",
+                data_dir=data_dir,
+                flatten=False,
+                normalize=True,
+                shuffle=True,
+                seed=seed,
+            )
+        )
+        if self.augmentation is not None:
+            self.augmentation.generator.manual_seed(self.seed)
+
+    def __len__(self) -> int:
+        base_length = min(self.num_samples, len(self.base_stream))
+        repeat_count = self.augmentation_factor if self.augmentation is not None and self.augmentation.is_active else 1
+        return base_length * repeat_count
+
+    def stream(self) -> Iterator[DataSample]:
+        repeat_count = self.augmentation_factor if self.augmentation is not None and self.augmentation.is_active else 1
+        yielded = 0
+        for sample in self.base_stream.stream():
+            if yielded >= self.num_samples:
+                break
+            if sample.label is None:
+                raise ValueError("AugmentedCIFARStream requires labelled CIFAR samples.")
+            image = sample.data.to(torch.float32)
+            if image.ndim != 3:
+                raise ValueError("AugmentedCIFARStream expects unflattened [C, H, W] CIFAR tensors.")
+            for view_index in range(repeat_count):
+                augmented = image.clone() if self.augmentation is None else self.augmentation(image)
+                metadata = dict(sample.metadata)
+                metadata["augmented"] = self.augmentation is not None and self.augmentation.is_active
+                metadata["augmentation_view"] = view_index
+                yield DataSample(
+                    data=augmented,
+                    label=int(sample.label),
+                    modality=sample.modality,
+                    metadata=metadata,
+                )
+            yielded += 1
+
+
 class CIFAR100Stream(_CIFARStreamBase):
     """CIFAR-100 streaming."""
 
@@ -496,4 +622,12 @@ class ImageFolderStream(_VisionStreamBase):
             )
 
 
-__all__ = ["CIFAR10Stream", "CIFAR100Stream", "FashionMNISTStream", "ImageFolderStream", "MNISTStream"]
+__all__ = [
+    "AugmentedCIFARStream",
+    "CIFAR10Stream",
+    "CIFAR100Stream",
+    "FashionMNISTStream",
+    "HebbianAugmentation",
+    "ImageFolderStream",
+    "MNISTStream",
+]

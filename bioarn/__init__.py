@@ -8,6 +8,7 @@ from bioarn.__version__ import __version__
 
 if TYPE_CHECKING:
     from bioarn.config import (
+        AugmentationConfig,
         AudioConfig,
         AudioHierarchyConfig,
         AudioTrainConfig,
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
         ConvCCCConfig,
         PrecisionConfig,
         RLTrainConfig,
+        WhiteningConfig,
         WorldModelConfig,
     )
     from bioarn.core.ccc import CCCPool, ConceptCellCluster
@@ -33,6 +35,7 @@ __all__ = [
     "AudioHierarchyConfig",
     "AudioTrainConfig",
     "AudioTrainer",
+    "AugmentationConfig",
     "AgentConfig",
     "AssociativeMemoryConfig",
     "AssociativeMemoryEngine",
@@ -52,6 +55,7 @@ __all__ = [
     "SensorimotorLoop",
     "VisionTrainConfig",
     "VisionTrainer",
+    "WhiteningConfig",
     "WorldModelConfig",
     "__version__",
 ]
@@ -59,6 +63,7 @@ __all__ = [
 
 def __getattr__(name: str):
     if name in {
+        "AugmentationConfig",
         "AudioConfig",
         "AudioHierarchyConfig",
         "AudioTrainConfig",
@@ -69,9 +74,11 @@ def __getattr__(name: str):
         "ConvCCCConfig",
         "PrecisionConfig",
         "RLTrainConfig",
+        "WhiteningConfig",
         "WorldModelConfig",
     }:
         from bioarn.config import (
+            AugmentationConfig,
             AudioConfig,
             AudioHierarchyConfig,
             AudioTrainConfig,
@@ -82,10 +89,12 @@ def __getattr__(name: str):
             ConvCCCConfig,
             PrecisionConfig,
             RLTrainConfig,
+            WhiteningConfig,
             WorldModelConfig,
         )
 
         exports = {
+            "AugmentationConfig": AugmentationConfig,
             "AudioConfig": AudioConfig,
             "AudioHierarchyConfig": AudioHierarchyConfig,
             "AudioTrainConfig": AudioTrainConfig,
@@ -96,6 +105,7 @@ def __getattr__(name: str):
             "ConvCCCConfig": ConvCCCConfig,
             "PrecisionConfig": PrecisionConfig,
             "RLTrainConfig": RLTrainConfig,
+            "WhiteningConfig": WhiteningConfig,
             "WorldModelConfig": WorldModelConfig,
         }
         return exports[name]

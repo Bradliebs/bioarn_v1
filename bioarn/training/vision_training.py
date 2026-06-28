@@ -6,7 +6,7 @@ import copy
 import contextlib
 import socket
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from itertools import islice
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -14,6 +14,7 @@ from typing import Iterable, Iterator
 import torch
 
 from bioarn.config import (
+    AugmentationConfig,
     BioARNConfig,
     CCCConfig,
     ConvCCCConfig,
@@ -27,7 +28,7 @@ from bioarn.config import (
 from bioarn.core.conv_ccc import ConvCCCPool
 from bioarn.core.math_utils import cosine_similarity, normalize
 from bioarn.core.margin_gate import ResonanceOutput
-from bioarn.data import CIFAR10Stream, DataSample, StreamingDataSource
+from bioarn.data import AugmentedCIFARStream, CIFAR10Stream, DataSample, HebbianAugmentation, StreamingDataSource
 from bioarn.loop import SensorimotorLoop
 from bioarn.preprocessing import PreprocessingPipeline
 from bioarn.reward import NoveltySignal, RewardSystem
@@ -72,6 +73,7 @@ class VisionTrainConfig:
     lateral_prediction: LateralPredictionConfig | None = None
     num_f1_features: int | None = None
     f1_top_k: int | None = None
+    augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
 
 
 @dataclass
@@ -198,12 +200,26 @@ def load_cifar10_or_synthetic(
     test_samples: int = 2000,
     seed: int = 0,
     timeout_seconds: float = 20.0,
+    augmentation: AugmentationConfig | None = None,
 ) -> tuple[StreamingDataSource, StreamingDataSource, str]:
     """Try CIFAR-10 first; fall back to a structured synthetic stream on failure."""
 
+    use_augmentation = augmentation is not None and augmentation.enabled
+    augmenter = (
+        HebbianAugmentation(
+            random_flip=augmentation.random_flip,
+            random_crop=augmentation.random_crop,
+            color_jitter=augmentation.color_jitter,
+            cutout=augmentation.cutout,
+            cutout_size=augmentation.cutout_size,
+        )
+        if use_augmentation
+        else None
+    )
+
     try:
         with _socket_timeout(timeout_seconds):
-            train_stream = CIFAR10Stream(
+            train_stream: StreamingDataSource = CIFAR10Stream(
                 split="train",
                 data_dir=data_dir,
                 flatten=True,
@@ -219,10 +235,37 @@ def load_cifar10_or_synthetic(
                 shuffle=False,
                 seed=seed,
             )
+        if use_augmentation and augmenter is not None:
+            train_stream = AugmentedCIFARStream(
+                num_samples=train_samples,
+                augmentation=augmenter,
+                augmentation_factor=augmentation.augmentation_factor,
+                seed=seed,
+                data_dir=data_dir,
+            )
         return train_stream, test_stream, "cifar10"
     except Exception:
+        synthetic_train: StreamingDataSource = SyntheticCIFAR10Stream(
+            train_samples,
+            flatten=True,
+            shuffle=True,
+            seed=seed,
+        )
+        if use_augmentation and augmenter is not None:
+            synthetic_train = AugmentedCIFARStream(
+                num_samples=train_samples,
+                augmentation=augmenter,
+                augmentation_factor=augmentation.augmentation_factor,
+                seed=seed,
+                base_stream=SyntheticCIFAR10Stream(
+                    train_samples,
+                    flatten=False,
+                    shuffle=True,
+                    seed=seed,
+                ),
+            )
         return (
-            SyntheticCIFAR10Stream(train_samples, flatten=True, shuffle=True, seed=seed),
+            synthetic_train,
             SyntheticCIFAR10Stream(test_samples, flatten=True, shuffle=False, seed=seed + 1),
             "synthetic-cifar10",
         )
@@ -1153,7 +1196,10 @@ class VisionTrainer:
                 train_samples=target_samples,
                 test_samples=self.config.num_test_samples,
                 seed=0,
+                augmentation=self.config.augmentation,
             )
+            if self.config.augmentation.enabled:
+                target_samples = len(data_stream)
         if auto_conv_benchmark and num_passes == 1:
             num_passes = 3
         samples = self._materialize_samples(data_stream, target_samples)
@@ -1533,6 +1579,7 @@ class VisionTrainer:
                 contrastive_curiosity=self.config.contrastive_curiosity,
                 workspace=copy.deepcopy(self.config.workspace),
                 maturation=copy.deepcopy(self.config.maturation),
+                augmentation=copy.deepcopy(self.config.augmentation),
             ),
             preprocessing=copy.deepcopy(self.preprocessing),
         )

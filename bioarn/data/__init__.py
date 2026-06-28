@@ -7,9 +7,19 @@ from bioarn.data.curriculum import CurriculumScheduler
 from bioarn.data.language import CharacterStream, TinyStoriesStream, WikiTextStream
 from bioarn.data.multimodal import MultimodalStream, SyntheticMultimodalStream
 from bioarn.data.video import SyntheticVideoStream, VideoSequence
-from bioarn.data.vision import CIFAR10Stream, CIFAR100Stream, FashionMNISTStream, ImageFolderStream, MNISTStream
+from bioarn.data.vision import (
+    AugmentedCIFARStream,
+    CIFAR10Stream,
+    CIFAR100Stream,
+    FashionMNISTStream,
+    HebbianAugmentation,
+    ImageFolderStream,
+    MNISTStream,
+)
+from bioarn.data.whitening import WhitenedCIFARStream, ZCAWhitening
 
 __all__ = [
+    "AugmentedCIFARStream",
     "CIFAR10Stream",
     "CIFAR100Stream",
     "CharacterStream",
@@ -17,6 +27,7 @@ __all__ = [
     "DataBatch",
     "DataSample",
     "FashionMNISTStream",
+    "HebbianAugmentation",
     "ImageFolderStream",
     "MNISTStream",
     "MultimodalStream",
@@ -28,4 +39,6 @@ __all__ = [
     "TinyStoriesStream",
     "VideoSequence",
     "WikiTextStream",
+    "WhitenedCIFARStream",
+    "ZCAWhitening",
 ]
