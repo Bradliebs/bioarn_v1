@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 import math
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -79,6 +81,10 @@ class ConvF1Layer(nn.Module):
         feature_pool_avg_mix: float = 0.25,
         hebbian_oja_decay: float = 0.05,
         filter_decorrelation: float = 0.02,
+        softhebb_enabled: bool = False,
+        softhebb_gamma: float = 4.0,
+        softhebb_beta: float = 2.0,
+        softhebb_theta_decay: float = 0.99,
     ) -> None:
         super().__init__()
         self.in_channels = int(in_channels)
@@ -115,6 +121,10 @@ class ConvF1Layer(nn.Module):
         self.feature_pool_avg_mix = float(min(max(feature_pool_avg_mix, 0.0), 1.0))
         self.hebbian_oja_decay = float(max(0.0, hebbian_oja_decay))
         self.filter_decorrelation = float(max(0.0, filter_decorrelation))
+        self.softhebb_enabled = bool(softhebb_enabled)
+        self.softhebb_gamma = float(max(1e-6, softhebb_gamma))
+        self.softhebb_beta = float(max(1.0, softhebb_beta))
+        self.softhebb_theta_decay = float(min(max(softhebb_theta_decay, 0.0), 0.999999))
         self._pending_hebbian_calls: list[_PendingConvHebbianCall] = []
         self._pending_hebbian_samples = 0
 
@@ -133,8 +143,17 @@ class ConvF1Layer(nn.Module):
         self.conv1 = self.conv_layers[0]
         self.conv2 = self.conv_layers[1] if len(self.conv_layers) > 1 else None
         self.conv3 = self.conv_layers[2] if len(self.conv_layers) > 2 else None
+        self._softhebb_theta_names: tuple[str, ...] = tuple(
+            f"softhebb_theta_{layer_index}" for layer_index in range(len(self.conv_layers))
+        )
+        for layer_index, layer in enumerate(self.conv_layers):
+            self.register_buffer(
+                self._softhebb_theta_names[layer_index],
+                torch.zeros(layer.out_channels, dtype=layer.weight.dtype),
+            )
         self._initialize_filters()
         self.register_buffer("is_frozen", torch.tensor(False, dtype=torch.bool))
+        self.register_buffer("layer_frozen", torch.zeros(self.num_layers, dtype=torch.bool))
         for parameter in self.parameters():
             parameter.requires_grad_(False)
 
@@ -148,9 +167,27 @@ class ConvF1Layer(nn.Module):
             return (self.num_features,)
         return tuple(self.hidden_channels[: self.num_layers - 1]) + (self.num_features,)
 
+    @property
+    def softhebb_thetas(self) -> tuple[torch.Tensor, ...]:
+        return tuple(getattr(self, name) for name in self._softhebb_theta_names)
+
     def freeze(self) -> None:
         self.flush_hebbian_updates()
-        self.is_frozen.fill_(True)
+        for layer_index in range(self.num_layers):
+            self._freeze_layer(layer_index)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        theta_keys = {f"{prefix}{name}" for name in self._softhebb_theta_names}
+        missing_keys[:] = [key for key in missing_keys if key not in theta_keys]
 
     def _ensure_spatial_batch(self, x: torch.Tensor) -> tuple[torch.Tensor, bool]:
         expected = self.in_channels * self.spatial_size * self.spatial_size
@@ -190,7 +227,30 @@ class ConvF1Layer(nn.Module):
     def _downsample(x: torch.Tensor) -> torch.Tensor:
         if min(x.shape[-2:]) <= 1:
             return x
-        return F.avg_pool2d(x, kernel_size=2, stride=2)
+        return F.max_pool2d(x, kernel_size=2, stride=2)
+
+    def _sync_frozen_state(self) -> None:
+        self.is_frozen.fill_(bool(self.layer_frozen.all().item()))
+
+    def _freeze_layer(self, layer_idx: int) -> None:
+        layer = self.conv_layers[layer_idx]
+        for parameter in layer.parameters():
+            parameter.requires_grad_(False)
+        self.layer_frozen[layer_idx] = True
+        self._sync_frozen_state()
+
+    def _unfreeze_layer(self, layer_idx: int) -> None:
+        layer = self.conv_layers[layer_idx]
+        for parameter in layer.parameters():
+            parameter.requires_grad_(False)
+        self.layer_frozen[layer_idx] = False
+        self._sync_frozen_state()
+
+    def _is_layer_frozen(self, layer_idx: int) -> bool:
+        return bool(self.layer_frozen[layer_idx].item())
+
+    def _should_pool_after_layer(self, layer_idx: int) -> bool:
+        return layer_idx < (self.num_layers - 1) and ((layer_idx + 1) % 2 == 0)
 
     def _local_contrast_normalize(self, x: torch.Tensor) -> torch.Tensor:
         if not self.enable_local_contrast_norm:
@@ -296,6 +356,35 @@ class ConvF1Layer(nn.Module):
             )
         return normalize(pooled.flatten(1))
 
+    def _apply_layer(self, layer: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
+        return F.relu(self._response_normalize(layer(x)))
+
+    def _forward_to_layer_input(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        if layer_idx <= 0:
+            return self._local_contrast_normalize(x.to(self.conv1.weight.dtype))
+        current = self._local_contrast_normalize(x.to(self.conv1.weight.dtype))
+        for previous_idx in range(layer_idx):
+            current = self._apply_layer(self.conv_layers[previous_idx], current)
+            if self._should_pool_after_layer(previous_idx):
+                current = self._downsample(current)
+        return current
+
+    def _cache_layerwise_batches(
+        self,
+        data: Iterable[torch.Tensor],
+        *,
+        samples_per_layer: int,
+    ) -> tuple[list[torch.Tensor], int]:
+        cached_batches: list[torch.Tensor] = []
+        cached_samples = 0
+        for sample in data:
+            raw_batch, _ = self._ensure_spatial_batch(sample)
+            cached_batches.append(raw_batch.detach().clone())
+            cached_samples += raw_batch.shape[0]
+            if cached_samples >= samples_per_layer:
+                break
+        return cached_batches, cached_samples
+
     def _forward_dense(self, x: torch.Tensor) -> tuple[torch.Tensor, _ConvHebbianTrace]:
         batch = x.to(self.conv1.weight.dtype)
         pre_activations: list[torch.Tensor] = []
@@ -305,11 +394,10 @@ class ConvF1Layer(nn.Module):
 
         for layer_index, layer in enumerate(self.conv_layers):
             pre_activations.append(current)
-            current = layer(current)
-            current = F.relu(self._response_normalize(current))
+            current = self._apply_layer(layer, current)
             post_activations.append(current)
             feature_maps.append(current)
-            if layer_index < len(self.conv_layers) - 1:
+            if self._should_pool_after_layer(layer_index):
                 current = self._downsample(current)
 
         pooled_scales = [self._competitive_spatial_pool(feature_map) for feature_map in feature_maps]
@@ -404,8 +492,9 @@ class ConvF1Layer(nn.Module):
         mask.scatter_(1, top_indices, 1.0)
         return mask.unsqueeze(-1)
 
-    @staticmethod
     def _compute_hebbian_conv_delta(
+        self,
+        layer_index: int,
         layer: nn.Conv2d,
         pre: torch.Tensor,
         post: torch.Tensor,
@@ -423,17 +512,65 @@ class ConvF1Layer(nn.Module):
         )
         patches = patches - patches.mean(dim=1, keepdim=True)
         patches = patches / patches.norm(dim=1, keepdim=True).clamp_min(1e-6)
-        post_flat = post.to(layer.weight.dtype).reshape(post.shape[0], post.shape[1], -1)
-        channel_mask = ConvF1Layer._competitive_channel_mask(post, competitive_k).to(post_flat.dtype)
-        centered_post = (post_flat - post_flat.mean(dim=2, keepdim=True)).clamp_min(0.0)
-        weighted_post = centered_post * channel_mask * scaled_signal.to(post_flat.dtype).view(-1, 1, 1)
+        post_map = post.to(layer.weight.dtype)
+        post_flat = post_map.reshape(post.shape[0], post.shape[1], -1)
+        signal_scale = scaled_signal.to(post_flat.dtype).view(-1, 1, 1)
+        if self.softhebb_enabled:
+            soft_wta = F.softmax(self.softhebb_gamma * post_map, dim=1)
+            theta = self.softhebb_thetas[layer_index]
+            theta_update = soft_wta.square().mean(dim=(0, 2, 3)).to(theta.dtype)
+            theta.mul_(self.softhebb_theta_decay).add_((1.0 - self.softhebb_theta_decay) * theta_update)
+            bcm_drive = soft_wta - theta.to(soft_wta.dtype).view(1, -1, 1, 1)
+            if self.softhebb_beta != 1.0:
+                bcm_drive = torch.sign(bcm_drive) * torch.abs(bcm_drive).pow(self.softhebb_beta)
+            weighted_post = bcm_drive.mul(soft_wta).reshape(post.shape[0], post.shape[1], -1) * signal_scale
+            oja_drive = (
+                weighted_post * soft_wta.reshape(post.shape[0], post.shape[1], -1)
+            ).mean(dim=(0, 2), keepdim=False).unsqueeze(1)
+        else:
+            channel_mask = ConvF1Layer._competitive_channel_mask(post_map, competitive_k).to(post_flat.dtype)
+            centered_post = (post_flat - post_flat.mean(dim=2, keepdim=True)).clamp_min(0.0)
+            weighted_post = centered_post * channel_mask * signal_scale
+            oja_drive = weighted_post.square().mean(dim=(0, 2)).unsqueeze(1)
         spatial_positions = max(post_flat.shape[-1], 1)
         delta = torch.einsum("bol,bil->oi", weighted_post, patches) / spatial_positions
         if oja_decay > 0.0:
             flat_weight = layer.weight.view(layer.weight.shape[0], -1)
-            post_power = weighted_post.square().mean(dim=(0, 2)).unsqueeze(1)
-            delta = delta - (float(oja_decay) * post_power * flat_weight)
+            delta = delta - (float(oja_decay) * oja_drive * flat_weight)
         return delta.reshape_as(layer.weight), weighted_post.mean(dim=2)
+
+    @torch.no_grad()
+    def _apply_layer_hebbian_update(
+        self,
+        layer_index: int,
+        pre_batch: torch.Tensor,
+        post_batch: torch.Tensor,
+        scaled_signal: torch.Tensor,
+    ) -> bool:
+        if self._is_layer_frozen(layer_index):
+            return False
+        layer = self.conv_layers[layer_index]
+        effective_signal = scaled_signal.to(layer.weight.dtype)
+        if not bool((effective_signal > 0).any().item()):
+            return False
+        weight_delta, bias_terms = self._compute_hebbian_conv_delta(
+            layer_index,
+            layer,
+            pre_batch,
+            post_batch,
+            effective_signal,
+            competitive_k=self.competitive_k,
+            oja_decay=self.hebbian_oja_decay,
+        )
+        layer.weight.add_(weight_delta)
+        if layer.bias is not None:
+            layer.bias.mul_(0.99).add_(bias_terms.sum(dim=0))
+        self._clamp_filter_norms(
+            layer.weight.data,
+            max_norm=self.weight_norm_target,
+            decorrelation=self.filter_decorrelation,
+        )
+        return True
 
     @torch.no_grad()
     def flush_hebbian_updates(self) -> bool:
@@ -456,33 +593,87 @@ class ConvF1Layer(nn.Module):
                 [call.scaled_signal.to(layer.weight.dtype) for call in pending_calls],
                 dim=0,
             )
-            if not bool((scaled_signal > 0).any().item()):
-                continue
-
-            weight_delta, bias_terms = self._compute_hebbian_conv_delta(
-                layer,
+            self._apply_layer_hebbian_update(
+                layer_index,
                 pre_batch,
                 post_batch,
                 scaled_signal,
-                competitive_k=self.competitive_k,
-                oja_decay=self.hebbian_oja_decay,
-            )
-            layer.weight.add_(weight_delta)
-            if layer.bias is not None:
-                start = 0
-                for call in pending_calls:
-                    end = start + call.scaled_signal.numel()
-                    layer.bias.mul_(0.99).add_(bias_terms[start:end].sum(dim=0))
-                    start = end
-            self._clamp_filter_norms(
-                layer.weight.data,
-                max_norm=self.weight_norm_target,
-                decorrelation=self.filter_decorrelation,
             )
 
         self._pending_hebbian_calls.clear()
         self._pending_hebbian_samples = 0
         return True
+
+    @torch.no_grad()
+    def train_layerwise(
+        self,
+        data: Iterable[torch.Tensor],
+        *,
+        samples_per_layer: int = 2000,
+        passes_per_layer: int = 3,
+        lr_schedule: list[float] | None = None,
+    ) -> dict[str, Any]:
+        """Train each convolutional layer sequentially with frozen lower layers."""
+
+        self.flush_hebbian_updates()
+        cached_batches, cached_samples = self._cache_layerwise_batches(
+            data,
+            samples_per_layer=max(1, int(samples_per_layer)),
+        )
+        if not cached_batches:
+            return {}
+
+        passes = max(1, int(passes_per_layer))
+        results: dict[str, Any] = {}
+        for layer_idx in range(self.num_layers):
+            stage_before = [layer.weight.detach().clone() for layer in self.conv_layers]
+            for index in range(self.num_layers):
+                if index < layer_idx:
+                    self._freeze_layer(index)
+                else:
+                    self._unfreeze_layer(index)
+
+            layer_lr = self.hebbian_lr
+            if lr_schedule:
+                schedule_index = min(layer_idx, len(lr_schedule) - 1)
+                layer_lr = float(lr_schedule[schedule_index])
+            updates_applied = 0
+
+            for _ in range(passes):
+                for raw_batch in cached_batches:
+                    layer_input = self._forward_to_layer_input(raw_batch, layer_idx)
+                    post_batch = self._apply_layer(self.conv_layers[layer_idx], layer_input)
+                    scaled_signal = torch.full(
+                        (raw_batch.shape[0],),
+                        max(layer_lr, 0.0) / max(raw_batch.shape[0], 1),
+                        device=raw_batch.device,
+                        dtype=self.conv1.weight.dtype,
+                    )
+                    if self._apply_layer_hebbian_update(
+                        layer_idx,
+                        layer_input,
+                        post_batch,
+                        scaled_signal,
+                    ):
+                        updates_applied += 1
+
+            changed_layers = [
+                index
+                for index, (before, layer) in enumerate(zip(stage_before, self.conv_layers, strict=True))
+                if not torch.allclose(layer.weight, before)
+            ]
+            self._freeze_layer(layer_idx)
+            results[f"layer_{layer_idx}"] = {
+                "samples": cached_samples,
+                "passes": passes,
+                "lr": layer_lr,
+                "updates_applied": updates_applied,
+                "changed_layers": changed_layers,
+                "frozen_layers": [self._is_layer_frozen(index) for index in range(self.num_layers)],
+            }
+
+        self._sync_frozen_state()
+        return results
 
     @torch.no_grad()
     def hebbian_update(
@@ -556,6 +747,10 @@ class ConvConceptCellCluster(nn.Module):
             feature_pool_avg_mix=config.feature_pool_avg_mix,
             hebbian_oja_decay=config.hebbian_oja_decay,
             filter_decorrelation=config.filter_decorrelation,
+            softhebb_enabled=config.softhebb_enabled,
+            softhebb_gamma=config.softhebb_gamma,
+            softhebb_beta=config.softhebb_beta,
+            softhebb_theta_decay=config.softhebb_theta_decay,
         )
         self.margin_gate = MarginGate(margin_config)
         self.register_buffer("feedback_template", torch.zeros(config.concept_dim, dtype=torch.float32))
@@ -928,6 +1123,10 @@ class ConvCCCPool(nn.Module):
             feature_pool_avg_mix=config.feature_pool_avg_mix,
             hebbian_oja_decay=config.hebbian_oja_decay,
             filter_decorrelation=config.filter_decorrelation,
+            softhebb_enabled=config.softhebb_enabled,
+            softhebb_gamma=config.softhebb_gamma,
+            softhebb_beta=config.softhebb_beta,
+            softhebb_theta_decay=config.softhebb_theta_decay,
         )
         self.cccs = nn.ModuleList(
             [

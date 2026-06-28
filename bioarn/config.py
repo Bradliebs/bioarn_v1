@@ -144,6 +144,27 @@ class CCCConfig:
 
 
 @dataclass
+class LayerwiseTrainConfig:
+    """Greedy layer-wise Hebbian pre-training parameters."""
+
+    enabled: bool = False
+    samples_per_layer: int = 2000
+    passes_per_layer: int = 3
+    lr_schedule: list[float] = field(
+        default_factory=lambda: [0.01, 0.005, 0.003, 0.002, 0.001]
+    )
+    freeze_after_training: bool = True
+
+    def __post_init__(self) -> None:
+        self.enabled = bool(self.enabled)
+        self.samples_per_layer = int(max(1, self.samples_per_layer))
+        self.passes_per_layer = int(max(1, self.passes_per_layer))
+        normalized_schedule = [float(max(0.0, lr)) for lr in self.lr_schedule]
+        self.lr_schedule = normalized_schedule or [0.01]
+        self.freeze_after_training = bool(self.freeze_after_training)
+
+
+@dataclass
 class ConvCCCConfig:
     """Convolutional CCC parameters."""
 
@@ -170,6 +191,11 @@ class ConvCCCConfig:
     feature_pool_avg_mix: float = 0.25
     hebbian_oja_decay: float = 0.05
     filter_decorrelation: float = 0.02
+    softhebb_enabled: bool = False
+    softhebb_gamma: float = 4.0
+    softhebb_beta: float = 2.0
+    softhebb_theta_decay: float = 0.99
+    layerwise_train: LayerwiseTrainConfig = field(default_factory=LayerwiseTrainConfig)
     max_pool_size: int = 200
     max_growth_factor: float = 3.0
     consolidation_strength: float = 0.0
@@ -186,6 +212,8 @@ class ConvCCCConfig:
         return tuple(hidden_channels[: self.num_conv_layers - 1]) + (self.num_conv_features,)
 
     def __post_init__(self) -> None:
+        if isinstance(self.layerwise_train, Mapping):
+            self.layerwise_train = LayerwiseTrainConfig(**self.layerwise_train)
         self.in_channels = int(max(1, self.in_channels))
         self.spatial_size = int(max(1, self.spatial_size))
         self.num_conv_features = int(max(1, self.num_conv_features))
@@ -226,10 +254,79 @@ class ConvCCCConfig:
         self.feature_pool_avg_mix = float(min(max(self.feature_pool_avg_mix, 0.0), 1.0))
         self.hebbian_oja_decay = float(max(0.0, self.hebbian_oja_decay))
         self.filter_decorrelation = float(max(0.0, self.filter_decorrelation))
+        self.softhebb_enabled = bool(self.softhebb_enabled)
+        self.softhebb_gamma = float(max(1e-6, self.softhebb_gamma))
+        self.softhebb_beta = float(max(1.0, self.softhebb_beta))
+        self.softhebb_theta_decay = float(min(max(self.softhebb_theta_decay, 0.0), 0.999999))
         self.max_pool_size = int(max(1, self.max_pool_size))
         self.max_growth_factor = float(max(1.0, self.max_growth_factor))
         self.consolidation_strength = float(max(0.0, self.consolidation_strength))
         self.lock_threshold = float(min(max(self.lock_threshold, 0.0), 1.0))
+
+
+def deep_cifar_config() -> ConvCCCConfig:
+    """Deeper CIFAR-oriented convolutional CCC preset with layer-wise pre-training."""
+
+    return ConvCCCConfig(
+        in_channels=3,
+        spatial_size=32,
+        num_conv_features=384,
+        num_conv_layers=5,
+        conv_hidden_channels=(96, 128, 192, 256),
+        conv_kernel_sizes=(5, 3, 3, 3, 3),
+        spatial_grid=4,
+        f1_top_k=64,
+        conv_hebbian_lr=0.005,
+        hebbian_batch_size=32,
+        conv_competitive_k=16,
+        spatial_top_k=8,
+        layerwise_train=LayerwiseTrainConfig(
+            enabled=True,
+            samples_per_layer=2000,
+            passes_per_layer=3,
+            lr_schedule=[0.01, 0.005, 0.003, 0.002, 0.001],
+            freeze_after_training=True,
+        ),
+    )
+
+
+@dataclass
+class AugmentationConfig:
+    """Configuration for training-time vision augmentation."""
+
+    enabled: bool = False
+    random_flip: bool = True
+    random_crop: bool = True
+    color_jitter: bool = False
+    cutout: bool = False
+    cutout_size: int = 8
+    augmentation_factor: int = 2
+
+    def __post_init__(self) -> None:
+        self.enabled = bool(self.enabled)
+        self.random_flip = bool(self.random_flip)
+        self.random_crop = bool(self.random_crop)
+        self.color_jitter = bool(self.color_jitter)
+        self.cutout = bool(self.cutout)
+        self.cutout_size = int(max(1, self.cutout_size))
+        self.augmentation_factor = int(max(1, self.augmentation_factor))
+
+
+@dataclass
+class WhiteningConfig:
+    """Offline whitening parameters for vision streams."""
+
+    enabled: bool = False
+    epsilon: float = 1e-5
+    n_fit_samples: int = 5000
+    n_components: int | None = None
+
+    def __post_init__(self) -> None:
+        self.enabled = bool(self.enabled)
+        self.epsilon = float(max(1e-12, self.epsilon))
+        self.n_fit_samples = int(max(2, self.n_fit_samples))
+        if self.n_components is not None:
+            self.n_components = int(max(1, self.n_components))
 
 
 @dataclass

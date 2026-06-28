@@ -1,6 +1,6 @@
 import torch
 
-from bioarn.config import ConvCCCConfig, MarginGateConfig
+from bioarn.config import ConvCCCConfig, MarginGateConfig, deep_cifar_config
 from bioarn.core.conv_ccc import ConvCCCPool, ConvF1Layer
 from bioarn.training import SyntheticCIFAR10Stream, VisionTrainConfig, VisionTrainer
 
@@ -149,6 +149,189 @@ def test_conv_f1_layer_manual_flush_applies_pending_updates() -> None:
     assert torch.allclose(layer.conv1.weight, before_conv1)
     assert layer.flush_hebbian_updates() is True
     assert not torch.allclose(layer.conv1.weight, before_conv1)
+
+
+def test_layerwise_trains_one_at_a_time() -> None:
+    layer = ConvF1Layer(
+        in_channels=3,
+        num_features=8,
+        spatial_size=32,
+        top_k=4,
+        num_layers=3,
+        hidden_channels=(12, 16),
+        kernel_sizes=(5, 3, 3),
+        hebbian_lr=0.01,
+        competitive_k=4,
+        spatial_top_k=4,
+    )
+    before_weights = [conv.weight.clone() for conv in layer.conv_layers]
+
+    results = layer.train_layerwise(
+        [make_image(20), make_image(21)],
+        samples_per_layer=2,
+        passes_per_layer=1,
+        lr_schedule=[0.01, 0.007, 0.005],
+    )
+
+    assert results["layer_0"]["changed_layers"] == [0]
+    assert results["layer_1"]["changed_layers"] == [1]
+    assert results["layer_2"]["changed_layers"] == [2]
+    assert all(result["updates_applied"] > 0 for result in results.values())
+    assert all(layer._is_layer_frozen(index) for index in range(layer.num_layers))
+    assert all(
+        not torch.allclose(conv.weight, before)
+        for conv, before in zip(layer.conv_layers, before_weights, strict=True)
+    )
+
+
+def test_layerwise_freezes_previous() -> None:
+    layer = ConvF1Layer(
+        in_channels=3,
+        num_features=8,
+        spatial_size=32,
+        top_k=4,
+        hidden_channels=(12, 16),
+        hebbian_lr=0.01,
+        hebbian_batch_size=1,
+        competitive_k=4,
+        spatial_top_k=4,
+    )
+    before_conv1 = layer.conv1.weight.clone()
+    before_conv2 = layer.conv2.weight.clone()
+    before_conv3 = layer.conv3.weight.clone()
+    layer._freeze_layer(0)
+
+    layer.hebbian_update(make_image(22), learning_signal=torch.tensor([1.0]))
+
+    assert layer._is_layer_frozen(0) is True
+    assert torch.allclose(layer.conv1.weight, before_conv1)
+    assert not torch.allclose(layer.conv2.weight, before_conv2)
+    assert not torch.allclose(layer.conv3.weight, before_conv3)
+
+
+def test_deeper_config_creates_more_layers() -> None:
+    config = deep_cifar_config()
+    pool = ConvCCCPool(config, make_margin_config())
+
+    assert config.num_conv_layers == 5
+    assert config.layerwise_train.enabled is True
+    assert len(pool.shared_f1.conv_layers) == 5
+    assert pool.shared_f1.feature_channels == (96, 128, 192, 256, 384)
+
+
+def test_maxpool_reduces_spatial() -> None:
+    layer = ConvF1Layer(
+        in_channels=3,
+        num_features=16,
+        spatial_size=32,
+        top_k=8,
+        num_layers=5,
+        hidden_channels=(8, 10, 12, 14),
+        kernel_sizes=(5, 3, 3, 3, 3),
+        competitive_k=4,
+        spatial_top_k=4,
+    )
+
+    _, trace = layer._forward_dense(torch.randn(1, 3, 32, 32))
+
+    assert trace.pre_activations[0].shape[-2:] == (32, 32)
+    assert trace.pre_activations[1].shape[-2:] == (32, 32)
+    assert trace.pre_activations[2].shape[-2:] == (16, 16)
+    assert trace.pre_activations[3].shape[-2:] == (16, 16)
+    assert trace.pre_activations[4].shape[-2:] == (8, 8)
+
+
+def test_softhebb_updates_weights() -> None:
+    torch.manual_seed(0)
+    layer = ConvF1Layer(
+        in_channels=3,
+        num_features=8,
+        spatial_size=32,
+        top_k=4,
+        hidden_channels=(12, 16),
+        hebbian_lr=0.01,
+        hebbian_batch_size=1,
+        competitive_k=4,
+        spatial_top_k=4,
+        softhebb_enabled=True,
+    )
+    before_weights = [conv.weight.clone() for conv in layer.conv_layers]
+    before_theta = [theta.clone() for theta in layer.softhebb_thetas]
+
+    layer.hebbian_update(make_image(11), learning_signal=torch.tensor([1.0]))
+
+    assert any(not torch.allclose(conv.weight, before) for conv, before in zip(layer.conv_layers, before_weights, strict=True))
+    assert any(not torch.allclose(theta, before) for theta, before in zip(layer.softhebb_thetas, before_theta, strict=True))
+    for theta in layer.softhebb_thetas:
+        assert torch.all(theta >= 0.0)
+
+
+def test_softhebb_bcm_threshold_adapts() -> None:
+    torch.manual_seed(1)
+    layer = ConvF1Layer(
+        in_channels=3,
+        num_features=6,
+        spatial_size=32,
+        top_k=4,
+        num_layers=1,
+        hidden_channels=(),
+        kernel_sizes=(3,),
+        hebbian_lr=0.01,
+        hebbian_batch_size=2,
+        competitive_k=2,
+        spatial_top_k=4,
+        softhebb_enabled=True,
+        softhebb_gamma=3.0,
+        softhebb_beta=2.0,
+        softhebb_theta_decay=0.8,
+    )
+    initial_theta = layer.softhebb_thetas[0].clone()
+
+    layer.hebbian_update(make_image(12), learning_signal=torch.tensor([1.0]))
+    assert torch.allclose(layer.softhebb_thetas[0], initial_theta)
+
+    layer.hebbian_update(make_image(13), learning_signal=torch.tensor([1.0]))
+    first_theta = layer.softhebb_thetas[0].clone()
+    layer.hebbian_update(make_image(14), learning_signal=torch.tensor([1.0]))
+    layer.hebbian_update(make_image(15), learning_signal=torch.tensor([1.0]))
+    second_theta = layer.softhebb_thetas[0].clone()
+
+    assert not torch.allclose(first_theta, initial_theta)
+    assert not torch.allclose(second_theta, first_theta)
+    assert torch.isfinite(second_theta).all()
+
+
+def test_softhebb_vs_hard_competitive() -> None:
+    torch.manual_seed(2)
+    shared_kwargs = dict(
+        in_channels=3,
+        num_features=6,
+        spatial_size=32,
+        top_k=4,
+        num_layers=1,
+        hidden_channels=(),
+        kernel_sizes=(3,),
+        hebbian_lr=0.01,
+        hebbian_batch_size=1,
+        competitive_k=1,
+        spatial_top_k=4,
+    )
+    hard_layer = ConvF1Layer(**shared_kwargs)
+    soft_layer = ConvF1Layer(**shared_kwargs, softhebb_enabled=True, softhebb_gamma=2.0)
+    soft_layer.load_state_dict(hard_layer.state_dict(), strict=False)
+    image = make_image(16)
+
+    before_hard = hard_layer.conv1.weight.clone()
+    before_soft = soft_layer.conv1.weight.clone()
+    hard_layer.hebbian_update(image, learning_signal=torch.tensor([1.0]))
+    soft_layer.hebbian_update(image, learning_signal=torch.tensor([1.0]))
+
+    hard_delta = (hard_layer.conv1.weight - before_hard).view(hard_layer.conv1.weight.shape[0], -1).norm(dim=1)
+    soft_delta = (soft_layer.conv1.weight - before_soft).view(soft_layer.conv1.weight.shape[0], -1).norm(dim=1)
+    hard_active = int((hard_delta > 1e-5).sum().item())
+    soft_active = int((soft_delta > 1e-5).sum().item())
+
+    assert soft_active > hard_active
 
 
 def test_conv_ccc_pool_recruits_from_images() -> None:
