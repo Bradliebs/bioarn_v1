@@ -1,1 +1,1 @@
-__version__ = "0.1.0"
+from bioarn.__version__ import __version__
