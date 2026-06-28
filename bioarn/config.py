@@ -151,7 +151,8 @@ class ConvCCCConfig:
     spatial_size: int = 32
     num_conv_features: int = 64
     num_conv_layers: int = 3
-    conv_hidden_channels: tuple[int, int] = (32, 64)
+    conv_hidden_channels: tuple[int, ...] = (32, 64)
+    conv_kernel_sizes: tuple[int, ...] = (5, 3, 3)
     spatial_grid: int = 4
     concept_dim: int = 0
     f1_top_k: int = 64
@@ -163,31 +164,50 @@ class ConvCCCConfig:
     conv_competitive_k: int = 8
     spatial_top_k: int = 4
     conv_weight_norm: float = 1.0
+    enable_local_contrast_norm: bool = True
+    contrast_kernel_size: int = 5
+    response_norm_eps: float = 1e-4
+    feature_pool_avg_mix: float = 0.25
+    hebbian_oja_decay: float = 0.05
+    filter_decorrelation: float = 0.02
     max_pool_size: int = 200
     max_growth_factor: float = 3.0
     consolidation_strength: float = 0.0
     lock_threshold: float = 0.8
 
     def feature_channels(self) -> tuple[int, ...]:
-        hidden1 = int(self.conv_hidden_channels[0])
-        hidden2 = int(self.conv_hidden_channels[1])
         if self.num_conv_layers <= 1:
             return (self.num_conv_features,)
-        if self.num_conv_layers == 2:
-            return (hidden1, self.num_conv_features)
-        return (hidden1, hidden2, self.num_conv_features)
+        hidden_channels = list(self.conv_hidden_channels)
+        if not hidden_channels:
+            hidden_channels = [max(32, self.num_conv_features)]
+        while len(hidden_channels) < max(0, self.num_conv_layers - 1):
+            hidden_channels.append(max(hidden_channels[-1], self.num_conv_features))
+        return tuple(hidden_channels[: self.num_conv_layers - 1]) + (self.num_conv_features,)
 
     def __post_init__(self) -> None:
         self.in_channels = int(max(1, self.in_channels))
         self.spatial_size = int(max(1, self.spatial_size))
         self.num_conv_features = int(max(1, self.num_conv_features))
-        self.num_conv_layers = int(min(max(1, self.num_conv_layers), 3))
+        self.num_conv_layers = int(max(1, self.num_conv_layers))
         hidden_channels = tuple(int(max(1, channel)) for channel in self.conv_hidden_channels)
         if not hidden_channels:
-            hidden_channels = (32, 64)
-        if len(hidden_channels) == 1:
-            hidden_channels = (hidden_channels[0], max(hidden_channels[0], self.num_conv_features))
-        self.conv_hidden_channels = (hidden_channels[0], hidden_channels[1])
+            hidden_channels = (max(32, self.num_conv_features),)
+        if len(hidden_channels) < max(0, self.num_conv_layers - 1):
+            expanded = list(hidden_channels)
+            while len(expanded) < max(0, self.num_conv_layers - 1):
+                expanded.append(max(expanded[-1], self.num_conv_features))
+            hidden_channels = tuple(expanded)
+        self.conv_hidden_channels = hidden_channels[: max(1, self.num_conv_layers - 1)]
+        kernel_sizes = tuple(int(max(1, kernel)) for kernel in self.conv_kernel_sizes)
+        if not kernel_sizes:
+            kernel_sizes = (5,)
+        if len(kernel_sizes) < self.num_conv_layers:
+            kernel_sizes = kernel_sizes + (kernel_sizes[-1],) * (self.num_conv_layers - len(kernel_sizes))
+        normalized_kernel_sizes = []
+        for kernel_size in kernel_sizes[: self.num_conv_layers]:
+            normalized_kernel_sizes.append(kernel_size if kernel_size % 2 == 1 else kernel_size + 1)
+        self.conv_kernel_sizes = tuple(normalized_kernel_sizes)
         self.spatial_grid = int(max(1, self.spatial_grid))
         if int(self.concept_dim) <= 0:
             self.concept_dim = sum(self.feature_channels()) * self.spatial_grid * self.spatial_grid
@@ -199,6 +219,13 @@ class ConvCCCConfig:
         self.conv_competitive_k = int(max(1, self.conv_competitive_k))
         self.spatial_top_k = int(max(1, self.spatial_top_k))
         self.conv_weight_norm = float(max(1e-6, self.conv_weight_norm))
+        self.contrast_kernel_size = int(max(1, self.contrast_kernel_size))
+        if self.contrast_kernel_size % 2 == 0:
+            self.contrast_kernel_size += 1
+        self.response_norm_eps = float(max(1e-8, self.response_norm_eps))
+        self.feature_pool_avg_mix = float(min(max(self.feature_pool_avg_mix, 0.0), 1.0))
+        self.hebbian_oja_decay = float(max(0.0, self.hebbian_oja_decay))
+        self.filter_decorrelation = float(max(0.0, self.filter_decorrelation))
         self.max_pool_size = int(max(1, self.max_pool_size))
         self.max_growth_factor = float(max(1.0, self.max_growth_factor))
         self.consolidation_strength = float(max(0.0, self.consolidation_strength))

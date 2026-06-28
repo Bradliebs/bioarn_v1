@@ -66,12 +66,19 @@ class ConvF1Layer(nn.Module):
         spatial_grid: int = 4,
         *,
         num_layers: int = 3,
-        hidden_channels: tuple[int, int] = (32, 64),
+        hidden_channels: tuple[int, ...] = (32, 64),
+        kernel_sizes: tuple[int, ...] = (5, 3, 3),
         spatial_top_k: int = 4,
         competitive_k: int = 8,
         hebbian_lr: float = 0.0025,
         hebbian_batch_size: int = 1,
         weight_norm_target: float = 1.0,
+        enable_local_contrast_norm: bool = True,
+        contrast_kernel_size: int = 5,
+        response_norm_eps: float = 1e-4,
+        feature_pool_avg_mix: float = 0.25,
+        hebbian_oja_decay: float = 0.05,
+        filter_decorrelation: float = 0.02,
     ) -> None:
         super().__init__()
         self.in_channels = int(in_channels)
@@ -79,30 +86,54 @@ class ConvF1Layer(nn.Module):
         self.spatial_size = int(spatial_size)
         self.spatial_grid = int(spatial_grid)
         self.top_k = int(max(1, top_k))
-        self.num_layers = int(min(max(1, num_layers), 3))
-        hidden1 = int(max(1, hidden_channels[0]))
-        hidden2 = int(max(1, hidden_channels[1]))
-        self.hidden_channels = (hidden1, hidden2)
+        self.num_layers = int(max(1, num_layers))
+        normalized_hidden = [int(max(1, channel)) for channel in hidden_channels]
+        if not normalized_hidden and self.num_layers > 1:
+            normalized_hidden = [max(32, self.num_features)]
+        while len(normalized_hidden) < max(0, self.num_layers - 1):
+            normalized_hidden.append(max(normalized_hidden[-1], self.num_features))
+        self.hidden_channels = tuple(normalized_hidden[: max(0, self.num_layers - 1)])
+        normalized_kernel_sizes = [int(max(1, kernel)) for kernel in kernel_sizes]
+        if not normalized_kernel_sizes:
+            normalized_kernel_sizes = [5]
+        while len(normalized_kernel_sizes) < self.num_layers:
+            normalized_kernel_sizes.append(normalized_kernel_sizes[-1])
+        self.kernel_sizes = tuple(
+            kernel if kernel % 2 == 1 else kernel + 1
+            for kernel in normalized_kernel_sizes[: self.num_layers]
+        )
         self.spatial_top_k = int(max(1, spatial_top_k))
         self.competitive_k = int(max(1, competitive_k))
         self.hebbian_lr = float(max(0.0, hebbian_lr))
         self.hebbian_batch_size = int(max(1, hebbian_batch_size))
         self.weight_norm_target = float(max(1e-6, weight_norm_target))
+        self.enable_local_contrast_norm = bool(enable_local_contrast_norm)
+        self.contrast_kernel_size = int(max(1, contrast_kernel_size))
+        if self.contrast_kernel_size % 2 == 0:
+            self.contrast_kernel_size += 1
+        self.response_norm_eps = float(max(1e-8, response_norm_eps))
+        self.feature_pool_avg_mix = float(min(max(feature_pool_avg_mix, 0.0), 1.0))
+        self.hebbian_oja_decay = float(max(0.0, hebbian_oja_decay))
+        self.filter_decorrelation = float(max(0.0, filter_decorrelation))
         self._pending_hebbian_calls: list[_PendingConvHebbianCall] = []
         self._pending_hebbian_samples = 0
 
-        if self.num_layers == 1:
-            self.conv1 = nn.Conv2d(self.in_channels, self.num_features, kernel_size=3, padding=1)
-            self.conv2 = None
-            self.conv3 = None
-        elif self.num_layers == 2:
-            self.conv1 = nn.Conv2d(self.in_channels, hidden1, kernel_size=3, padding=1)
-            self.conv2 = nn.Conv2d(hidden1, self.num_features, kernel_size=3, padding=1)
-            self.conv3 = None
-        else:
-            self.conv1 = nn.Conv2d(self.in_channels, hidden1, kernel_size=3, padding=1)
-            self.conv2 = nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1)
-            self.conv3 = nn.Conv2d(hidden2, self.num_features, kernel_size=3, padding=1)
+        channel_schedule = [self.in_channels, *self.feature_channels]
+        self.conv_layers = nn.ModuleList(
+            [
+                nn.Conv2d(
+                    channel_schedule[layer_index],
+                    channel_schedule[layer_index + 1],
+                    kernel_size=self.kernel_sizes[layer_index],
+                    padding=self.kernel_sizes[layer_index] // 2,
+                )
+                for layer_index in range(self.num_layers)
+            ]
+        )
+        self.conv1 = self.conv_layers[0]
+        self.conv2 = self.conv_layers[1] if len(self.conv_layers) > 1 else None
+        self.conv3 = self.conv_layers[2] if len(self.conv_layers) > 2 else None
+        self._initialize_filters()
         self.register_buffer("is_frozen", torch.tensor(False, dtype=torch.bool))
         for parameter in self.parameters():
             parameter.requires_grad_(False)
@@ -115,9 +146,7 @@ class ConvF1Layer(nn.Module):
     def feature_channels(self) -> tuple[int, ...]:
         if self.num_layers <= 1:
             return (self.num_features,)
-        if self.num_layers == 2:
-            return (self.hidden_channels[0], self.num_features)
-        return (self.hidden_channels[0], self.hidden_channels[1], self.num_features)
+        return tuple(self.hidden_channels[: self.num_layers - 1]) + (self.num_features,)
 
     def freeze(self) -> None:
         self.flush_hebbian_updates()
@@ -163,6 +192,93 @@ class ConvF1Layer(nn.Module):
             return x
         return F.avg_pool2d(x, kernel_size=2, stride=2)
 
+    def _local_contrast_normalize(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.enable_local_contrast_norm:
+            return x
+        padding = self.contrast_kernel_size // 2
+        local_mean = F.avg_pool2d(x, kernel_size=self.contrast_kernel_size, stride=1, padding=padding)
+        centered = x - local_mean
+        local_var = F.avg_pool2d(
+            centered.square(),
+            kernel_size=self.contrast_kernel_size,
+            stride=1,
+            padding=padding,
+        )
+        return centered / torch.sqrt(local_var + self.response_norm_eps)
+
+    def _response_normalize(self, x: torch.Tensor) -> torch.Tensor:
+        centered = x - x.mean(dim=(2, 3), keepdim=True)
+        scale = centered.square().mean(dim=(2, 3), keepdim=True)
+        return centered / torch.sqrt(scale + self.response_norm_eps)
+
+    @torch.no_grad()
+    def _initialize_filters(self) -> None:
+        if not self.conv_layers:
+            return
+        self._initialize_first_layer(self.conv_layers[0])
+        for layer in self.conv_layers[1:]:
+            nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
+            self._clamp_filter_norms(
+                layer.weight.data,
+                max_norm=self.weight_norm_target,
+                decorrelation=self.filter_decorrelation,
+            )
+            if layer.bias is not None:
+                layer.bias.zero_()
+
+    @staticmethod
+    @torch.no_grad()
+    def _initialize_first_layer(layer: nn.Conv2d) -> None:
+        base_patterns = torch.tensor(
+            [
+                [[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]],  # sobel x
+                [[1.0, 2.0, 1.0], [0.0, 0.0, 0.0], [-1.0, -2.0, -1.0]],  # sobel y
+                [[0.0, 1.0, 2.0], [-1.0, 0.0, 1.0], [-2.0, -1.0, 0.0]],  # diag /
+                [[2.0, 1.0, 0.0], [1.0, 0.0, -1.0], [0.0, -1.0, -2.0]],  # diag \
+                [[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]],  # laplacian
+                [[-1.0, -1.0, -1.0], [-1.0, 8.0, -1.0], [-1.0, -1.0, -1.0]],  # edge
+                [[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]],  # blur
+                [[-1.0, -1.0, -1.0], [-1.0, 9.0, -1.0], [-1.0, -1.0, -1.0]],  # sharpen
+            ],
+            dtype=layer.weight.dtype,
+            device=layer.weight.device,
+        )
+        color_mixes = torch.tensor(
+            [
+                [1.0, 1.0, 1.0],
+                [1.0, -1.0, 0.0],
+                [0.0, 1.0, -1.0],
+                [-1.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=layer.weight.dtype,
+            device=layer.weight.device,
+        )
+        patterns = []
+        for pattern in base_patterns:
+            pattern = pattern / pattern.norm().clamp_min(1e-6)
+            if layer.kernel_size != (3, 3):
+                pattern = F.interpolate(
+                    pattern.view(1, 1, 3, 3),
+                    size=layer.kernel_size,
+                    mode="bilinear",
+                    align_corners=False,
+                ).view(*layer.kernel_size)
+                pattern = pattern / pattern.norm().clamp_min(1e-6)
+            patterns.append(pattern)
+        for out_index in range(layer.weight.shape[0]):
+            pattern = patterns[out_index % len(patterns)]
+            mix = color_mixes[out_index % len(color_mixes)]
+            mix = mix / mix.norm().clamp_min(1e-6)
+            for in_index in range(layer.weight.shape[1]):
+                channel_weight = mix[in_index % mix.numel()]
+                layer.weight[out_index, in_index].copy_(pattern * channel_weight)
+        ConvF1Layer._clamp_filter_norms(layer.weight.data, max_norm=1.0, decorrelation=0.02)
+        if layer.bias is not None:
+            layer.bias.zero_()
+
     def _competitive_spatial_pool(self, feature_map: torch.Tensor) -> torch.Tensor:
         flat = feature_map.flatten(2)
         top_k = min(self.spatial_top_k, flat.shape[-1])
@@ -170,7 +286,14 @@ class ConvF1Layer(nn.Module):
         sparse_flat = torch.zeros_like(flat)
         sparse_flat.scatter_(2, top_indices, top_values)
         sparse_map = sparse_flat.view_as(feature_map)
-        pooled = F.adaptive_max_pool2d(sparse_map, (self.spatial_grid, self.spatial_grid))
+        max_pooled = F.adaptive_max_pool2d(sparse_map, (self.spatial_grid, self.spatial_grid))
+        if self.feature_pool_avg_mix <= 0.0:
+            pooled = max_pooled
+        else:
+            avg_pooled = F.adaptive_avg_pool2d(feature_map, (self.spatial_grid, self.spatial_grid))
+            pooled = ((1.0 - self.feature_pool_avg_mix) * max_pooled) + (
+                self.feature_pool_avg_mix * avg_pooled
+            )
         return normalize(pooled.flatten(1))
 
     def _forward_dense(self, x: torch.Tensor) -> tuple[torch.Tensor, _ConvHebbianTrace]:
@@ -178,25 +301,16 @@ class ConvF1Layer(nn.Module):
         pre_activations: list[torch.Tensor] = []
         post_activations: list[torch.Tensor] = []
         feature_maps: list[torch.Tensor] = []
+        current = self._local_contrast_normalize(batch)
 
-        pre_activations.append(batch)
-        current = F.relu(self.conv1(batch))
-        post_activations.append(current)
-        feature_maps.append(current)
-
-        if self.conv2 is not None:
-            pre_conv2 = self._downsample(current)
-            pre_activations.append(pre_conv2)
-            current = F.relu(self.conv2(pre_conv2))
+        for layer_index, layer in enumerate(self.conv_layers):
+            pre_activations.append(current)
+            current = layer(current)
+            current = F.relu(self._response_normalize(current))
             post_activations.append(current)
             feature_maps.append(current)
-
-        if self.conv3 is not None:
-            pre_conv3 = self._downsample(current)
-            pre_activations.append(pre_conv3)
-            current = F.relu(self.conv3(pre_conv3))
-            post_activations.append(current)
-            feature_maps.append(current)
+            if layer_index < len(self.conv_layers) - 1:
+                current = self._downsample(current)
 
         pooled_scales = [self._competitive_spatial_pool(feature_map) for feature_map in feature_maps]
         dense = torch.cat(pooled_scales, dim=1)
@@ -264,9 +378,19 @@ class ConvF1Layer(nn.Module):
         return aligned
 
     @staticmethod
-    def _clamp_filter_norms(weight: torch.Tensor, *, max_norm: float = 1.0) -> None:
+    def _clamp_filter_norms(
+        weight: torch.Tensor,
+        *,
+        max_norm: float = 1.0,
+        decorrelation: float = 0.0,
+    ) -> None:
         flat = weight.view(weight.shape[0], -1)
         flat.sub_(flat.mean(dim=1, keepdim=True))
+        if decorrelation > 0.0 and flat.shape[0] > 1:
+            normalized = F.normalize(flat, dim=1)
+            similarity = normalized @ normalized.T
+            similarity.fill_diagonal_(0.0)
+            flat.sub_(float(decorrelation) * (similarity @ flat) / max(flat.shape[0] - 1, 1))
         norms = flat.norm(dim=1, keepdim=True).clamp_min(1e-6)
         flat.mul_(float(max_norm) / norms)
 
@@ -288,6 +412,7 @@ class ConvF1Layer(nn.Module):
         scaled_signal: torch.Tensor,
         *,
         competitive_k: int,
+        oja_decay: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         patches = F.unfold(
             pre.to(layer.weight.dtype),
@@ -296,11 +421,18 @@ class ConvF1Layer(nn.Module):
             padding=layer.padding,
             stride=layer.stride,
         )
+        patches = patches - patches.mean(dim=1, keepdim=True)
+        patches = patches / patches.norm(dim=1, keepdim=True).clamp_min(1e-6)
         post_flat = post.to(layer.weight.dtype).reshape(post.shape[0], post.shape[1], -1)
         channel_mask = ConvF1Layer._competitive_channel_mask(post, competitive_k).to(post_flat.dtype)
-        weighted_post = post_flat * channel_mask * scaled_signal.to(post_flat.dtype).view(-1, 1, 1)
+        centered_post = (post_flat - post_flat.mean(dim=2, keepdim=True)).clamp_min(0.0)
+        weighted_post = centered_post * channel_mask * scaled_signal.to(post_flat.dtype).view(-1, 1, 1)
         spatial_positions = max(post_flat.shape[-1], 1)
         delta = torch.einsum("bol,bil->oi", weighted_post, patches) / spatial_positions
+        if oja_decay > 0.0:
+            flat_weight = layer.weight.view(layer.weight.shape[0], -1)
+            post_power = weighted_post.square().mean(dim=(0, 2)).unsqueeze(1)
+            delta = delta - (float(oja_decay) * post_power * flat_weight)
         return delta.reshape_as(layer.weight), weighted_post.mean(dim=2)
 
     @torch.no_grad()
@@ -309,11 +441,7 @@ class ConvF1Layer(nn.Module):
             return False
 
         pending_calls = self._pending_hebbian_calls
-        layers = [self.conv1]
-        if self.conv2 is not None:
-            layers.append(self.conv2)
-        if self.conv3 is not None:
-            layers.append(self.conv3)
+        layers = list(self.conv_layers)
 
         for layer_index, layer in enumerate(layers):
             pre_batch = torch.cat(
@@ -337,6 +465,7 @@ class ConvF1Layer(nn.Module):
                 post_batch,
                 scaled_signal,
                 competitive_k=self.competitive_k,
+                oja_decay=self.hebbian_oja_decay,
             )
             layer.weight.add_(weight_delta)
             if layer.bias is not None:
@@ -345,7 +474,11 @@ class ConvF1Layer(nn.Module):
                     end = start + call.scaled_signal.numel()
                     layer.bias.mul_(0.99).add_(bias_terms[start:end].sum(dim=0))
                     start = end
-            self._clamp_filter_norms(layer.weight.data, max_norm=self.weight_norm_target)
+            self._clamp_filter_norms(
+                layer.weight.data,
+                max_norm=self.weight_norm_target,
+                decorrelation=self.filter_decorrelation,
+            )
 
         self._pending_hebbian_calls.clear()
         self._pending_hebbian_samples = 0
@@ -411,11 +544,18 @@ class ConvConceptCellCluster(nn.Module):
             spatial_grid=config.spatial_grid,
             num_layers=config.num_conv_layers,
             hidden_channels=config.conv_hidden_channels,
+            kernel_sizes=config.conv_kernel_sizes,
             spatial_top_k=config.spatial_top_k,
             competitive_k=config.conv_competitive_k,
             hebbian_lr=config.conv_hebbian_lr,
             hebbian_batch_size=config.hebbian_batch_size,
             weight_norm_target=config.conv_weight_norm,
+            enable_local_contrast_norm=config.enable_local_contrast_norm,
+            contrast_kernel_size=config.contrast_kernel_size,
+            response_norm_eps=config.response_norm_eps,
+            feature_pool_avg_mix=config.feature_pool_avg_mix,
+            hebbian_oja_decay=config.hebbian_oja_decay,
+            filter_decorrelation=config.filter_decorrelation,
         )
         self.margin_gate = MarginGate(margin_config)
         self.register_buffer("feedback_template", torch.zeros(config.concept_dim, dtype=torch.float32))
@@ -776,11 +916,18 @@ class ConvCCCPool(nn.Module):
             spatial_grid=config.spatial_grid,
             num_layers=config.num_conv_layers,
             hidden_channels=config.conv_hidden_channels,
+            kernel_sizes=config.conv_kernel_sizes,
             spatial_top_k=config.spatial_top_k,
             competitive_k=config.conv_competitive_k,
             hebbian_lr=config.conv_hebbian_lr,
             hebbian_batch_size=config.hebbian_batch_size,
             weight_norm_target=config.conv_weight_norm,
+            enable_local_contrast_norm=config.enable_local_contrast_norm,
+            contrast_kernel_size=config.contrast_kernel_size,
+            response_norm_eps=config.response_norm_eps,
+            feature_pool_avg_mix=config.feature_pool_avg_mix,
+            hebbian_oja_decay=config.hebbian_oja_decay,
+            filter_decorrelation=config.filter_decorrelation,
         )
         self.cccs = nn.ModuleList(
             [

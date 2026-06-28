@@ -26,6 +26,7 @@ from bioarn.config import (
 )
 from bioarn.core.conv_ccc import ConvCCCPool
 from bioarn.core.math_utils import cosine_similarity, normalize
+from bioarn.core.margin_gate import ResonanceOutput
 from bioarn.data import CIFAR10Stream, DataSample, StreamingDataSource
 from bioarn.loop import SensorimotorLoop
 from bioarn.preprocessing import PreprocessingPipeline
@@ -62,6 +63,9 @@ class VisionTrainConfig:
     enable_replay: bool = False
     enable_eviction: bool = False
     use_conv_ccc: bool = False
+    conv_ccc: ConvCCCConfig | None = None
+    pass_lr_decay: float = 1.0
+    supervised_merge_threshold: float = 0.2
     workspace: GNWConfig | None = None
     maturation: MaturationConfig | None = None
     precision: PrecisionConfig | None = None
@@ -225,33 +229,79 @@ def load_cifar10_or_synthetic(
 
 
 class _PrototypeBank:
-    def __init__(self) -> None:
-        self.prototypes: dict[int, torch.Tensor] = {}
-        self.counts: dict[int, int] = {}
+    def __init__(
+        self,
+        *,
+        max_entries_per_label: int = 8,
+        recruit_threshold: float = 0.82,
+        vote_top_k: int = 3,
+    ) -> None:
+        self.max_entries_per_label = int(max(1, max_entries_per_label))
+        self.recruit_threshold = float(recruit_threshold)
+        self.vote_top_k = int(max(1, vote_top_k))
+        self.prototypes: dict[int, list[torch.Tensor]] = defaultdict(list)
+        self.counts: dict[int, list[int]] = defaultdict(list)
 
     def update(self, label: int, concept_direction: torch.Tensor) -> None:
         normalized = normalize(concept_direction.reshape(1, -1)).squeeze(0)
-        count = self.counts.get(label, 0) + 1
-        if label not in self.prototypes:
-            self.prototypes[label] = normalized.detach().clone()
-        else:
-            updated = ((self.prototypes[label] * self.counts[label]) + normalized) / count
-            self.prototypes[label] = normalize(updated.reshape(1, -1)).squeeze(0)
-        self.counts[label] = count
+        entries = self.prototypes[int(label)]
+        counts = self.counts[int(label)]
+        if not entries:
+            entries.append(normalized.detach().clone())
+            counts.append(1)
+            return
+
+        similarities = torch.tensor(
+            [float(cosine_similarity(entry, normalized).item()) for entry in entries],
+            dtype=torch.float32,
+        )
+        best_index = int(torch.argmax(similarities).item())
+        best_score = float(similarities[best_index].item())
+        if best_score < self.recruit_threshold and len(entries) < self.max_entries_per_label:
+            entries.append(normalized.detach().clone())
+            counts.append(1)
+            return
+
+        count = counts[best_index] + 1
+        updated = normalize(((entries[best_index] * counts[best_index]) + normalized).reshape(1, -1)).squeeze(0)
+        entries[best_index] = updated.detach().clone()
+        counts[best_index] = count
 
     def predict(self, concept_direction: torch.Tensor) -> int | None:
         if not self.prototypes:
             return None
-        labels = list(self.prototypes.keys())
-        stacked = torch.stack([self.prototypes[label].to(concept_direction) for label in labels], dim=0)
-        query = normalize(concept_direction.reshape(1, -1)).expand_as(stacked)
-        similarities = cosine_similarity(stacked, query)
-        return labels[int(torch.argmax(similarities).item())]
+        query = normalize(concept_direction.reshape(1, -1)).squeeze(0)
+        label_scores: dict[int, float] = {}
+        for label, entries in self.prototypes.items():
+            if not entries:
+                continue
+            stacked = torch.stack([entry.to(query) for entry in entries], dim=0)
+            similarities = cosine_similarity(stacked, query.expand_as(stacked))
+            top_k = min(self.vote_top_k, similarities.numel())
+            top_values, top_indices = torch.topk(similarities, k=top_k)
+            score = 0.0
+            for similarity, index in zip(top_values.tolist(), top_indices.tolist(), strict=True):
+                weight = float(self.counts[int(label)][int(index)])
+                score += max(0.0, float(similarity)) * max(weight, 1.0)
+            label_scores[int(label)] = score / max(sum(self.counts[int(label)]), 1)
+        if not label_scores:
+            return None
+        return max(label_scores.items(), key=lambda item: item[1])[0]
 
     def clone(self) -> "_PrototypeBank":
-        cloned = _PrototypeBank()
-        cloned.prototypes = {label: value.clone() for label, value in self.prototypes.items()}
-        cloned.counts = dict(self.counts)
+        cloned = _PrototypeBank(
+            max_entries_per_label=self.max_entries_per_label,
+            recruit_threshold=self.recruit_threshold,
+            vote_top_k=self.vote_top_k,
+        )
+        cloned.prototypes = defaultdict(
+            list,
+            {
+                label: [value.clone() for value in values]
+                for label, values in self.prototypes.items()
+            },
+        )
+        cloned.counts = defaultdict(list, {label: list(values) for label, values in self.counts.items()})
         return cloned
 
 
@@ -329,14 +379,17 @@ class VisionTrainer:
         config: VisionTrainConfig,
         preprocessing: PreprocessingPipeline | None = None,
     ):
-        self.config = config
+        self.config = copy.deepcopy(config)
         self.preprocessing = preprocessing
-        self._spatial_input_shape = SensorimotorLoop._infer_visual_shape(int(config.input_dim))
+        self._spatial_input_shape = SensorimotorLoop._infer_visual_shape(int(self.config.input_dim))
         if self.config.use_conv_ccc and self.preprocessing is not None:
             raise ValueError("ConvCCCPool currently expects raw image inputs without preprocessing.")
         self.effective_input_dim = self._effective_input_dim()
-        self._configured_workspace = copy.deepcopy(config.workspace)
-        self.system = self._build_system(config, input_dim=self.effective_input_dim)
+        self._configured_workspace = copy.deepcopy(self.config.workspace)
+        self.system = self._build_system(self.config, input_dim=self.effective_input_dim)
+        self.config.concept_dim = int(getattr(self.system.config.ccc, "concept_dim", self.config.concept_dim))
+        if self.config.use_conv_ccc:
+            self.config.max_pool_size = int(getattr(self.system.config.ccc, "max_pool_size", self.config.max_pool_size))
         self.label_bank = _PrototypeBank()
         self.ccc_label_counts: defaultdict[int, Counter[int]] = defaultdict(Counter)
         self.ccc_confidence_sums: defaultdict[int, float] = defaultdict(float)
@@ -351,6 +404,9 @@ class VisionTrainer:
         if self.preprocessing is None:
             return int(self.config.input_dim)
         return int(self.preprocessing.get_output_dim(self.config.input_dim))
+
+    def _concept_dim(self) -> int:
+        return int(getattr(self.system.config.ccc, "concept_dim", self.config.concept_dim))
 
     @staticmethod
     def _build_system(config: VisionTrainConfig, *, input_dim: int) -> BioARNCore:
@@ -368,32 +424,46 @@ class VisionTrainer:
             channels, height, width = SensorimotorLoop._infer_visual_shape(input_dim)
             if height != width:
                 raise ValueError("ConvCCCPool currently requires square spatial inputs.")
-            conv_config = ConvCCCConfig(
-                in_channels=channels,
-                spatial_size=height,
-                num_conv_features=64,
-                num_conv_layers=3,
-                conv_hidden_channels=(32, 64),
-                spatial_grid=4,
-                f1_top_k=64,
-                fast_lr=1.0,
-                slow_lr=config.learning_rate,
-                feedback_lr=config.learning_rate,
-                conv_hebbian_lr=max(0.0005, min(0.005, float(config.learning_rate) * 0.25)),
-                hebbian_batch_size=max(1, int(config.batch_size)) if config.use_batched else 1,
-                conv_competitive_k=16,
-                spatial_top_k=6,
-                conv_weight_norm=1.0,
-                max_pool_size=config.max_pool_size,
-                max_growth_factor=config.max_growth_factor,
-                consolidation_strength=config.consolidation_strength,
-                lock_threshold=0.8,
-            )
+            if config.conv_ccc is not None:
+                conv_config = copy.deepcopy(config.conv_ccc)
+                conv_config.in_channels = channels
+                conv_config.spatial_size = height
+                conv_config.hebbian_batch_size = (
+                    max(1, int(config.batch_size)) if config.use_batched else 1
+                )
+            else:
+                conv_config = ConvCCCConfig(
+                    in_channels=channels,
+                    spatial_size=height,
+                    num_conv_features=96,
+                    num_conv_layers=4,
+                    conv_hidden_channels=(48, 96, 128),
+                    spatial_grid=4,
+                    f1_top_k=96,
+                    fast_lr=1.0,
+                    slow_lr=config.learning_rate,
+                    feedback_lr=config.learning_rate,
+                    conv_hebbian_lr=max(0.00075, min(0.006, float(config.learning_rate) * 0.35)),
+                    hebbian_batch_size=max(1, int(config.batch_size)) if config.use_batched else 1,
+                    conv_competitive_k=24,
+                    spatial_top_k=8,
+                    conv_weight_norm=1.0,
+                    enable_local_contrast_norm=True,
+                    contrast_kernel_size=5,
+                    response_norm_eps=1e-4,
+                    feature_pool_avg_mix=0.35,
+                    hebbian_oja_decay=0.08,
+                    filter_decorrelation=0.03,
+                    max_pool_size=config.max_pool_size,
+                    max_growth_factor=config.max_growth_factor,
+                    consolidation_strength=config.consolidation_strength,
+                    lock_threshold=0.8,
+                )
             workspace_config = copy.deepcopy(config.workspace)
             precision_config = copy.deepcopy(config.precision)
             lateral_config = copy.deepcopy(config.lateral_prediction)
             if precision_config is not None:
-                precision_config.pool_size = int(config.max_pool_size)
+                precision_config.pool_size = int(conv_config.max_pool_size)
             conv_f1_features = (
                 int(config.num_f1_features)
                 if config.num_f1_features is not None
@@ -576,6 +646,16 @@ class VisionTrainer:
     def _fit_preprocessing(
         self, samples: list[tuple[torch.Tensor, int | None]]
     ) -> tuple[list[tuple[torch.Tensor, int | None]], int]:
+        if self.config.use_conv_ccc and self.preprocessing is None and samples:
+            minimum_training_samples = min(64, max(1, len(samples) // 2))
+            warmup = min(
+                int(self.config.preprocessing_warmup_samples),
+                max(0, len(samples) - minimum_training_samples),
+            )
+            if warmup <= 0:
+                return samples, 0
+            self._warmup_conv_pool(samples[:warmup])
+            return samples, warmup
         if self.preprocessing is None or self.preprocessing.is_fitted or not samples:
             return samples, 0
 
@@ -611,6 +691,29 @@ class VisionTrainer:
         if callable(flusher):
             flusher()
 
+    def _warmup_conv_pool(self, samples: list[tuple[torch.Tensor, int | None]]) -> None:
+        pool = getattr(self.system, "ccc_pool", None)
+        shared_f1 = getattr(pool, "shared_f1", None)
+        if shared_f1 is None or not samples:
+            return
+
+        batch_size = max(
+            1,
+            int(getattr(getattr(pool, "config", None), "hebbian_batch_size", max(1, self.config.batch_size))),
+        )
+        warmup_scale = 1.25
+        for start in range(0, len(samples), batch_size):
+            batch_tensors = [self._prepare_tensor(tensor) for tensor, _ in samples[start : start + batch_size]]
+            batch = torch.stack(batch_tensors, dim=0)
+            shared_f1.hebbian_update(
+                batch,
+                learning_signal=torch.ones(batch.shape[0], dtype=torch.float32, device=batch.device),
+                lr=float(getattr(pool.config, "conv_hebbian_lr", self.config.learning_rate * 0.25)) * warmup_scale,
+            )
+        flusher = getattr(pool, "flush_hebbian_updates", None)
+        if callable(flusher):
+            flusher()
+
     def start_new_task(self) -> None:
         if int(getattr(self.system.config.ccc, "freeze_f1_after", 0)) <= 0:
             return
@@ -632,10 +735,14 @@ class VisionTrainer:
                 continue
             dominant_label, dominant_count = counts.most_common(1)[0]
             purity = dominant_count / max(sum(counts.values()), 1)
-            ccc_votes[dominant_label] += purity
+            mean_confidence = self.ccc_confidence_sums[index] / max(sum(counts.values()), 1)
+            ccc_votes[dominant_label] += purity * max(mean_confidence, 0.25)
+        bank_label = self.label_bank.predict(concept_direction)
+        if bank_label is not None:
+            ccc_votes[int(bank_label)] += 0.35
         if ccc_votes:
             return max(ccc_votes.items(), key=lambda item: item[1])[0]
-        return self.label_bank.predict(concept_direction)
+        return bank_label
 
     def _pool_stats(self) -> dict[str, float | int]:
         return self.system.ccc_pool.get_pool_stats()
@@ -694,7 +801,7 @@ class VisionTrainer:
         winner_confidences: torch.Tensor,
     ) -> tuple[torch.Tensor, float]:
         if not fired_indices:
-            return torch.zeros(self.config.concept_dim, dtype=torch.float32), 0.0
+            return torch.zeros(self._concept_dim(), dtype=torch.float32), 0.0
         directions = torch.stack([self._ccc_direction(index) for index in fired_indices], dim=0)
         if winner_confidences.numel() == len(fired_indices):
             weights = winner_confidences.to(directions).unsqueeze(-1)
@@ -789,6 +896,84 @@ class VisionTrainer:
         for index in fired_indices:
             self.ccc_label_counts[index][int(label)] += 1
             self.ccc_confidence_sums[index] += float(confidence)
+
+    def _best_same_label_ccc(
+        self,
+        concept_direction: torch.Tensor,
+        label: int,
+    ) -> tuple[int | None, float]:
+        best_index: int | None = None
+        best_similarity = float("-inf")
+        for index, counts in self.ccc_label_counts.items():
+            if not counts:
+                continue
+            dominant_label, _ = counts.most_common(1)[0]
+            if int(dominant_label) != int(label):
+                continue
+            candidate = self._ccc_direction(index)
+            similarity = float(cosine_similarity(candidate, concept_direction).item())
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_index = index
+        if best_index is None:
+            return None, 0.0
+        return best_index, best_similarity
+
+    def _supervised_conv_merge(
+        self,
+        tensor: torch.Tensor,
+        label: int | None,
+        *,
+        learning_rate_multiplier: float,
+    ) -> tuple[int | None, bool, bool, float, PoolStepResult] | None:
+        if not self.config.use_conv_ccc or label is None:
+            return None
+        if float(self.config.supervised_merge_threshold) <= 0.0:
+            return None
+        pool = self.system.ccc_pool
+        if not isinstance(pool, ConvCCCPool):
+            return None
+
+        raw_batch, f1_batch, f1_trace, _ = pool._encode_shared_f1(tensor)  # noqa: SLF001
+        concept_direction = normalize(f1_batch.mean(dim=0, keepdim=True)).squeeze(0)
+        candidate_index, similarity = self._best_same_label_ccc(concept_direction, int(label))
+        if candidate_index is None or similarity < float(self.config.supervised_merge_threshold):
+            return None
+
+        candidate = pool.cccs[candidate_index]
+        if bool(candidate.is_locked.item()):
+            return None
+
+        candidate.learn_slow(
+            raw_batch,
+            f1_batch,
+            ResonanceOutput(
+                match_score=torch.full((raw_batch.shape[0],), similarity, dtype=torch.float32, device=raw_batch.device),
+                resonated=torch.ones(raw_batch.shape[0], dtype=torch.bool, device=raw_batch.device),
+                learn_signal=torch.ones(raw_batch.shape[0], dtype=torch.float32, device=raw_batch.device),
+            ),
+            f1_trace=f1_trace,
+            timestep=int(self.system.timestep),
+            learning_rate_multiplier=learning_rate_multiplier,
+        )
+        candidate.last_fired.fill_(int(self.system.timestep))
+        self.system.timestep += 1
+        self.last_fired_indices = [candidate_index]
+        winner_confidences = torch.tensor([similarity], dtype=torch.float32)
+        return (
+            int(label),
+            False,
+            False,
+            similarity,
+            PoolStepResult(
+                fired_indices=[candidate_index],
+                concept_direction=self._ccc_direction(candidate_index),
+                confidence=similarity,
+                abstained=False,
+                winner_confidences=winner_confidences,
+                broadcast_strength=0.0,
+            ),
+        )
 
     @staticmethod
     def _estimate_prediction_error(
@@ -889,24 +1074,34 @@ class VisionTrainer:
         before_committed = int(self._pool_stats()["num_committed"])
         tensor = self._prepare_tensor(tensor)
         self._observe_pool_samples(1)
-        step_result = self._step_pool(
+        merged_result = self._supervised_conv_merge(
             tensor,
-            allow_recruit=True,
+            label,
             learning_rate_multiplier=learning_rate_multiplier,
         )
-        prediction = (
-            None
-            if step_result.abstained
-            else self._recognition_label(step_result.concept_direction, step_result.fired_indices)
-        )
+        if merged_result is not None:
+            prediction, abstained_flag, recruited, confidence, step_result = merged_result
+        else:
+            step_result = self._step_pool(
+                tensor,
+                allow_recruit=True,
+                learning_rate_multiplier=learning_rate_multiplier,
+            )
+            prediction = (
+                None
+                if step_result.abstained
+                else self._recognition_label(step_result.concept_direction, step_result.fired_indices)
+            )
+            abstained_flag = bool(step_result.abstained)
+            recruited = int(self._pool_stats()["num_committed"]) > before_committed
+            confidence = float(step_result.confidence)
         if not step_result.abstained and label is not None:
             self.label_bank.update(int(label), step_result.concept_direction)
         self._update_pool_importance(step_result.fired_indices, step_result.winner_confidences)
         self._update_lateral_predictions(step_result.fired_indices)
         self._record_ccc_activity(step_result.fired_indices, label, step_result.confidence)
-        recruited = int(self._pool_stats()["num_committed"]) > before_committed
         hebbian_update = getattr(self.system.ccc_pool, "hebbian_update", None)
-        if callable(hebbian_update):
+        if callable(hebbian_update) and merged_result is None:
             hebbian_update(
                 tensor,
                 fired_indices=step_result.fired_indices,
@@ -916,9 +1111,9 @@ class VisionTrainer:
             )
         return (
             prediction,
-            bool(step_result.abstained),
+            abstained_flag,
             recruited,
-            float(step_result.confidence),
+            confidence,
             step_result,
         )
 
@@ -1001,6 +1196,7 @@ class VisionTrainer:
         primary_processed = 0
 
         for pass_index in range(num_passes):
+            pass_lr_scale = float(max(0.0, self.config.pass_lr_decay)) ** pass_index
             if pass_index == 0:
                 pass_samples = indexed_train_samples
             elif self.curriculum_scheduler is not None:
@@ -1030,7 +1226,7 @@ class VisionTrainer:
                 preview_confidence = 0.0
                 prediction_error_preview = 0.0
                 boundary_score = 0.0
-                learning_rate_multiplier = 1.0
+                learning_rate_multiplier = pass_lr_scale
                 precision_enabled = getattr(self.system.ccc_pool, "precision_gate", None) is not None
 
                 needs_preview = (
