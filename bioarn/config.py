@@ -204,6 +204,92 @@ class ConvCCCConfig:
 
 
 @dataclass
+class AudioConfig:
+    """Audio preprocessing parameters."""
+
+    sample_rate: int = 16000
+    n_mels: int = 40
+    n_fft: int = 512
+    hop_length: int = 160
+    max_duration_ms: int = 1000
+
+    def __post_init__(self) -> None:
+        self.sample_rate = int(max(1, self.sample_rate))
+        self.n_mels = int(max(1, self.n_mels))
+        self.n_fft = int(max(16, self.n_fft))
+        self.hop_length = int(max(1, self.hop_length))
+        self.max_duration_ms = int(max(1, self.max_duration_ms))
+
+    @property
+    def max_samples(self) -> int:
+        return max(1, int(round(self.sample_rate * (self.max_duration_ms / 1000.0))))
+
+    @property
+    def max_frames(self) -> int:
+        return 1 + (self.max_samples // self.hop_length)
+
+
+@dataclass
+class AudioHierarchyConfig:
+    """Configuration for the auditory A1 → A2 → Belt hierarchy."""
+
+    n_mels: int = 40
+    a1_channels: int = 32
+    a2_channels: int = 64
+    belt_dim: int = 256
+    temporal_kernel: int = 5
+    init_seed: int = 7
+
+    def __post_init__(self) -> None:
+        self.n_mels = int(max(1, self.n_mels))
+        self.a1_channels = int(max(1, self.a1_channels))
+        self.a2_channels = int(max(1, self.a2_channels))
+        self.belt_dim = int(max(1, self.belt_dim))
+        self.temporal_kernel = int(max(1, self.temporal_kernel))
+        if self.temporal_kernel % 2 == 0:
+            self.temporal_kernel += 1
+        self.init_seed = int(self.init_seed)
+
+
+@dataclass
+class AudioTrainConfig:
+    """Online audio-training parameters."""
+
+    audio: AudioConfig = field(default_factory=AudioConfig)
+    hierarchy: AudioHierarchyConfig = field(default_factory=AudioHierarchyConfig)
+    max_pool_size: int = 128
+    max_growth_factor: float = 2.0
+    margin_threshold: float = 0.95
+    learning_rate: float = 0.01
+    num_train_samples: int = 300
+    num_test_samples: int = 120
+    num_passes: int = 2
+    interleave_classes: bool = True
+    use_batched: bool = True
+    seed: int = 0
+    device: str = "cpu"
+
+    def __post_init__(self) -> None:
+        if isinstance(self.audio, Mapping):
+            self.audio = AudioConfig(**self.audio)
+        if isinstance(self.hierarchy, Mapping):
+            self.hierarchy = AudioHierarchyConfig(**self.hierarchy)
+        self.max_pool_size = int(max(1, self.max_pool_size))
+        self.max_growth_factor = float(max(1.0, self.max_growth_factor))
+        self.margin_threshold = float(min(max(self.margin_threshold, 0.0), 1.0))
+        self.learning_rate = float(max(0.0, self.learning_rate))
+        self.num_train_samples = int(max(1, self.num_train_samples))
+        self.num_test_samples = int(max(1, self.num_test_samples))
+        self.num_passes = int(max(1, self.num_passes))
+        self.interleave_classes = bool(self.interleave_classes)
+        self.use_batched = bool(self.use_batched)
+        self.seed = int(self.seed)
+        self.device = str(self.device)
+        if self.hierarchy.n_mels != self.audio.n_mels:
+            self.hierarchy.n_mels = int(self.audio.n_mels)
+
+
+@dataclass
 class SDMConfig:
     """Sparse Distributed Memory (Kanerva) parameters."""
     address_dim: int = 10000     # Dimensionality of binary address space
@@ -248,6 +334,100 @@ class GNWConfig:
 
 
 @dataclass
+class AssociativeMemoryConfig:
+    """Configuration for the associative memory engine."""
+
+    capacity: int = 500
+    concept_dim: int = 256
+    input_dim: int = 768
+    top_k_retrieval: int = 5
+    auto_consolidate_interval: int = 100
+    lock_important: bool = True
+    importance_threshold: float = 0.8
+    use_workspace: bool = True
+    use_precision: bool = True
+
+    def __post_init__(self) -> None:
+        self.capacity = int(max(1, self.capacity))
+        self.concept_dim = int(max(1, self.concept_dim))
+        self.input_dim = int(max(1, self.input_dim))
+        self.top_k_retrieval = int(max(1, min(self.top_k_retrieval, self.capacity)))
+        self.auto_consolidate_interval = int(max(0, self.auto_consolidate_interval))
+        self.lock_important = bool(self.lock_important)
+        self.importance_threshold = float(min(max(self.importance_threshold, 0.0), 1.0))
+        self.use_workspace = bool(self.use_workspace)
+        self.use_precision = bool(self.use_precision)
+
+
+@dataclass
+class TemporalConfig:
+    """Temporal STDP layer parameters."""
+
+    context_window: int = 8
+    concept_dim: int = 256
+    stdp_tau_plus: float = 20.0
+    stdp_tau_minus: float = 40.0
+    stdp_lr: float = 0.01
+    prediction_threshold: float = 0.3
+
+    def __post_init__(self) -> None:
+        self.context_window = int(max(1, self.context_window))
+        self.concept_dim = int(max(1, self.concept_dim))
+        self.stdp_tau_plus = float(max(1e-6, self.stdp_tau_plus))
+        self.stdp_tau_minus = float(max(1e-6, self.stdp_tau_minus))
+        self.stdp_lr = float(max(0.0, self.stdp_lr))
+        self.prediction_threshold = float(min(max(self.prediction_threshold, 0.0), 1.0))
+
+
+@dataclass
+class TemporalTrainConfig:
+    """Streaming temporal-learning parameters."""
+
+    frames_per_sequence: int = 8
+    num_sequences: int = 200
+    concept_dim: int = 256
+    max_pool_size: int = 100
+    use_workspace_context: bool = True
+    frame_shape: tuple[int, int] = (16, 16)
+    seed: int = 0
+    margin_threshold: float = 0.35
+    prediction_top_k: int = 8
+    context_gain: float = 0.2
+    causal_violation_rate: float = 0.2
+    workspace: GNWConfig | None = None
+    stdp: STDPConfig | None = None
+    temporal: TemporalConfig | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.workspace, Mapping):
+            self.workspace = GNWConfig(**self.workspace)
+        if isinstance(self.stdp, Mapping):
+            self.stdp = STDPConfig(**self.stdp)
+        if isinstance(self.temporal, Mapping):
+            self.temporal = TemporalConfig(**self.temporal)
+        self.frames_per_sequence = int(max(2, self.frames_per_sequence))
+        self.num_sequences = int(max(1, self.num_sequences))
+        self.concept_dim = int(max(1, self.concept_dim))
+        self.max_pool_size = int(max(1, self.max_pool_size))
+        height = int(max(1, self.frame_shape[0]))
+        width = int(max(1, self.frame_shape[1]))
+        self.frame_shape = (height, width)
+        self.seed = int(self.seed)
+        self.margin_threshold = float(min(max(self.margin_threshold, 0.0), 1.0))
+        self.prediction_top_k = int(max(1, min(self.prediction_top_k, self.concept_dim)))
+        self.context_gain = float(max(0.0, self.context_gain))
+        self.causal_violation_rate = float(min(max(self.causal_violation_rate, 0.0), 1.0))
+        if self.temporal is None:
+            self.temporal = TemporalConfig(
+                context_window=self.frames_per_sequence,
+                concept_dim=self.concept_dim,
+            )
+        else:
+            self.temporal.context_window = int(max(1, self.temporal.context_window))
+            self.temporal.concept_dim = int(max(1, self.concept_dim))
+
+
+@dataclass
 class RewardConfig:
     """Reward and novelty system parameters."""
     intrinsic_scale: float = 1.0   # Scale of prediction error reward
@@ -255,6 +435,70 @@ class RewardConfig:
     novelty_boost: float = 5.0     # Learning rate multiplier during novelty
     novelty_decay: float = 0.95    # How fast novelty boost fades
     curiosity_weight: float = 0.5  # Balance between exploitation and exploration
+
+
+@dataclass
+class WorldModelConfig:
+    """Configuration for the Bio-ARN RL world model."""
+
+    observation_dim: int = 4
+    concept_dim: int = 64
+    max_pool_size: int = 50
+    num_actions: int = 2
+    curiosity_weight: float = 0.5
+    prediction_lr: float = 0.05
+    use_precision: bool = True
+
+    def __post_init__(self) -> None:
+        self.observation_dim = int(max(1, self.observation_dim))
+        self.concept_dim = int(max(1, self.concept_dim))
+        self.max_pool_size = int(max(2, self.max_pool_size))
+        self.num_actions = int(max(1, self.num_actions))
+        self.curiosity_weight = float(max(0.0, self.curiosity_weight))
+        self.prediction_lr = float(max(1e-4, self.prediction_lr))
+        self.use_precision = bool(self.use_precision)
+
+
+@dataclass
+class AgentConfig:
+    """Configuration for the concept-based Bio-ARN RL agent."""
+
+    epsilon_start: float = 1.0
+    epsilon_end: float = 0.05
+    epsilon_decay: float = 0.995
+    curiosity_bonus: float = 0.3
+    reward_discount: float = 0.99
+
+    def __post_init__(self) -> None:
+        self.epsilon_start = float(min(max(self.epsilon_start, 0.0), 1.0))
+        self.epsilon_end = float(min(max(self.epsilon_end, 0.0), 1.0))
+        self.epsilon_decay = float(min(max(self.epsilon_decay, 0.0), 1.0))
+        self.curiosity_bonus = float(max(0.0, self.curiosity_bonus))
+        self.reward_discount = float(min(max(self.reward_discount, 0.0), 1.0))
+
+
+@dataclass
+class RLTrainConfig:
+    """Configuration for training Bio-ARN on lightweight RL environments."""
+
+    env_name: str = "cartpole"
+    num_episodes: int = 500
+    max_steps_per_episode: int = 500
+    world_model: WorldModelConfig | None = None
+    agent: AgentConfig | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.world_model, Mapping):
+            self.world_model = WorldModelConfig(**self.world_model)
+        if isinstance(self.agent, Mapping):
+            self.agent = AgentConfig(**self.agent)
+        if self.world_model is None:
+            self.world_model = WorldModelConfig()
+        if self.agent is None:
+            self.agent = AgentConfig()
+        self.env_name = str(self.env_name).strip().lower()
+        self.num_episodes = int(max(1, self.num_episodes))
+        self.max_steps_per_episode = int(max(1, self.max_steps_per_episode))
 
 
 @dataclass
