@@ -56,6 +56,10 @@ class PrecisionConfig:
     precision_threshold: float = 0.5
     min_precision: float = 0.1
     max_precision: float = 1.0
+    lateral_error_weight: float = 0.35
+    hierarchy_error_weight: float = 0.2
+    external_signal_decay: float = 0.85
+    surprise_gain: float = 1.5
 
     def __post_init__(self) -> None:
         self.pool_size = int(max(1, self.pool_size))
@@ -64,6 +68,35 @@ class PrecisionConfig:
         self.precision_threshold = float(self.precision_threshold)
         self.min_precision = float(max(0.0, self.min_precision))
         self.max_precision = float(max(self.min_precision, self.max_precision))
+        self.lateral_error_weight = float(max(0.0, self.lateral_error_weight))
+        self.hierarchy_error_weight = float(max(0.0, self.hierarchy_error_weight))
+        self.external_signal_decay = float(min(max(self.external_signal_decay, 0.0), 0.999))
+        self.surprise_gain = float(max(0.0, self.surprise_gain))
+
+
+@dataclass
+class LateralPredictionConfig:
+    """Sparse lateral predictive coding parameters for CCC pools."""
+
+    enabled: bool = False
+    max_neighbors: int = 8
+    hebbian_lr: float = 0.05
+    anti_hebbian_lr: float = 0.02
+    min_weight: float = 0.1
+    max_weight: float = 2.5
+    refresh_interval: int = 16
+    prediction_threshold: float = 0.1
+    surprise_gain: float = 1.5
+
+    def __post_init__(self) -> None:
+        self.max_neighbors = int(max(1, self.max_neighbors))
+        self.hebbian_lr = float(max(0.0, self.hebbian_lr))
+        self.anti_hebbian_lr = float(max(0.0, self.anti_hebbian_lr))
+        self.min_weight = float(max(0.0, self.min_weight))
+        self.max_weight = float(max(self.min_weight, self.max_weight))
+        self.refresh_interval = int(max(1, self.refresh_interval))
+        self.prediction_threshold = float(min(max(self.prediction_threshold, 0.0), 1.0))
+        self.surprise_gain = float(max(0.0, self.surprise_gain))
 
 
 @dataclass
@@ -82,20 +115,32 @@ class CCCConfig:
     max_growth_factor: float = 3.0  # Allow the pool to grow beyond its initial size
     consolidation_strength: float = 0.0  # Penalize updates to highly active CCCs
     lock_threshold: float = 0.8  # Lock CCC when importance exceeds this
+    protection_growth_rate: float = 0.1  # Grow soft protection for valuable CCCs
+    protection_decay_rate: float = 0.01  # Slowly release stale protected CCCs
+    replay_interval: int = 64    # Samples between concept replay sweeps
+    enable_elastic_protection: bool = False
+    enable_replay: bool = False
+    enable_eviction: bool = False
     stdp: STDPConfig | None = None
     precision: PrecisionConfig | None = None
+    lateral_prediction: LateralPredictionConfig | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.stdp, Mapping):
             self.stdp = STDPConfig(**self.stdp)
         if isinstance(self.precision, Mapping):
             self.precision = PrecisionConfig(**self.precision)
+        if isinstance(self.lateral_prediction, Mapping):
+            self.lateral_prediction = LateralPredictionConfig(**self.lateral_prediction)
         self.freeze_f1_after = int(max(0, self.freeze_f1_after))
         self.f1_adapter_dim = int(max(1, self.f1_adapter_dim))
         self.max_pool_size = int(max(1, self.max_pool_size))
         self.max_growth_factor = float(max(1.0, self.max_growth_factor))
         self.consolidation_strength = float(max(0.0, self.consolidation_strength))
         self.lock_threshold = float(max(0.0, self.lock_threshold))
+        self.protection_growth_rate = float(min(max(self.protection_growth_rate, 0.0), 1.0))
+        self.protection_decay_rate = float(min(max(self.protection_decay_rate, 0.0), 1.0))
+        self.replay_interval = int(max(0, self.replay_interval))
 
 
 @dataclass
@@ -105,27 +150,53 @@ class ConvCCCConfig:
     in_channels: int = 3
     spatial_size: int = 32
     num_conv_features: int = 64
+    num_conv_layers: int = 3
+    conv_hidden_channels: tuple[int, int] = (32, 64)
     spatial_grid: int = 4
     concept_dim: int = 0
     f1_top_k: int = 64
     fast_lr: float = 1.0
     slow_lr: float = 0.01
     feedback_lr: float = 0.01
+    conv_hebbian_lr: float = 0.0025
+    conv_competitive_k: int = 8
+    spatial_top_k: int = 4
+    conv_weight_norm: float = 1.0
     max_pool_size: int = 200
     max_growth_factor: float = 3.0
     consolidation_strength: float = 0.0
     lock_threshold: float = 0.8
 
+    def feature_channels(self) -> tuple[int, ...]:
+        hidden1 = int(self.conv_hidden_channels[0])
+        hidden2 = int(self.conv_hidden_channels[1])
+        if self.num_conv_layers <= 1:
+            return (self.num_conv_features,)
+        if self.num_conv_layers == 2:
+            return (hidden1, self.num_conv_features)
+        return (hidden1, hidden2, self.num_conv_features)
+
     def __post_init__(self) -> None:
         self.in_channels = int(max(1, self.in_channels))
         self.spatial_size = int(max(1, self.spatial_size))
         self.num_conv_features = int(max(1, self.num_conv_features))
+        self.num_conv_layers = int(min(max(1, self.num_conv_layers), 3))
+        hidden_channels = tuple(int(max(1, channel)) for channel in self.conv_hidden_channels)
+        if not hidden_channels:
+            hidden_channels = (32, 64)
+        if len(hidden_channels) == 1:
+            hidden_channels = (hidden_channels[0], max(hidden_channels[0], self.num_conv_features))
+        self.conv_hidden_channels = (hidden_channels[0], hidden_channels[1])
         self.spatial_grid = int(max(1, self.spatial_grid))
         if int(self.concept_dim) <= 0:
-            self.concept_dim = self.num_conv_features * self.spatial_grid * self.spatial_grid
+            self.concept_dim = sum(self.feature_channels()) * self.spatial_grid * self.spatial_grid
         else:
             self.concept_dim = int(self.concept_dim)
         self.f1_top_k = int(max(1, self.f1_top_k))
+        self.conv_hebbian_lr = float(max(0.0, self.conv_hebbian_lr))
+        self.conv_competitive_k = int(max(1, self.conv_competitive_k))
+        self.spatial_top_k = int(max(1, self.spatial_top_k))
+        self.conv_weight_norm = float(max(1e-6, self.conv_weight_norm))
         self.max_pool_size = int(max(1, self.max_pool_size))
         self.max_growth_factor = float(max(1.0, self.max_growth_factor))
         self.consolidation_strength = float(max(0.0, self.consolidation_strength))

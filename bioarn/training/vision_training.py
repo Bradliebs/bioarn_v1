@@ -18,6 +18,7 @@ from bioarn.config import (
     CCCConfig,
     ConvCCCConfig,
     GNWConfig,
+    LateralPredictionConfig,
     MarginGateConfig,
     PrecisionConfig,
     RewardConfig,
@@ -54,10 +55,17 @@ class VisionTrainConfig:
     curiosity_weight: float = 0.0
     curriculum: bool = False
     contrastive_curiosity: bool = False
+    protection_growth_rate: float = 0.1
+    protection_decay_rate: float = 0.01
+    replay_interval: int = 64
+    enable_elastic_protection: bool = False
+    enable_replay: bool = False
+    enable_eviction: bool = False
     use_conv_ccc: bool = False
     workspace: GNWConfig | None = None
     maturation: MaturationConfig | None = None
     precision: PrecisionConfig | None = None
+    lateral_prediction: LateralPredictionConfig | None = None
 
 
 @dataclass
@@ -344,6 +352,11 @@ class VisionTrainer:
 
     @staticmethod
     def _build_system(config: VisionTrainConfig, *, input_dim: int) -> BioARNCore:
+        use_classic_ccc = (
+            bool(config.enable_elastic_protection)
+            or bool(config.enable_replay)
+            or bool(config.enable_eviction)
+        )
         margin_config = MarginGateConfig(
             theta_margin=config.margin_threshold,
             theta_margin_lr=0.001,
@@ -357,11 +370,17 @@ class VisionTrainer:
                 in_channels=channels,
                 spatial_size=height,
                 num_conv_features=64,
+                num_conv_layers=3,
+                conv_hidden_channels=(32, 64),
                 spatial_grid=4,
                 f1_top_k=64,
                 fast_lr=1.0,
                 slow_lr=config.learning_rate,
                 feedback_lr=config.learning_rate,
+                conv_hebbian_lr=max(0.0005, min(0.005, float(config.learning_rate) * 0.25)),
+                conv_competitive_k=16,
+                spatial_top_k=6,
+                conv_weight_norm=1.0,
                 max_pool_size=config.max_pool_size,
                 max_growth_factor=config.max_growth_factor,
                 consolidation_strength=config.consolidation_strength,
@@ -369,6 +388,7 @@ class VisionTrainer:
             )
             workspace_config = copy.deepcopy(config.workspace)
             precision_config = copy.deepcopy(config.precision)
+            lateral_config = copy.deepcopy(config.lateral_prediction)
             if precision_config is not None:
                 precision_config.pool_size = int(config.max_pool_size)
             placeholder_ccc = CCCConfig(
@@ -384,7 +404,14 @@ class VisionTrainer:
                 max_pool_size=1,
                 max_growth_factor=1.0,
                 consolidation_strength=config.consolidation_strength,
+                protection_growth_rate=config.protection_growth_rate,
+                protection_decay_rate=config.protection_decay_rate,
+                replay_interval=config.replay_interval,
+                enable_elastic_protection=config.enable_elastic_protection,
+                enable_replay=config.enable_replay,
+                enable_eviction=config.enable_eviction,
                 precision=precision_config,
+                lateral_prediction=lateral_config,
             )
             bio_config = BioARNConfig(
                 ccc=placeholder_ccc,
@@ -417,6 +444,7 @@ class VisionTrainer:
         ccc_features = 64 if input_dim >= 1024 else max(16, min(64, input_dim))
         workspace_config = copy.deepcopy(config.workspace)
         precision_config = copy.deepcopy(config.precision)
+        lateral_config = copy.deepcopy(config.lateral_prediction)
         if precision_config is not None:
             precision_config.pool_size = int(config.max_pool_size)
         bio_config = BioARNConfig(
@@ -433,7 +461,14 @@ class VisionTrainer:
                 max_pool_size=config.max_pool_size,
                 max_growth_factor=config.max_growth_factor,
                 consolidation_strength=config.consolidation_strength,
+                protection_growth_rate=config.protection_growth_rate,
+                protection_decay_rate=config.protection_decay_rate,
+                replay_interval=config.replay_interval,
+                enable_elastic_protection=config.enable_elastic_protection,
+                enable_replay=config.enable_replay,
+                enable_eviction=config.enable_eviction,
                 precision=precision_config,
+                lateral_prediction=lateral_config,
             ),
             margin_gate=margin_config,
             sdm=SDMConfig(
@@ -448,7 +483,10 @@ class VisionTrainer:
             workspace=workspace_config,
             seed=42,
         )
-        return ScaledBioARN(bio_config, use_optimized=config.use_batched)
+        return ScaledBioARN(
+            bio_config,
+            use_optimized=bool(config.use_batched) and not use_classic_ccc,
+        )
 
     def _build_curiosity_system(self) -> RewardSystem | None:
         weight = max(0.0, min(float(self.config.curiosity_weight), 1.0))
@@ -604,6 +642,17 @@ class VisionTrainer:
         update_importance = getattr(self.system.ccc_pool, "update_importance", None)
         if callable(update_importance):
             update_importance(fired_indices, confidences=winner_confidences)
+
+    def _update_lateral_predictions(self, fired_indices: list[int]) -> None:
+        updater = getattr(self.system.ccc_pool, "hebbian_update_lateral", None)
+        if callable(updater):
+            updater(fired_indices)
+
+    def _replay_pool_concepts(self) -> int:
+        replay = getattr(self.system.ccc_pool, "replay_exemplars", None)
+        if not callable(replay):
+            return 0
+        return int(replay())
 
     def _ccc_direction(self, index: int) -> torch.Tensor:
         if hasattr(self.system.ccc_pool, "concept_directions"):
@@ -824,8 +873,18 @@ class VisionTrainer:
         if not step_result.abstained and label is not None:
             self.label_bank.update(int(label), step_result.concept_direction)
         self._update_pool_importance(step_result.fired_indices, step_result.winner_confidences)
+        self._update_lateral_predictions(step_result.fired_indices)
         self._record_ccc_activity(step_result.fired_indices, label, step_result.confidence)
         recruited = int(self._pool_stats()["num_committed"]) > before_committed
+        hebbian_update = getattr(self.system.ccc_pool, "hebbian_update", None)
+        if callable(hebbian_update):
+            hebbian_update(
+                tensor,
+                fired_indices=step_result.fired_indices,
+                winner_confidences=step_result.winner_confidences,
+                recruited=recruited,
+                learning_rate_multiplier=learning_rate_multiplier,
+            )
         return (
             prediction,
             bool(step_result.abstained),
@@ -837,7 +896,7 @@ class VisionTrainer:
     @torch.no_grad()
     def train_online(
         self,
-        data_stream: StreamingDataSource | Iterable[DataSample | tuple[torch.Tensor, int]],
+        data_stream: StreamingDataSource | Iterable[DataSample | tuple[torch.Tensor, int]] | None = None,
         num_samples: int | None = None,
         *,
         num_passes: int = 1,
@@ -862,7 +921,16 @@ class VisionTrainer:
                 particularly useful when the source stream is sorted by class.
         """
         target_samples = self.config.num_train_samples if num_samples is None else int(num_samples)
+        auto_conv_benchmark = data_stream is None and bool(self.config.use_conv_ccc)
         num_passes = max(1, int(num_passes))
+        if data_stream is None:
+            data_stream, _, _ = load_cifar10_or_synthetic(
+                train_samples=target_samples,
+                test_samples=self.config.num_test_samples,
+                seed=0,
+            )
+        if auto_conv_benchmark and num_passes == 1:
+            num_passes = 3
         samples = self._materialize_samples(data_stream, target_samples)
         train_samples, warmup_samples = self._fit_preprocessing(samples)
         if warmup_samples > 0:
@@ -894,8 +962,13 @@ class VisionTrainer:
         boundary_scores: list[float] = []
         learning_rate_multipliers: list[float] = []
         curiosity_replays = 0
+        concept_replay_events = 0
+        concept_replay_boosts = 0
         maturation_transitions: list[dict[str, float | int]] = []
         progress_interval = max(1, max(effective_target, 1) // 10)
+        replay_interval = int(getattr(self.system.config.ccc, "replay_interval", 0))
+        replay_enabled = bool(getattr(self.system.config.ccc, "enable_replay", False))
+        primary_processed = 0
 
         for pass_index in range(num_passes):
             if pass_index == 0:
@@ -995,6 +1068,8 @@ class VisionTrainer:
                     labeled += 1
                     correct += int(prediction == label)
                 abstained += int(abstained_flag)
+                if replay_depth == 0:
+                    primary_processed += 1
                 if self.maturation is not None:
                     previous_phase = self.maturation.phase
                     if self.maturation.check_transition(
@@ -1048,6 +1123,15 @@ class VisionTrainer:
                     for _ in range(replay_count):
                         queue.append((sample_id, tensor.detach().clone(), label, replay_depth + 1))
 
+                if (
+                    replay_enabled
+                    and replay_depth == 0
+                    and replay_interval > 0
+                    and primary_processed % replay_interval == 0
+                ):
+                    concept_replay_events += 1
+                    concept_replay_boosts += self._replay_pool_concepts()
+
                 pool_stats = self._pool_stats()
                 current_capacity = max(int(pool_stats["total_concepts"]), 1)
                 accuracy_curve.append(correct / max(labeled, 1))
@@ -1071,6 +1155,7 @@ class VisionTrainer:
             "warmup_samples": warmup_samples,
             "num_passes": num_passes,
             "accuracy": correct / max(labeled, 1),
+            "online_accuracy": correct / max(labeled, 1),
             "abstention_rate": abstained / max(processed, 1),
             "committed_cccs": int(self._pool_stats()["num_committed"]),
             "accuracy_curve": accuracy_curve,
@@ -1081,6 +1166,8 @@ class VisionTrainer:
             "curriculum_enabled": self.curriculum_scheduler is not None,
             "contrastive_curiosity_enabled": bool(self.config.contrastive_curiosity),
             "curiosity_replays": curiosity_replays,
+            "concept_replay_events": concept_replay_events,
+            "concept_replay_boosts": concept_replay_boosts,
             "mean_prediction_error": sum(prediction_errors) / max(len(prediction_errors), 1),
             "mean_novelty": sum(novelty_scores) / max(len(novelty_scores), 1),
             "mean_boundary_score": sum(boundary_scores) / max(len(boundary_scores), 1),

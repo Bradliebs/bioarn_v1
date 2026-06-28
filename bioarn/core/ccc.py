@@ -12,8 +12,9 @@ from torch import nn
 from bioarn.config import CCCConfig, MarginGateConfig
 from bioarn.core.consolidation import SynapticConsolidation
 from bioarn.core.margin_gate import MarginGate, MarginGateOutput, ResonanceOutput
-from bioarn.core.math_utils import normalize, sparse_top_k
+from bioarn.core.math_utils import cosine_similarity, normalize, sparse_top_k
 from bioarn.core.stdp import STDPRule
+from bioarn.predictive.lateral_prediction import LateralPredictionNetwork
 from bioarn.predictive.precision_weighting import PrecisionWeightedGate
 
 
@@ -41,6 +42,63 @@ class CCCPoolOutput:
     recruited: bool
     recruited_index: int | None
     winner_confidences: torch.Tensor
+
+
+class ConceptReplayBuffer:
+    """Store one F1 exemplar per committed CCC and replay it to resist drift."""
+
+    def __init__(self, max_size: int):
+        self.max_size = int(max(1, max_size))
+        self.exemplars: dict[int, torch.Tensor] = {}
+
+    def store(self, ccc_index: int, f1_output: torch.Tensor) -> None:
+        exemplar = f1_output.detach().clone()
+        if exemplar.dim() == 2:
+            exemplar = exemplar.mean(dim=0)
+        self.exemplars[int(ccc_index)] = exemplar.reshape(-1)
+        if len(self.exemplars) > self.max_size:
+            oldest_index = next(iter(self.exemplars))
+            self.exemplars.pop(oldest_index, None)
+
+    def drop(self, ccc_index: int) -> None:
+        self.exemplars.pop(int(ccc_index), None)
+
+    @torch.no_grad()
+    def replay_all(self, pool: "CCCPool", boost_lr: float = 0.1) -> int:
+        restored = 0
+        if not self.exemplars:
+            return restored
+
+        for ccc_index, exemplar in list(self.exemplars.items()):
+            if ccc_index < 0 or ccc_index >= len(pool.cccs):
+                self.drop(ccc_index)
+                continue
+            ccc = pool.cccs[ccc_index]
+            ccc._ensure_runtime_state()
+            if not bool(ccc.is_committed.item()):
+                self.drop(ccc_index)
+                continue
+
+            confidence_by_index: dict[int, float] = {}
+            for index, candidate in enumerate(pool.cccs):
+                candidate._ensure_runtime_state()
+                if not bool(candidate.is_committed.item()):
+                    continue
+                f2_batch = candidate._ensure_batch(
+                    candidate.f2_activate(exemplar.to(candidate.concept_direction))
+                )[0]
+                confidence_by_index[index] = float(
+                    cosine_similarity(f2_batch, candidate.concept_direction).reshape(-1).mean().item()
+                )
+
+            if not confidence_by_index:
+                continue
+            winner_index = max(confidence_by_index, key=confidence_by_index.get)
+            target_confidence = confidence_by_index.get(ccc_index, 0.0)
+            if winner_index != ccc_index or target_confidence < float(ccc.margin_gate.theta_resonance.item()):
+                ccc.replay_boost(exemplar, boost_lr=boost_lr)
+                restored += 1
+        return restored
 
 
 class F1Adapter(nn.Module):
@@ -156,6 +214,7 @@ class ConceptCellCluster(nn.Module):
         self.register_buffer("age", torch.tensor(0, dtype=torch.long))
         self.register_buffer("last_fired", torch.tensor(-1, dtype=torch.long))
         self.register_buffer("importance", torch.tensor(0.0, dtype=torch.float32))
+        self.register_buffer("protection", torch.tensor(0.0, dtype=torch.float32))
         self.adapter_id = -1
         object.__setattr__(self, "adapter", None)
 
@@ -193,6 +252,8 @@ class ConceptCellCluster(nn.Module):
             self.register_buffer("locked", torch.tensor(False, dtype=torch.bool, device=device))
         if "importance" not in self._buffers:
             self.register_buffer("importance", torch.tensor(0.0, dtype=torch.float32, device=device))
+        if "protection" not in self._buffers:
+            self.register_buffer("protection", torch.tensor(0.0, dtype=torch.float32, device=device))
         if not hasattr(self, "adapter_id"):
             self.adapter_id = -1
         if not hasattr(self, "adapter"):
@@ -214,6 +275,71 @@ class ConceptCellCluster(nn.Module):
 
     def _adapter_lr(self, base_lr: float) -> float:
         return min(0.05, max(1e-3, float(base_lr)))
+
+    def _elastic_protection_enabled(self) -> bool:
+        return bool(getattr(self.config, "enable_elastic_protection", False))
+
+    def _protection_scale(self) -> float:
+        if not self._elastic_protection_enabled():
+            return 1.0
+        return max(0.0, 1.0 - float(self.protection.clamp(0.0, 1.0).item()))
+
+    @torch.no_grad()
+    def align_protection_to_importance(self, *, fired: bool, confidence: float = 0.0) -> None:
+        self._ensure_runtime_state()
+        if not self._elastic_protection_enabled():
+            self.protection.zero_()
+            return
+
+        growth = float(getattr(self.config, "protection_growth_rate", 0.0))
+        decay = float(getattr(self.config, "protection_decay_rate", 0.0))
+        current = float(self.protection.item())
+        importance = max(0.0, min(1.0, float(self.importance.item())))
+        if fired:
+            target = max(importance, max(0.0, min(1.0, float(confidence))))
+            current += growth * max(0.0, target - current)
+        else:
+            current *= max(0.0, 1.0 - decay)
+            if importance > current:
+                current += 0.5 * growth * (importance - current)
+        self.protection.fill_(float(max(0.0, min(1.0, current))))
+
+    @torch.no_grad()
+    def reset_state(self) -> None:
+        self._ensure_runtime_state()
+        self.concept_direction.zero_()
+        self.feedback_weights.zero_()
+        self.is_committed.zero_()
+        self.locked.zero_()
+        self.age.zero_()
+        self.last_fired.fill_(-1)
+        self.importance.zero_()
+        self.protection.zero_()
+        self.adapter_id = -1
+        object.__setattr__(self, "adapter", None)
+        self.margin_gate.total_presentations.zero_()
+        self.margin_gate.total_fires.zero_()
+        self.margin_gate.total_abstentions.zero_()
+        self.margin_gate.fire_rate.zero_()
+        self.margin_gate.avg_confidence_when_fired.zero_()
+        self.margin_gate.avg_confidence_when_abstained.zero_()
+
+    @torch.no_grad()
+    def replay_boost(self, exemplar: torch.Tensor, *, boost_lr: float = 0.1) -> bool:
+        self._ensure_runtime_state()
+        if not bool(self.is_committed.item()):
+            return False
+
+        f1_batch = self._ensure_batch(exemplar.to(device=self.feedback_weights.device, dtype=self.feedback_weights.dtype))[0]
+        f2_batch = self._ensure_batch(self.f2_activate(f1_batch))[0]
+        concept_target = f2_batch.mean(dim=0)
+        updated_direction = self.concept_direction + (max(0.0, float(boost_lr)) * concept_target)
+        self.concept_direction.copy_(self._normalize_vector(updated_direction))
+        prototype_f1 = f1_batch.mean(dim=0)
+        target_feedback = prototype_f1.unsqueeze(-1) * self.concept_direction.unsqueeze(0)
+        self.feedback_weights.lerp_(target_feedback.to(self.feedback_weights), min(max(float(boost_lr), 0.0), 1.0))
+        self.feedback_weights.copy_(self._normalize_feedback_rows(self.feedback_weights))
+        return True
 
     def _stdp_enabled(self) -> bool:
         return self.stdp_rule is not None and bool(getattr(self.config, "stdp_enabled", True))
@@ -492,6 +618,12 @@ class ConceptCellCluster(nn.Module):
         feedback_init = prototype_f1.unsqueeze(-1) * self.concept_direction.unsqueeze(0)
         self.feedback_weights.copy_(feedback_init)
         self.is_committed.fill_(True)
+        if self._elastic_protection_enabled():
+            seeded_protection = max(
+                float(self.protection.item()),
+                float(getattr(self.config, "protection_growth_rate", 0.0)),
+            )
+            self.protection.fill_(float(max(0.0, min(1.0, seeded_protection))))
 
     @torch.no_grad()
     def learn_slow(
@@ -533,7 +665,7 @@ class ConceptCellCluster(nn.Module):
             0.0,
             float(torch.as_tensor(learning_rate_multiplier, dtype=torch.float32).mean().item()),
         )
-        concept_lr = self._effective_lr(self.config.slow_lr) * lr_multiplier
+        concept_lr = self._effective_lr(self.config.slow_lr) * lr_multiplier * self._protection_scale()
         updated_direction = self.concept_direction + (concept_lr * concept_delta)
         self.concept_direction.copy_(self._normalize_vector(updated_direction))
 
@@ -567,6 +699,7 @@ class ConceptCellCluster(nn.Module):
             "last_fired": int(self.last_fired.item()),
             "adapter_id": int(getattr(self, "adapter_id", -1)),
             "concept_direction_norm": float(self.concept_direction.norm().item()),
+            "protection": float(self.protection.item()),
             "margin_gate": self.margin_gate.get_stats(),
         }
 
@@ -606,6 +739,23 @@ class CCCPool(nn.Module):
         )
         if self.precision_gate is not None:
             self.precision_gate.set_pool_size(self.initial_capacity)
+        lateral_config = getattr(self.config, "lateral_prediction", None)
+        self.lateral_network = (
+            LateralPredictionNetwork(
+                self.initial_capacity,
+                self.config.concept_dim,
+                lateral_config,
+            )
+            if lateral_config is not None and bool(lateral_config.enabled)
+            else None
+        )
+        self.last_lateral_prediction_error = 0.0
+        self.last_hierarchy_prediction_error = 0.0
+        self.replay_buffer = (
+            ConceptReplayBuffer(self.max_capacity)
+            if bool(getattr(self.config, "enable_replay", False))
+            else None
+        )
         self._sync_importance_buffers()
 
     @property
@@ -614,6 +764,15 @@ class CCCPool(nn.Module):
         if 0 <= self.active_adapter_id < len(self.task_adapters):
             return self.task_adapters[self.active_adapter_id]
         return None
+
+    @property
+    def concept_directions(self) -> torch.Tensor:
+        if not self.cccs:
+            return torch.zeros(0, self.config.concept_dim, dtype=torch.float32)
+        return torch.stack(
+            [ccc.concept_direction.detach().clone().to(torch.float32) for ccc in self.cccs],
+            dim=0,
+        )
 
     def _ensure_runtime_buffers(self) -> None:
         device = self.consolidation.importance.device
@@ -637,6 +796,27 @@ class CCCPool(nn.Module):
             )
             if self.precision_gate is not None:
                 self.precision_gate.set_pool_size(len(self.cccs))
+        if not hasattr(self, "lateral_network"):
+            lateral_config = getattr(self.config, "lateral_prediction", None)
+            self.lateral_network = (
+                LateralPredictionNetwork(
+                    len(self.cccs),
+                    self.config.concept_dim,
+                    lateral_config,
+                )
+                if lateral_config is not None and bool(lateral_config.enabled)
+                else None
+            )
+        if not hasattr(self, "last_lateral_prediction_error"):
+            self.last_lateral_prediction_error = 0.0
+        if not hasattr(self, "last_hierarchy_prediction_error"):
+            self.last_hierarchy_prediction_error = 0.0
+        if not hasattr(self, "replay_buffer"):
+            self.replay_buffer = (
+                ConceptReplayBuffer(self.max_capacity)
+                if bool(getattr(self.config, "enable_replay", False))
+                else None
+            )
 
     def freeze_f1(self) -> None:
         self._ensure_runtime_state()
@@ -683,9 +863,141 @@ class CCCPool(nn.Module):
         for index, ccc in enumerate(self.cccs):
             ccc.importance.copy_(self.consolidation.importance[index].to(ccc.importance))
 
+    def _reset_consolidation_slot(self, index: int) -> None:
+        self.consolidation.ensure_capacity(index + 1)
+        self.consolidation.fire_counts[index].zero_()
+        self.consolidation.confidence_sums[index].zero_()
+        self.consolidation.mean_confidence[index].zero_()
+        self.consolidation.last_fire_step[index].fill_(-1.0)
+        self.consolidation.importance[index].zero_()
+
+    def _update_protection_buffers(
+        self,
+        fired_indices: list[int] | torch.Tensor,
+        *,
+        confidences: torch.Tensor | list[float] | None = None,
+    ) -> None:
+        if not bool(getattr(self.config, "enable_elastic_protection", False)):
+            return
+
+        if isinstance(fired_indices, torch.Tensor):
+            fired_list = [int(index) for index in fired_indices.reshape(-1).tolist()]
+        else:
+            fired_list = [int(index) for index in fired_indices]
+        confidence_lookup = {index: 0.0 for index in fired_list}
+        if confidences is not None:
+            if isinstance(confidences, torch.Tensor):
+                confidence_values = confidences.reshape(-1).tolist()
+            else:
+                confidence_values = [float(value) for value in confidences]
+            for index, confidence in zip(fired_list, confidence_values, strict=False):
+                confidence_lookup[int(index)] = float(confidence)
+
+        fired_set = set(fired_list)
+        for index, ccc in enumerate(self.cccs):
+            ccc.align_protection_to_importance(
+                fired=index in fired_set,
+                confidence=confidence_lookup.get(index, 0.0),
+            )
+
+    def _routing_enabled(self) -> bool:
+        return self.precision_gate is not None and bool(
+            getattr(self.config, "enable_elastic_protection", False)
+        )
+
+    def _routing_bias(self, ccc: ConceptCellCluster, *, precision: float) -> float:
+        if not self._routing_enabled():
+            return 1.0
+        protection = max(0.0, min(1.0, float(ccc.protection.item())))
+        if precision > 0.7:
+            return max(0.0, 1.0 - protection)
+        return protection
+
+    def _route_fired_indices(
+        self,
+        outputs: list[CCCOutput],
+        fired_indices: list[int],
+    ) -> tuple[list[int], torch.Tensor]:
+        if not fired_indices:
+            return [], torch.empty(0, dtype=torch.float32)
+
+        base_confidences = torch.stack(
+            [self._confidence_score(outputs[index].confidence).to(torch.float32) for index in fired_indices]
+        )
+        if not self._routing_enabled():
+            return fired_indices, base_confidences
+
+        precision = float(self.precision_gate.current_precision)
+        routing_biases = torch.tensor(
+            [self._routing_bias(self.cccs[index], precision=precision) for index in fired_indices],
+            device=base_confidences.device,
+            dtype=base_confidences.dtype,
+        )
+        routed_confidences = base_confidences * routing_biases
+        best_score = float(routed_confidences.max().item()) if routed_confidences.numel() else 0.0
+        if precision > 0.7:
+            threshold = max(float(self.margin_config.theta_margin) * 0.75, best_score * 0.9)
+            if best_score < max(float(self.margin_config.theta_margin), 0.05):
+                return [], torch.empty(0, dtype=torch.float32, device=base_confidences.device)
+        else:
+            threshold = max(1e-6, best_score * 0.75)
+
+        keep_mask = routed_confidences >= threshold
+        if not bool(keep_mask.any().item()):
+            return [], torch.empty(0, dtype=torch.float32, device=base_confidences.device)
+        kept_positions = torch.nonzero(keep_mask, as_tuple=False).reshape(-1).tolist()
+        kept_indices = [fired_indices[position] for position in kept_positions]
+        return kept_indices, routed_confidences[keep_mask]
+
+    def set_hierarchy_prediction_error(self, error: float | None) -> None:
+        self.last_hierarchy_prediction_error = 0.0 if error is None else max(0.0, min(1.0, float(error)))
+
+    def _lateral_attention_map(self, errors: dict[int, float], fired_indices: list[int]) -> dict[int, float]:
+        if not fired_indices:
+            return {}
+        gain = (
+            float(self.lateral_network.config.surprise_gain)
+            if self.lateral_network is not None
+            else 1.0
+        )
+        if self.precision_gate is None:
+            return {
+                int(index): float(1.0 + (max(0.0, min(1.0, errors.get(int(index), 0.0))) * gain))
+                for index in fired_indices
+            }
+        return {
+            int(index): float(
+                self.precision_gate.compute_error_attention(
+                    errors.get(int(index), 0.0),
+                    gain=gain,
+                )
+            )
+            for index in fired_indices
+        }
+
+    def _update_lateral_prediction_state(self, fired_indices: list[int]) -> float:
+        if self.lateral_network is None:
+            self.last_lateral_prediction_error = 0.0
+            return 0.0
+        predictions = self.lateral_network.predict_lateral(fired_indices, self.concept_directions)
+        errors = self.lateral_network.compute_lateral_errors(predictions, fired_indices)
+        attention = self._lateral_attention_map(errors, fired_indices)
+        self.lateral_network.cache_error_state(predictions, errors, attention=attention)
+        self.last_lateral_prediction_error = self.lateral_network.summarize_errors(errors)
+        return self.last_lateral_prediction_error
+
+    @torch.no_grad()
+    def hebbian_update_lateral(self, fired_indices: list[int] | None = None) -> None:
+        if self.lateral_network is None:
+            return
+        active_indices = [] if fired_indices is None else [int(index) for index in fired_indices]
+        self.lateral_network.hebbian_update(active_indices, self.concept_directions)
+
     def grow(self, min_extra_slots: int = 1) -> int:
         current_size = len(self.cccs)
         if current_size >= self.max_capacity:
+            if bool(getattr(self.config, "enable_eviction", False)):
+                self.evict_weakest(num_slots=min_extra_slots)
             return current_size
 
         growth_target = max(
@@ -710,6 +1022,8 @@ class CCCPool(nn.Module):
         self._ensure_runtime_state()
         if self.precision_gate is not None:
             self.precision_gate.set_pool_size(target_size)
+        if self.lateral_network is not None:
+            self.lateral_network.set_pool_size(target_size)
         return target_size
 
     def update_importance(
@@ -724,6 +1038,7 @@ class CCCPool(nn.Module):
             confidences=confidences,
         )
         self._sync_importance_buffers()
+        self._update_protection_buffers(fired_indices, confidences=confidences)
         self.auto_lock()
         return scores
 
@@ -755,6 +1070,61 @@ class CCCPool(nn.Module):
         return None
 
     @torch.no_grad()
+    def evict_weakest(self, num_slots: int = 1) -> list[int]:
+        """Evict the least valuable CCC slots to make room for new concepts."""
+
+        self._ensure_runtime_state()
+        requested = int(max(1, num_slots))
+        evicted: list[int] = []
+
+        uncommitted_candidates = [
+            (
+                float(ccc.age.item()) * max(0.0, 1.0 - float(ccc.importance.item())),
+                index,
+            )
+            for index, ccc in enumerate(self.cccs)
+            if not bool(ccc.is_committed.item())
+        ]
+        for _, index in sorted(uncommitted_candidates, key=lambda item: (-item[0], item[1]))[:requested]:
+            self.cccs[index].reset_state()
+            self._reset_consolidation_slot(index)
+            if self.replay_buffer is not None:
+                self.replay_buffer.drop(index)
+            evicted.append(index)
+
+        remaining = requested - len(evicted)
+        if remaining <= 0:
+            self._sync_importance_buffers()
+            return evicted
+
+        committed_candidates = [
+            (
+                float(ccc.protection.item()),
+                float(ccc.importance.item()),
+                -int(ccc.age.item()),
+                index,
+            )
+            for index, ccc in enumerate(self.cccs)
+            if bool(ccc.is_committed.item())
+        ]
+        for _, _, _, index in sorted(committed_candidates)[:remaining]:
+            self.cccs[index].reset_state()
+            self._reset_consolidation_slot(index)
+            if self.replay_buffer is not None:
+                self.replay_buffer.drop(index)
+            evicted.append(index)
+
+        self._sync_importance_buffers()
+        return evicted
+
+    @torch.no_grad()
+    def replay_exemplars(self, boost_lr: float | None = None) -> int:
+        if self.replay_buffer is None or not bool(getattr(self.config, "enable_replay", False)):
+            return 0
+        effective_boost = self.config.slow_lr if boost_lr is None else boost_lr
+        return self.replay_buffer.replay_all(self, boost_lr=effective_boost)
+
+    @torch.no_grad()
     def preview(self, raw_input: torch.Tensor) -> CCCPoolOutput:
         """Run the pool read-only without recruitment or learning."""
 
@@ -766,17 +1136,18 @@ class CCCPool(nn.Module):
             else:
                 outputs.append(ccc.empty_output(raw_input))
 
-        fired_indices = [index for index, output in enumerate(outputs) if output.fired]
+        raw_fired_indices = [index for index, output in enumerate(outputs) if output.fired]
         abstained_indices = [index for index, output in enumerate(outputs) if output.abstained]
-        winner_confidences = (
-            torch.stack(
-                [self._confidence_score(outputs[index].confidence) for index in fired_indices]
-            )
-            if fired_indices
-            else torch.empty(0, dtype=torch.float32)
-        )
         if self.precision_gate is not None:
-            self.precision_gate.preview_pool_output(fired_indices)
+            self.precision_gate.preview_pool_output(raw_fired_indices)
+        fired_indices, winner_confidences = self._route_fired_indices(outputs, raw_fired_indices)
+        lateral_error = self._update_lateral_prediction_state(fired_indices)
+        if self.precision_gate is not None:
+            self.precision_gate.preview_pool_output(
+                fired_indices,
+                lateral_error=lateral_error,
+                hierarchy_error=self.last_hierarchy_prediction_error,
+            )
 
         return CCCPoolOutput(
             outputs=outputs,
@@ -814,7 +1185,11 @@ class CCCPool(nn.Module):
 
         recruited = False
         recruited_index: int | None = None
-        if not any(output.fired for output in outputs):
+        raw_fired_indices = [index for index, output in enumerate(outputs) if output.fired]
+        if self.precision_gate is not None:
+            self.precision_gate.preview_pool_output(raw_fired_indices)
+        fired_indices, _ = self._route_fired_indices(outputs, raw_fired_indices)
+        if not fired_indices:
             recruited_index = self._first_uncommitted_index()
             if recruited_index is None:
                 previous_size = len(self.cccs)
@@ -835,23 +1210,26 @@ class CCCPool(nn.Module):
                     f1_output,
                     learning_rate_multiplier=learning_rate_multiplier,
                 )
+                if self.replay_buffer is not None:
+                    self.replay_buffer.store(recruited_index, f1_output)
                 outputs[recruited_index] = recruited_ccc(
                     raw_input,
                     timestep=timestep,
                     learning_rate_multiplier=learning_rate_multiplier,
                 )
 
-        fired_indices = [index for index, output in enumerate(outputs) if output.fired]
+        raw_fired_indices = [index for index, output in enumerate(outputs) if output.fired]
         abstained_indices = [index for index, output in enumerate(outputs) if output.abstained]
-        winner_confidences = (
-            torch.stack(
-                [self._confidence_score(outputs[index].confidence) for index in fired_indices]
-            )
-            if fired_indices
-            else torch.empty(0, dtype=torch.float32)
-        )
         if self.precision_gate is not None:
-            self.precision_gate.observe_pool_output(fired_indices)
+            self.precision_gate.preview_pool_output(raw_fired_indices)
+        fired_indices, winner_confidences = self._route_fired_indices(outputs, raw_fired_indices)
+        lateral_error = self._update_lateral_prediction_state(fired_indices)
+        if self.precision_gate is not None:
+            self.precision_gate.observe_pool_output(
+                fired_indices,
+                lateral_error=lateral_error,
+                hierarchy_error=self.last_hierarchy_prediction_error,
+            )
         self.auto_lock()
 
         return CCCPoolOutput(
@@ -907,8 +1285,12 @@ class CCCPool(nn.Module):
             "initial_capacity": self.initial_capacity,
             "max_capacity": self.max_capacity,
             "mean_importance": float(self.consolidation.importance[: len(self.cccs)].mean().item()),
+            "mean_protection": float(
+                torch.stack([ccc.protection.to(torch.float32) for ccc in self.cccs]).mean().item()
+            ) if self.cccs else 0.0,
             "f1_frozen": bool(self.f1_frozen.item()),
             "task_adapters": len(self.task_adapters),
+            "replay_exemplars": 0 if self.replay_buffer is None else len(self.replay_buffer.exemplars),
         }
 
     def get_precision(self) -> float:
@@ -918,9 +1300,13 @@ class CCCPool(nn.Module):
             return 1.0
         return float(self.precision_gate.current_precision)
 
+    def get_lateral_prediction_error(self) -> float:
+        return float(getattr(self, "last_lateral_prediction_error", 0.0))
+
 
 __all__ = [
     "CCCOutput",
+    "ConceptReplayBuffer",
     "F1Adapter",
     "CCCPool",
     "CCCPoolOutput",
