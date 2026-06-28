@@ -1,5 +1,6 @@
 """Preprocessing utilities for vision inputs."""
 
+from bioarn.preprocessing.audio import AudioPreprocessor
 from bioarn.preprocessing.contrast import ContrastNormalizer
 from bioarn.preprocessing.competitive_learning import CompetitiveLearner
 from bioarn.preprocessing.dictionary_learning import OnlineDictionaryLearner
@@ -10,6 +11,7 @@ from bioarn.preprocessing.random_projection import SparseRandomProjection
 from bioarn.preprocessing.sparse_coding import HebbianSparseCoder
 
 __all__ = [
+    "AudioPreprocessor",
     "CompetitiveLearner",
     "ContrastNormalizer",
     "HebbianSparseCoder",

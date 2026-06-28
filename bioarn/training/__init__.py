@@ -2,6 +2,8 @@
 
 from typing import TYPE_CHECKING
 
+from bioarn.config import AudioTrainConfig
+from bioarn.training.audio_training import AudioTrainer
 from bioarn.training.ensemble_training import (
     AugmentFn,
     EnsembleTrainMetrics,
@@ -18,6 +20,12 @@ from bioarn.training.text_training import (
 )
 from bioarn.training.curriculum import CurriculumScheduler
 from bioarn.training.maturation import MaturationConfig, MaturationSchedule
+from bioarn.training.rl_training import RLTrainer, TrainingResult as RLTrainingResult
+from bioarn.training.temporal_training import (
+    FrameTemporalResult,
+    SequenceResult,
+    TemporalTrainer,
+)
 from bioarn.training.vision_training import (
     SyntheticCIFAR10Stream,
     VisionTrainConfig,
@@ -36,6 +44,8 @@ if TYPE_CHECKING:
 Trainer = OnlineTrainer
 
 __all__ = [
+    "AudioTrainConfig",
+    "AudioTrainer",
     "AugmentFn",
     "EnsembleTrainMetrics",
     "EnsembleTrainer",
@@ -47,7 +57,12 @@ __all__ = [
     "MultimodalExample",
     "MultimodalTrainer",
     "MultimodalTrainingResult",
+    "FrameTemporalResult",
+    "RLTrainer",
+    "RLTrainingResult",
     "OnlineTrainer",
+    "SequenceResult",
+    "TemporalTrainer",
     "Trainer",
     "SyntheticCIFAR10Stream",
     "TextGenConfig",
