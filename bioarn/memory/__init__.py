@@ -20,10 +20,12 @@ from .sequence_memory import (
 
 __all__ = [
     "AssociationResult",
+    "AssociativeMemoryEngine",
     "AssociativeFabric",
     "ChunkLibrary",
     "FabricConnectedPool",
     "FabricPoolOutput",
+    "MemoryResult",
     "PredictiveRetrieval",
     "ReplayBuffer",
     "SequenceEnsembleResult",
@@ -34,3 +36,15 @@ __all__ = [
     "TransitionMatrix",
     "VoteResult",
 ]
+
+
+def __getattr__(name: str):
+    if name in {"AssociativeMemoryEngine", "MemoryResult"}:
+        from .associative_engine import AssociativeMemoryEngine, MemoryResult
+
+        exports = {
+            "AssociativeMemoryEngine": AssociativeMemoryEngine,
+            "MemoryResult": MemoryResult,
+        }
+        return exports[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
