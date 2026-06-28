@@ -8,6 +8,7 @@ import pickle
 import shutil
 import tarfile
 import urllib.request
+import warnings
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterator
@@ -28,6 +29,7 @@ except Exception:  # pragma: no cover - optional dependency
     read_image = None
 
 _MNIST_MIRROR = "https://ossci-datasets.s3.amazonaws.com/mnist"
+_FASHION_MNIST_MIRROR = "https://fashion-mnist.s3-website.eu-central-1.amazonaws.com"
 _CIFAR10_URL = "https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz"
 _CIFAR100_URL = "https://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz"
 
@@ -193,6 +195,74 @@ class MNISTStream(_VisionStreamBase):
                 )
 
 
+class FashionMNISTStream(_VisionStreamBase):
+    """Fashion-MNIST streaming (downloads if needed)."""
+
+    def __init__(
+        self,
+        split: str = "train",
+        data_dir: str | os.PathLike[str] = "data/",
+        flatten: bool = True,
+        normalize: bool = True,
+        shuffle: bool | None = None,
+        class_sequential: bool = False,
+        seed: int = 0,
+        device: str | torch.device | None = None,
+    ) -> None:
+        if split not in {"train", "test"}:
+            raise ValueError("split must be 'train' or 'test'")
+        super().__init__(
+            split=split,
+            flatten=flatten,
+            normalize=normalize,
+            shuffle=shuffle,
+            class_sequential=class_sequential,
+            seed=seed,
+            device=device,
+        )
+        root = Path(data_dir) / "FashionMNIST" / "raw"
+        prefix = "train" if split == "train" else "t10k"
+        self.image_path = _ensure_idx_file(
+            root / f"{prefix}-images-idx3-ubyte",
+            root / f"{prefix}-images-idx3-ubyte.gz",
+            f"{_FASHION_MNIST_MIRROR}/{prefix}-images-idx3-ubyte.gz",
+        )
+        self.label_path = _ensure_idx_file(
+            root / f"{prefix}-labels-idx1-ubyte",
+            root / f"{prefix}-labels-idx1-ubyte.gz",
+            f"{_FASHION_MNIST_MIRROR}/{prefix}-labels-idx1-ubyte.gz",
+        )
+        self._length, self._image_shape, self._image_offset = _read_idx_metadata(self.image_path)
+        label_length, _, self._label_offset = _read_idx_metadata(self.label_path)
+        if label_length != self._length:
+            raise ValueError("Image and label counts do not match for Fashion-MNIST")
+        self._labels = self._load_all_labels()
+        self._ordered_indices = self._ordered_indices_from_labels(self._labels)
+
+    def _load_all_labels(self) -> torch.Tensor:
+        with self.label_path.open("rb") as handle:
+            handle.seek(self._label_offset)
+            return torch.frombuffer(bytearray(handle.read()), dtype=torch.uint8).clone().to(torch.long)
+
+    def __len__(self) -> int:
+        return self._length
+
+    def stream(self) -> Iterator[DataSample]:
+        image_size = int(np.prod(self._image_shape))
+        with self.image_path.open("rb") as images, self.label_path.open("rb") as labels:
+            for dataset_index in self._ordered_indices:
+                images.seek(self._image_offset + dataset_index * image_size)
+                labels.seek(self._label_offset + dataset_index)
+                image = torch.frombuffer(bytearray(images.read(image_size)), dtype=torch.uint8).clone().reshape(self._image_shape)
+                label = int.from_bytes(labels.read(1), "big")
+                yield DataSample(
+                    data=self._reshape_image(image),
+                    label=label,
+                    modality="vision",
+                    metadata={"index": dataset_index, "split": self.split, "dataset": "fashion-mnist"},
+                )
+
+
 class _CIFARStreamBase(_VisionStreamBase):
     archive_url: str = ""
     extracted_dir: str = ""
@@ -244,7 +314,12 @@ class _CIFARStreamBase(_VisionStreamBase):
     def _load_batch(self, path: Path) -> dict[bytes, object]:
         if path not in self._batch_cache:
             with path.open("rb") as handle:
-                self._batch_cache[path] = pickle.load(handle, encoding="bytes")
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="dtype\\(\\): align should be passed as Python or NumPy boolean.*",
+                    )
+                    self._batch_cache[path] = pickle.load(handle, encoding="bytes")
         return self._batch_cache[path]
 
     def _build_sample_refs(self) -> list[tuple[Path, int, int]]:
@@ -421,4 +496,4 @@ class ImageFolderStream(_VisionStreamBase):
             )
 
 
-__all__ = ["CIFAR10Stream", "CIFAR100Stream", "ImageFolderStream", "MNISTStream"]
+__all__ = ["CIFAR10Stream", "CIFAR100Stream", "FashionMNISTStream", "ImageFolderStream", "MNISTStream"]
