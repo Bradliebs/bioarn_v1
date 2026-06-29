@@ -26,3 +26,6 @@ demo/model_cache/
 .squad-workstream
 
 logs/
+
+# Squad scaffold created by Copilot CLI session (not part of project)
+my-project/
