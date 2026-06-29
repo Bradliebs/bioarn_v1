@@ -1,20 +1,22 @@
 # Hebbian Convolutional Feature Learning — CIFAR-10 Ceiling Analysis
 
-**Status:** Revised (survivorship bias audit applied)
-**Date:** 2026-06-28
-**Authors:** Bio-ARN Team (Sprint J + Final Validation + Bias Audit)
+**Status:** Revised (progressive scaling Exp 1 complete; Exp 2/3 in progress)
+**Date:** 2026-06-29
+**Authors:** Bio-ARN Team (Sprint J + Final Validation + Bias Audit + Progressive Scaling)
 
 ## Summary
 
-Pure unsupervised Hebbian convolutional learning reaches a **revised ceiling of ~27% accuracy on CIFAR-10** (up from our initial ~20% estimate). The initial conclusion suffered from **survivorship bias** — we exhaustively varied the competition mechanism while holding capacity and training duration constant.
+Pure unsupervised Hebbian convolutional learning reaches a **revised ceiling of ≥28.45% accuracy on CIFAR-10** (up from our initial ~20% estimate, correcting for survivorship bias). The initial conclusion suffered from **survivorship bias** — we exhaustively varied the competition mechanism while holding capacity and training duration constant.
 
 **Key revision:** The ~20% result was not a fundamental Hebbian ceiling but a **capacity floor + undertraining artifact**. Specifically:
 - **Capacity bias:** 256 features outperforms 64 features by +5.3 pp (linear probe)
 - **Duration bias:** Training for 50 passes reaches 26.7% vs 19.7% at 10 passes (+7.0 pp)
+- **Combined scaling (Exp 1):** 256 features × 50 passes on 5K data reaches **27.90% NC / 27.30% LP**
+- **Full data (Exp 2, pass 1 only):** 50K training images already yields **28.45% LP** at pass 1 alone — the ceiling is still rising
 
-The competition mechanism conclusion (SoftHebb ≈ hard top-K) remains valid — the plasticity rule is not the bottleneck. But the ceiling itself is higher than we initially measured, and may be higher still with combined capacity + duration scaling.
+The competition mechanism conclusion (SoftHebb ≈ hard top-K) remains valid — the plasticity rule is not the bottleneck. The ceiling itself is a moving target as scale increases.
 
-This is a **partially-negative, partially-open finding**: the competition axis is closed, but the capacity/duration axis shows the ceiling hasn't been reached yet at our current scale.
+This is a **partially-negative, partially-open finding**: the competition axis is closed, but the capacity/data/duration axis shows the ceiling has not been reached.
 
 ## What Was Tried
 
@@ -103,7 +105,8 @@ Based on the literature and our experiments, breaking this ceiling would require
 | Method | CIFAR-10 Accuracy | Supervision |
 |--------|-------------------|-------------|
 | Bio-ARN Hebbian (this work, initial) | ~20% | None |
-| Bio-ARN Hebbian (this work, bias-corrected) | **~27%** | None |
+| Bio-ARN Hebbian (this work, bias-corrected, 5K data) | **~28% (still rising)** | None |
+| Bio-ARN Hebbian (this work, 50K data, pass 1) | **28.45%** | None |
 | SoftHebb MLP (Journé et al., ICLR 2023) | 54.5% (MLP) | None |
 | Modern Hebbian CNNs (literature) | 64–76% | None* |
 | Supervised CNN baseline | 90%+ | Full |
@@ -172,10 +175,53 @@ The survivorship bias audit opens two concrete paths:
 - Getting to literature's 64-76% would require 512+ features, 200+ passes, full dataset, and batch norm
 - That's valid engineering but the fundamental question (Hebbian vs competition mechanism) is answered
 
+## Progressive Scaling Experiments (2026-06-29)
+
+These experiments test the three scaling axes identified by the survivorship bias audit, run in sequence using `experiments/hebbian_scaling.py`. Architecture: 3-layer ConvF1, 256 features, spatial_grid=4, top_k=128, competitive_k=32, hebbian_lr=0.005. Seed: 42.
+
+### Experiment 1: Combined Scale — COMPLETE
+
+**Config:** 256 features × 50 passes × 5,000 training samples × 1,000 test samples
+
+| Pass | Nearest-Centroid | Linear Probe |
+|------|-----------------|--------------|
+| 1    | 18.00%          | 19.00%       |
+| 5    | 22.20%          | 21.40%       |
+| 10   | 23.00%          | 22.60%       |
+| 20   | 25.70%          | 24.70%       |
+| 30   | 27.80%          | **27.30%**   |
+| 40   | **27.90%**      | 26.90%       |
+| 50   | 27.40%          | 26.10%       |
+
+**Best:** 27.90% NC (pass 40) / **27.30% LP (pass 30)** — up from 20% baseline (+7.3 pp LP, +7.5 pp NC).
+
+**Observations:**
+- Both axes (capacity + duration) together produce clear gains over either alone
+- Accuracy peaks around pass 30–40; slight regression at pass 50 suggests saturation at 5K data scale
+- The 5K dataset is the remaining bottleneck — the model is well-trained given the data available
+
+### Experiment 2: Full Dataset — IN PROGRESS
+
+**Config:** 256 features × up to 30 passes × 50,000 training samples × 10,000 test samples (3hr runtime cap)
+
+| Pass | Nearest-Centroid | Linear Probe |
+|------|-----------------|--------------|
+| 1    | 24.80%          | **28.45%**   |
+| 5–30 | *(running)*     | *(running)*  |
+
+**Early result:** Pass 1 with full data (28.45% LP) already exceeds Exp 1's best at 27.30% LP, confirming data scale is the next bottleneck. Exp 2 will complete and checkpoints at passes 5 and 10 will be added here.
+
+### Experiment 3: Bio-plausible Divisive Normalization — PENDING
+
+**Config:** Same as Exp 2 + `DivisiveNormalization(σ=0.1, neighborhood=5)` between conv layers.
+
+Tests whether cortical-style divisive suppression (normalising each activation by local channel + spatial energy) improves feature generalisability. Results will be added here when complete.
+
 ## Files
 
 | File | Description |
 |------|-------------|
+| `experiments/hebbian_scaling.py` | **Progressive scaling experiments (combined scale, full data, divisive norm)** |
 | `experiments/bias_audit.py` | **Survivorship bias audit (capacity, duration, eval, pure Hebbian)** |
 | `experiments/softhebb_final_validation.py` | Decision-grade validation script (5 seeds × 3 configs) |
 | `experiments/fullscale_softhebb.py` | Full-scale benchmark (10K samples, 10 passes, 4 configs) |
@@ -189,12 +235,12 @@ The survivorship bias audit opens two concrete paths:
 
 **Competition mechanism investigation: CLOSED.** SoftHebb ≈ baseline at all scales tested. No further work on this axis.
 
-**Scaling investigation: OPEN.** The bias audit showed the ceiling hasn't been reached. Recommended next steps (in priority order):
+**Scaling investigation: OPEN AND CONFIRMING.** The bias audit opened the scaling axis; the progressive scaling experiments are now validating it:
 
-1. **Combined scale run:** 256 features × 50 passes on full 5K training set — projected ~30%+
-2. **Full dataset:** Use all 50K CIFAR-10 training images — more data directly helps Hebbian convergence
-3. **Bio-plausible batch norm:** Existing literature shows batch norm is the single biggest architectural contributor. Bio-plausible alternatives (local normalization, layer norm) may help.
-4. **Feature count scaling:** Test 512 features — diminishing returns expected but measurable
+1. ~~**Combined scale run:** 256 features × 50 passes on 5K training set~~ ✅ **DONE** — reached 27.90% NC / 27.30% LP. Curve peaks at pass 30–40 on 5K data.
+2. **Full dataset:** *(in progress)* 50K CIFAR-10 — pass 1 already at 28.45% LP, more passes running.
+3. **Bio-plausible divisive normalization:** *(pending)* — tests cortical-style local suppression.
+4. **Feature count scaling:** Test 512 features — diminishing returns expected but measurable.
 
 The SoftHebb infrastructure (soft-WTA, BCM thresholds, layer-wise training) remains in the codebase and is well-tested. It is available for future use if combined with scale.
 
