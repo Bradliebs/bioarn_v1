@@ -1,6 +1,6 @@
 # Hebbian Convolutional Feature Learning — CIFAR-10 Ceiling Analysis
 
-**Status:** Revised (progressive scaling Exp 1 complete; Exp 2/3 in progress)
+**Status:** Revised (progressive scaling Exp 1 complete, Exp 2 pass 5/7 complete; Exp 3 pending)
 **Date:** 2026-06-29
 **Authors:** Bio-ARN Team (Sprint J + Final Validation + Bias Audit + Progressive Scaling)
 
@@ -12,7 +12,7 @@ Pure unsupervised Hebbian convolutional learning reaches a **revised ceiling of 
 - **Capacity bias:** 256 features outperforms 64 features by +5.3 pp (linear probe)
 - **Duration bias:** Training for 50 passes reaches 26.7% vs 19.7% at 10 passes (+7.0 pp)
 - **Combined scaling (Exp 1):** 256 features × 50 passes on 5K data reaches **27.90% NC / 27.30% LP**
-- **Full data (Exp 2, pass 1 only):** 50K training images already yields **28.45% LP** at pass 1 alone — the ceiling is still rising
+- **Full data (Exp 2, pass 5/7):** 50K training images, 7-pass cap — **33.32% LP at pass 5**, +6.0 pp over Exp 1 best. Data is a larger bottleneck than training duration.
 
 The competition mechanism conclusion (SoftHebb ≈ hard top-K) remains valid — the plasticity rule is not the bottleneck. The ceiling itself is a moving target as scale increases.
 
@@ -106,7 +106,7 @@ Based on the literature and our experiments, breaking this ceiling would require
 |--------|-------------------|-------------|
 | Bio-ARN Hebbian (this work, initial) | ~20% | None |
 | Bio-ARN Hebbian (this work, bias-corrected, 5K data) | **~28% (still rising)** | None |
-| Bio-ARN Hebbian (this work, 50K data, pass 1) | **28.45%** | None |
+| Bio-ARN Hebbian (this work, 50K data, pass 5) | **33.32%** | None |
 | SoftHebb MLP (Journé et al., ICLR 2023) | 54.5% (MLP) | None |
 | Modern Hebbian CNNs (literature) | 64–76% | None* |
 | Supervised CNN baseline | 90%+ | Full |
@@ -202,14 +202,17 @@ These experiments test the three scaling axes identified by the survivorship bia
 
 ### Experiment 2: Full Dataset — IN PROGRESS
 
-**Config:** 256 features × up to 30 passes × 50,000 training samples × 10,000 test samples (3hr runtime cap)
+**Config:** 256 features × 7 passes (3hr runtime cap) × 50,000 training samples × 10,000 test samples
 
 | Pass | Nearest-Centroid | Linear Probe |
 |------|-----------------|--------------|
-| 1    | 24.80%          | **28.45%**   |
-| 5–30 | *(running)*     | *(running)*  |
+| 1    | 24.80%          | 28.45%       |
+| 5    | 28.21%          | **33.32%**   |
+| 7    | *(running)*     | *(running)*  |
 
-**Early result:** Pass 1 with full data (28.45% LP) already exceeds Exp 1's best at 27.30% LP, confirming data scale is the next bottleneck. Exp 2 will complete and checkpoints at passes 5 and 10 will be added here.
+**Runtime note:** Pass times grew from 17 min → 30 min as more training data accumulated in memory; 3hr cap triggered after pass 5, capping Exp 2 (and Exp 3) to 7 passes each.
+
+**Key insight:** LP jumped from 27.30% (Exp 1 best, 5K data, 30 passes) to **33.32% at just pass 5** with 50K data — a +6.0 pp improvement from data scale alone. **Data is a larger bottleneck than training duration at this feature count.**
 
 ### Experiment 3: Bio-plausible Divisive Normalization — PENDING
 
