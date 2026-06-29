@@ -371,10 +371,10 @@ def _build_normalized_conv_f1(*, use_divisive_norm: bool, hebbian_batch_size: in
     )
 
 
-def _run_hebbian_pass(model: ConvF1Layer, images: torch.Tensor, ordered_indices: torch.Tensor, *, batch_size: int) -> None:
+def _run_hebbian_pass(model: ConvF1Layer, images: torch.Tensor, ordered_indices: torch.Tensor, *, batch_size: int, device: torch.device) -> None:
     for batch_indices in _batch_indices(ordered_indices, batch_size=batch_size):
-        batch_images = images[batch_indices].to(torch.float32)
-        learning_signal = torch.ones(batch_images.shape[0], dtype=torch.float32)
+        batch_images = images[batch_indices].to(device=device, dtype=torch.float32)
+        learning_signal = torch.ones(batch_images.shape[0], device=device, dtype=torch.float32)
         model.hebbian_update(batch_images, learning_signal=learning_signal)
     model.flush_hebbian_updates()
 
@@ -387,6 +387,7 @@ def _extract_sparse_features(
     *,
     batch_size: int,
     sparse_k: int,
+    device: torch.device,
 ) -> SparseFeatureSet:
     model.eval()
     total = images.shape[0]
@@ -396,7 +397,7 @@ def _extract_sparse_features(
     all_values = torch.empty((total, top_k), dtype=torch.float32)
     cursor = 0
     for batch_indices in _iter_label_batches(labels, batch_size=batch_size, shuffle=False, seed=0):
-        batch_images = images[batch_indices].to(torch.float32)
+        batch_images = images[batch_indices].to(device=device, dtype=torch.float32)
         dense_batch = model(batch_images).cpu().to(torch.float32)
         top_values, top_indices = torch.topk(dense_batch, k=top_k, dim=1)
         batch_size_now = dense_batch.shape[0]
@@ -471,9 +472,10 @@ def _linear_probe_accuracy(
     seed: int,
     probe_epochs: int,
     probe_batch_size: int,
+    device: torch.device,
 ) -> float:
     _set_seed(seed)
-    probe = SparseLinearProbe(train_features.feature_dim).to(torch.float32)
+    probe = SparseLinearProbe(train_features.feature_dim).to(device=device, dtype=torch.float32)
     optimizer = torch.optim.SGD(probe.parameters(), lr=PROBE_LR, momentum=PROBE_MOMENTUM)
     criterion = nn.CrossEntropyLoss()
 
@@ -486,8 +488,8 @@ def _linear_probe_accuracy(
             seed=seed + epoch,
         ):
             optimizer.zero_grad(set_to_none=True)
-            logits = probe(batch_indices.to(torch.long), batch_values.to(torch.float32))
-            loss = criterion(logits, batch_labels.to(torch.long))
+            logits = probe(batch_indices.to(device=device, dtype=torch.long), batch_values.to(device=device, dtype=torch.float32))
+            loss = criterion(logits, batch_labels.to(device=device, dtype=torch.long))
             loss.backward()
             optimizer.step()
 
@@ -501,9 +503,9 @@ def _linear_probe_accuracy(
             shuffle=False,
             seed=0,
         ):
-            logits = probe(batch_indices.to(torch.long), batch_values.to(torch.float32))
+            logits = probe(batch_indices.to(device=device, dtype=torch.long), batch_values.to(device=device, dtype=torch.float32))
             predictions = logits.argmax(dim=1)
-            correct += int((predictions == batch_labels).sum().item())
+            correct += int((predictions == batch_labels.to(device)).sum().item())
             total += int(batch_labels.numel())
     return correct / max(total, 1)
 
@@ -519,6 +521,7 @@ def _evaluate_checkpoint(
     probe_batch_size: int,
     probe_epochs: int,
     seed: int,
+    device: torch.device,
 ) -> tuple[float, float]:
     train_features = _extract_sparse_features(
         model,
@@ -526,6 +529,7 @@ def _evaluate_checkpoint(
         train_labels,
         batch_size=eval_batch_size,
         sparse_k=TOP_K,
+        device=device,
     )
     test_features = _extract_sparse_features(
         model,
@@ -533,6 +537,7 @@ def _evaluate_checkpoint(
         test_labels,
         batch_size=eval_batch_size,
         sparse_k=TOP_K,
+        device=device,
     )
     nearest_centroid = _nearest_centroid_accuracy(train_features, test_features)
     linear_probe = _linear_probe_accuracy(
@@ -541,6 +546,7 @@ def _evaluate_checkpoint(
         seed=seed,
         probe_epochs=probe_epochs,
         probe_batch_size=probe_batch_size,
+        device=device,
     )
     return nearest_centroid, linear_probe
 
@@ -584,11 +590,12 @@ def _run_experiment(
     probe_epochs: int,
     seed: int,
     train_batch_size: int,
+    device: torch.device,
     runtime_limit_hours: float = 0.0,
     runtime_pass_cap: int | None = None,
 ) -> ExperimentResult:
     _set_seed(seed)
-    model = model_builder()
+    model = model_builder().to(device)
     class_indices = _class_index_buckets(train_labels)
     metrics: list[PassMetrics] = []
     notes: list[str] = []
@@ -605,7 +612,7 @@ def _run_experiment(
         pass_num = pass_index + 1
         ordered_indices = _build_interleaved_indices(class_indices, seed=seed + pass_index)
         pass_start = time.perf_counter()
-        _run_hebbian_pass(model, train_images, ordered_indices, batch_size=train_batch_size)
+        _run_hebbian_pass(model, train_images, ordered_indices, batch_size=train_batch_size, device=device)
         pass_time = time.perf_counter() - pass_start
         pass_times.append(pass_time)
         print(f"[{name}] pass {pass_num}/{pass_limit} train {pass_time:.1f}s", flush=True)
@@ -634,6 +641,7 @@ def _run_experiment(
                 probe_batch_size=probe_batch_size,
                 probe_epochs=probe_epochs,
                 seed=seed,
+                device=device,
             )
             metrics.append(
                 PassMetrics(
@@ -753,6 +761,7 @@ def _print_report(
     exp3_no_norm: ExperimentResult,
     exp3_div_norm: ExperimentResult,
     checkpoints: tuple[int, ...],
+    device: torch.device,
 ) -> None:
     exp1_delta = exp1.best_linear_probe - BASELINE_LINEAR_PROBE
     exp2_delta = exp2.best_linear_probe - exp1.best_linear_probe
@@ -762,7 +771,7 @@ def _print_report(
     print("\n================================================================", flush=True)
     print("HEBBIAN SCALING — PROGRESSIVE EXPERIMENTS", flush=True)
     print("================================================================", flush=True)
-    print("Seed: 42 | Device: cpu", flush=True)
+    print(f"Seed: 42 | Device: {device}", flush=True)
     print("", flush=True)
 
     print(
@@ -830,7 +839,9 @@ def main() -> int:
     args = parse_args()
     _set_seed(args.seed)
     torch.set_num_threads(max(1, int(args.threads)))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using torch threads: {torch.get_num_threads()}", flush=True)
+    print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""), flush=True)
 
     checkpoints = tuple(sorted({int(checkpoint) for checkpoint in args.checkpoints if int(checkpoint) > 0}))
     if not checkpoints:
@@ -892,6 +903,7 @@ def main() -> int:
         probe_epochs=args.probe_epochs,
         seed=args.seed,
         train_batch_size=args.train_batch_size,
+        device=device,
     )
 
     print("\nRunning experiment 2...", flush=True)
@@ -909,6 +921,7 @@ def main() -> int:
         probe_epochs=args.probe_epochs,
         seed=args.seed,
         train_batch_size=args.train_batch_size,
+        device=device,
         runtime_limit_hours=args.full_runtime_limit_hours,
         runtime_pass_cap=args.full_pass_cap,
     )
@@ -935,6 +948,7 @@ def main() -> int:
         probe_epochs=args.probe_epochs,
         seed=args.seed,
         train_batch_size=args.train_batch_size,
+        device=device,
     )
 
     revised_ceiling = max(exp1.best_linear_probe, exp2.best_linear_probe, exp3_div_norm.best_linear_probe)
@@ -944,6 +958,7 @@ def main() -> int:
         exp3_no_norm=exp3_no_norm,
         exp3_div_norm=exp3_div_norm,
         checkpoints=checkpoints,
+        device=device,
     )
 
     decision_path = _write_decision(
