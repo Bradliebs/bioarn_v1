@@ -6,16 +6,15 @@ training, so image data from any natural-image source is valid.  The linear
 probe at evaluation time uses only CIFAR-10 train/test labels.
 
 Free datasets used (auto-downloaded via torchvision):
-  • CIFAR-10  — 50K images 32×32 (used in every experiment)
-  • CIFAR-100 — 50K images 32×32 (unlabeled for Hebbian training)
-  • STL-10 unlabeled — 100K images 96×96 → resized to 32×32
+  • CIFAR-10  — 50K images 32×32  (eval labels always from here)
+  • CIFAR-100 — 50K images 32×32  (unlabeled for Hebbian training)
   • SVHN train — ~73K images 32×32 (street-view house numbers)
 
 Experiments:
-  Exp 1 (aug-c10):    CIFAR-10 50K + strong online augmentation,      512 feat, 50 passes
-  Exp 2 (multi-200k): CIFAR-10+CIFAR-100+STL-10 ~200K, no aug,       512 feat, 30 passes
-  Exp 3 (multi-aug):  same ~200K + strong online augmentation,        512 feat, 25 passes
-  Exp 4 (max-aug):    add SVHN ~73K → ~273K total + strong aug,       512 feat, 20 passes
+  Exp 1 (aug-c10):      CIFAR-10 50K + strong online aug,             512 feat, 50 passes
+  Exp 2 (multi-100k):   CIFAR-10+CIFAR-100 100K, no aug,              512 feat, 30 passes
+  Exp 3 (multi-173k):   CIFAR-10+CIFAR-100+SVHN ~173K, no aug,        512 feat, 25 passes
+  Exp 4 (multi-173k-aug): same ~173K + strong online aug,             512 feat, 20 passes
 """
 
 from __future__ import annotations
@@ -609,10 +608,10 @@ def _print_report(
     print(f"Seed: {SEED} | Device: {device} | Features: {NUM_FEATURES} | TOP_K: {TOP_K}", flush=True)
 
     for exp, label in [
-        (exp1, "Exp 1: aug-c10     (50K + aug)"),
-        (exp2, "Exp 2: multi-200k  (~200K, no aug)"),
-        (exp3, "Exp 3: multi-aug   (~200K + aug)"),
-        (exp4, "Exp 4: max-aug     (~273K + aug)"),
+        (exp1, "Exp 1: aug-c10      (50K + aug)"),
+        (exp2, "Exp 2: multi-100k   (~100K, no aug)"),
+        (exp3, "Exp 3: multi-173k   (~173K, no aug)"),
+        (exp4, "Exp 4: multi-173k-aug (~173K + aug)"),
     ]:
         print(f"\n--- {label} ---", flush=True)
         print(_format_experiment_table(exp, checkpoints=checkpoints), flush=True)
@@ -635,9 +634,9 @@ def _print_report(
     print(f"| Previous ceiling | 256 feat, 50K | {_pct(PREVIOUS_CEILING)} | — |", flush=True)
     for exp, label, note in [
         (exp1, f"Exp 1: 512 feat, {exp1.hebbian_samples // 1000}K aug", "aug CIFAR-10"),
-        (exp2, f"Exp 2: 512 feat, ~{exp2.hebbian_samples // 1000}K no aug", "C10+C100+STL10"),
-        (exp3, f"Exp 3: 512 feat, ~{exp3.hebbian_samples // 1000}K aug", "C10+C100+STL10+aug"),
-        (exp4, f"Exp 4: 512 feat, ~{exp4.hebbian_samples // 1000}K aug", "C10+C100+STL10+SVHN+aug"),
+        (exp2, f"Exp 2: 512 feat, ~{exp2.hebbian_samples // 1000}K no aug", "C10+C100"),
+        (exp3, f"Exp 3: 512 feat, ~{exp3.hebbian_samples // 1000}K no aug", "C10+C100+SVHN"),
+        (exp4, f"Exp 4: 512 feat, ~{exp4.hebbian_samples // 1000}K aug", "C10+C100+SVHN+aug"),
     ]:
         delta = exp.best_linear_probe - PREVIOUS_CEILING
         print(f"| {note} | {label} | {_pct(exp.best_linear_probe)} | {_pp(delta)} |", flush=True)
@@ -669,9 +668,9 @@ def _write_decision(
             f"**What:** Multi-dataset Hebbian training reached {best * 100:.1f}% LP on CIFAR-10",
             f"**Previous ceiling:** {PREVIOUS_CEILING * 100:.1f}% (256 feat, 50K images)",
             f"**Exp 1 (aug only):** {_pct(exp1.best_linear_probe)} ({_pp(aug_gain)} vs prev)",
-            f"**Exp 2 (200K no aug):** {_pct(exp2.best_linear_probe)} ({_pp(data_gain)} vs prev)",
-            f"**Exp 3 (200K + aug):** {_pct(exp3.best_linear_probe)} ({_pp(combined_gain)} vs prev)",
-            f"**Exp 4 (273K + aug):** {_pct(exp4.best_linear_probe)} ({_pp(max_gain)} vs prev)",
+            f"**Exp 2 (100K no aug, C10+C100):** {_pct(exp2.best_linear_probe)} ({_pp(data_gain)} vs prev)",
+            f"**Exp 3 (173K no aug, C10+C100+SVHN):** {_pct(exp3.best_linear_probe)} ({_pp(combined_gain)} vs prev)",
+            f"**Exp 4 (173K + aug, C10+C100+SVHN):** {_pct(exp4.best_linear_probe)} ({_pp(max_gain)} vs prev)",
             f"**New ceiling:** {best * 100:.1f}%",
             "",
         ]),
@@ -767,28 +766,35 @@ def main() -> int:
         print("(Skipping Exp 1)", flush=True)
         exp1 = ExperimentResult("exp1-skip", 0, 0, 0, 0, [])
 
-    # ── Download/load CIFAR-100 + STL-10 before Exp 2/3 ─────────────────────────
+    # ── Download/load CIFAR-100 + SVHN before Exp 2/3/4 ────────────────────────
     need_multi = not (args.skip_exp2 and args.skip_exp3 and args.skip_exp4)
     if need_multi:
         print("\nLoading multi-dataset sources (may download if not cached) ...", flush=True)
         print("  CIFAR-100 (~169 MB) ...", flush=True)
         c100_imgs = _load_cifar100_images(args.data_dir)
         print(f"  CIFAR-100: {c100_imgs.shape[0] // 1000}K unlabeled images", flush=True)
-        print("  STL-10 unlabeled (~2.6 GB) ...", flush=True)
-        stl10_imgs = _load_stl10_unlabeled(args.data_dir)
-        print(f"  STL-10 unlabeled: {stl10_imgs.shape[0] // 1000}K images (resized 96→32)", flush=True)
-        combined_200k = torch.cat([c10_train_imgs, c100_imgs, stl10_imgs], dim=0)
-        print(f"  Combined: {combined_200k.shape[0] // 1000}K images total\n", flush=True)
-    else:
-        combined_200k = torch.empty(0, 3, 32, 32)
+        combined_100k = torch.cat([c10_train_imgs, c100_imgs], dim=0)
+        print(f"  combined_100k: {combined_100k.shape[0] // 1000}K images", flush=True)
 
-    # ── Experiment 2: multi-dataset, no aug ───────────────────────────────────
+        print("  SVHN train (~174 MB) ...", flush=True)
+        svhn_imgs = _load_svhn_images(args.data_dir)
+        if args.include_svhn_extra:
+            print("  Loading SVHN extra (~531K images, ~6 GB) ...", flush=True)
+            svhn_extra = _load_svhn_extra_images(args.data_dir)
+            svhn_imgs = torch.cat([svhn_imgs, svhn_extra], dim=0)
+        combined_173k = torch.cat([c10_train_imgs, c100_imgs, svhn_imgs], dim=0)
+        print(f"  combined_173k: {combined_173k.shape[0] // 1000}K images (C10+C100+SVHN)\n", flush=True)
+    else:
+        combined_100k = torch.empty(0, 3, 32, 32)
+        combined_173k = torch.empty(0, 3, 32, 32)
+
+    # ── Experiment 2: C10+C100 100K, no aug ───────────────────────────────────
     if not args.skip_exp2:
-        print(f"=== EXPERIMENT 2: multi-dataset {combined_200k.shape[0] // 1000}K, no aug ===", flush=True)
+        print(f"=== EXPERIMENT 2: multi-dataset {combined_100k.shape[0] // 1000}K (C10+C100), no aug ===", flush=True)
         exp2 = _run_experiment(
-            name="exp2-multi-200k",
+            name="exp2-multi-100k",
             model_builder=builder,
-            hebbian_images=combined_200k,
+            hebbian_images=combined_100k,
             planned_passes=args.passes_multi,
             use_augmentation=False,
             **common_kwargs,
@@ -797,38 +803,28 @@ def main() -> int:
         print("(Skipping Exp 2)", flush=True)
         exp2 = ExperimentResult("exp2-skip", 0, 0, 0, 0, [])
 
-    # ── Experiment 3: multi-dataset + aug ─────────────────────────────────────
+    # ── Experiment 3: C10+C100+SVHN 173K, no aug ──────────────────────────────
     if not args.skip_exp3:
-        print(f"=== EXPERIMENT 3: multi-dataset {combined_200k.shape[0] // 1000}K + aug ===", flush=True)
+        print(f"=== EXPERIMENT 3: multi-dataset {combined_173k.shape[0] // 1000}K (C10+C100+SVHN), no aug ===", flush=True)
         exp3 = _run_experiment(
-            name="exp3-multi-aug",
+            name="exp3-multi-173k",
             model_builder=builder,
-            hebbian_images=combined_200k,
+            hebbian_images=combined_173k,
             planned_passes=args.passes_multi_aug,
-            use_augmentation=True,
+            use_augmentation=False,
             **common_kwargs,
         )
     else:
         print("(Skipping Exp 3)", flush=True)
         exp3 = ExperimentResult("exp3-skip", 0, 0, 0, 0, [])
 
-    # ── Download/load SVHN before Exp 4 ──────────────────────────────────────────
+    # ── Experiment 4: C10+C100+SVHN 173K + aug ────────────────────────────────
     if not args.skip_exp4:
-        print("\nLoading SVHN train (~182 MB download if not cached) ...", flush=True)
-        svhn_imgs = _load_svhn_images(args.data_dir)
-        print(f"  SVHN train: {svhn_imgs.shape[0] // 1000}K images", flush=True)
-        if args.include_svhn_extra:
-            print("  Loading SVHN extra (~531K images, ~6 GB) ...", flush=True)
-            svhn_extra = _load_svhn_extra_images(args.data_dir)
-            svhn_imgs = torch.cat([svhn_imgs, svhn_extra], dim=0)
-        combined_max = torch.cat([combined_200k, svhn_imgs], dim=0)
-        print(f"  Max dataset: {combined_max.shape[0] // 1000}K images total\n", flush=True)
-
-        print(f"=== EXPERIMENT 4: max data {combined_max.shape[0] // 1000}K + aug ===", flush=True)
+        print(f"=== EXPERIMENT 4: multi-dataset {combined_173k.shape[0] // 1000}K (C10+C100+SVHN) + aug ===", flush=True)
         exp4 = _run_experiment(
-            name="exp4-max-aug",
+            name="exp4-multi-173k-aug",
             model_builder=builder,
-            hebbian_images=combined_max,
+            hebbian_images=combined_173k,
             planned_passes=args.passes_max_aug,
             use_augmentation=True,
             **common_kwargs,
