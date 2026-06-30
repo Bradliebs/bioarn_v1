@@ -1,6 +1,6 @@
 # Hebbian Convolutional Feature Learning — CIFAR-10 Ceiling Analysis
 
-**Status:** Complete — progressive scaling experiments done (2026-06-29)
+**Status:** In progress — data scaling experiments running (2026-06-30)
 **Date:** 2026-06-29
 **Authors:** Bio-ARN Team (Sprint J + Final Validation + Bias Audit + Progressive Scaling)
 
@@ -241,10 +241,81 @@ All three experiments ran on GPU (NVIDIA GeForce RTX 3070, CUDA 12.4) using `exp
 
 **Total improvement over original baseline: +17.6 pp (20% → 37.6%)**
 
+## Data Scaling Experiments (2026-06-30) — IN PROGRESS
+
+Testing whether **more data + 512 features** breaks through the 37.6% LP ceiling. The Hebbian layer is fully unsupervised — labels are never used during training, so images from any natural source are valid. Linear probe evaluation always uses CIFAR-10 train/test labels.
+
+**Architecture:** 3-layer ConvF1, **512 features**, spatial_grid=4, top_k=256 (50% sparse), competitive_k=64, hebbian_lr=0.005. Seed: 42. GPU: NVIDIA GeForce RTX 3070.
+
+**Datasets (free via torchvision):**
+- CIFAR-10 train: 50K × 32×32 (eval labels always from here)
+- CIFAR-100 train: 50K × 32×32 (unlabeled Hebbian training)
+- SVHN train: ~73K × 32×32 (street-view house numbers, unlabeled)
+
+**Online augmentation (per batch):** random horizontal flip + pad4/crop + brightness/contrast jitter.
+
+### Experiment 1: aug-c10 — 50K + aug, 512 feat, 50 passes
+
+| Pass | Nearest-Centroid | Linear Probe |
+|------|-----------------|--------------|
+| 1    | 25.58%          | 28.75%       |
+| 5    | TBD             | TBD          |
+| 10   | TBD             | TBD          |
+| 20   | TBD             | TBD          |
+| 25   | TBD             | TBD          |
+| 30   | TBD             | TBD          |
+| 40   | TBD             | TBD          |
+| 50   | TBD             | TBD          |
+
+*Pass 1 confirmed LP=28.75% — identical to prior run, pipeline verified.*
+
+### Experiment 2: multi-100k — C10+C100 100K, no aug, 30 passes
+
+| Pass | Nearest-Centroid | Linear Probe |
+|------|-----------------|--------------|
+| 1    | TBD             | TBD          |
+| 5    | TBD             | TBD          |
+| 10   | TBD             | TBD          |
+| 20   | TBD             | TBD          |
+| 25   | TBD             | TBD          |
+| 30   | TBD             | TBD          |
+
+### Experiment 3: multi-173k — C10+C100+SVHN ~173K, no aug, 25 passes
+
+| Pass | Nearest-Centroid | Linear Probe |
+|------|-----------------|--------------|
+| 1    | TBD             | TBD          |
+| 5    | TBD             | TBD          |
+| 10   | TBD             | TBD          |
+| 20   | TBD             | TBD          |
+| 25   | TBD             | TBD          |
+
+### Experiment 4: multi-173k-aug — C10+C100+SVHN ~173K + aug, 20 passes
+
+| Pass | Nearest-Centroid | Linear Probe |
+|------|-----------------|--------------|
+| 1    | TBD             | TBD          |
+| 5    | TBD             | TBD          |
+| 10   | TBD             | TBD          |
+| 20   | TBD             | TBD          |
+
+### Data Scaling Summary (to be updated on completion)
+
+| Experiment | Data | Aug | Features | Passes | Best LP | Δ vs 37.6% |
+|------------|------|-----|----------|--------|---------|------------|
+| Previous ceiling (Exp 2, `hebbian_scaling.py`) | CIFAR-10 50K | ✗ | 256 | 50 | 37.6% | — |
+| Exp 1: aug-c10 | CIFAR-10 50K | ✓ | 512 | 50 | TBD | TBD |
+| Exp 2: multi-100k | C10+C100 100K | ✗ | 512 | 30 | TBD | TBD |
+| Exp 3: multi-173k | C10+C100+SVHN 173K | ✗ | 512 | 25 | TBD | TBD |
+| Exp 4: multi-173k-aug | C10+C100+SVHN 173K | ✓ | 512 | 20 | TBD | TBD |
+
+**Script:** `experiments/data_scaling.py` | **Log:** `logs/data_scaling_gpu_20260630_102947.log`
+
 ## Files
 
 | File | Description |
 |------|-------------|
+| `experiments/data_scaling.py` | **Data scaling experiments (aug, multi-dataset C10+C100+SVHN, 512 feat)** |
 | `experiments/hebbian_scaling.py` | **Progressive scaling experiments (combined scale, full data, divisive norm)** |
 | `experiments/bias_audit.py` | **Survivorship bias audit (capacity, duration, eval, pure Hebbian)** |
 | `experiments/softhebb_final_validation.py` | Decision-grade validation script (5 seeds × 3 configs) |
@@ -259,13 +330,13 @@ All three experiments ran on GPU (NVIDIA GeForce RTX 3070, CUDA 12.4) using `exp
 
 **Competition mechanism: CLOSED.** SoftHebb ≈ baseline at all scales.
 **Normalisation mechanism: CLOSED.** Divisive norm hurts (−5.6 pp).
-**Scaling investigation: OPEN.** Curve still rising at 50 passes on 50K data.
+**Scaling investigation: IN PROGRESS.** Data scaling experiments running (2026-06-30).
 
-Three axes tested and closed; one axis remains:
+Three axes tested and closed; one axis actively being explored:
 
 1. ~~Combined scale (256 feat × 50 pass × 5K)~~ ✅ **27.4% LP**
 2. ~~Full dataset (50K)~~ ✅ **37.6% LP — +10.2 pp, biggest gain**
 3. ~~Bio-plausible divisive norm~~ ✅ **−5.6 pp — skip this axis**
-4. **More data / curriculum:** The curve hadn't fully flattened at 50K × 50 passes. More data or augmentation is the natural next step. The script's `_write_decision` auto-recommendation: *"Prioritise more data or stronger curriculum/augmentation; scaling data still matters more than extra normalisation."*
+4. **More data + 512 features + augmentation:** ⏳ Running overnight. Exp 1 pass 1 = 28.75% LP (CIFAR-10 50K+aug, 512 feat) — 50K augmented matches prior 50K without aug at pass 1, 512 features adding capacity. Multi-dataset exps (100K → 173K, C10+C100+SVHN) follow.
 
 **Bottom line:** The Hebbian approach works — it just needs more room to breathe. 20% → 37.6% from scaling alone, with three local-rule variants all confirmed to be neutral/harmful. The limiting factor is data, not the plasticity rule.
