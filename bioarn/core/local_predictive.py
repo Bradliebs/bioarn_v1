@@ -99,9 +99,10 @@ class LocalPredictiveEncoder(nn.Module):
         eta: float = 0.01,
         pred_lr: float = 1e-3,
         error_scale: float = 2.0,
+        global_pool: bool = True,
     ) -> None:
         super().__init__()
-        self.encoder = SoftHebbNet(channels=channels, kernel_sizes=kernel_sizes, gamma=gamma, eta=eta)
+        self.encoder = SoftHebbNet(channels=channels, kernel_sizes=kernel_sizes, gamma=gamma, eta=eta, global_pool=global_pool)
 
         # Lightweight prediction head: features → predicted patch pixels
         feat_dim = self.encoder.output_dim
@@ -112,7 +113,11 @@ class LocalPredictiveEncoder(nn.Module):
         )
         self._pred_optim = torch.optim.Adam(self.pred_head.parameters(), lr=pred_lr)
         self._rng = random.Random(42)
-        self.error_scale = float(error_scale)  # softmax temperature for error normalisation
+        self.error_scale = float(error_scale)
+
+        # Diagnostic tracking
+        self._last_pred_loss: float = float("nan")
+        self._pred_loss_history: list[float] = []
 
     @property
     def output_dim(self) -> int:
@@ -161,6 +166,8 @@ class LocalPredictiveEncoder(nn.Module):
         pred_loss = F.mse_loss(predicted, target_patch.float())
         pred_loss.backward()
         self._pred_optim.step()
+        self._last_pred_loss = float(pred_loss.detach().item())
+        self._pred_loss_history.append(self._last_pred_loss)
 
         # ── Compute per-sample prediction error ────────────────────────────
         with torch.no_grad():

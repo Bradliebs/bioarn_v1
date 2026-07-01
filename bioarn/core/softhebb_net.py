@@ -15,8 +15,12 @@ Architecture (default, compact Journé variant):
     Input [B, 3, 32, 32]
     → SoftHebbLayer(96, k=5, pad=2)  → ReLU → SoftWTA  → MaxPool2
     → SoftHebbLayer(384, k=3, pad=1) → ReLU → SoftWTA  → MaxPool2
-    → SoftHebbLayer(512, k=3, pad=1) → ReLU → SoftWTA  → AdaptiveAvgPool(4×4)
-    → flatten [B, 512×4×4 = 8192]
+    → SoftHebbLayer(512, k=3, pad=1) → ReLU → SoftWTA
+    → [global_pool=True]  AdaptiveAvgPool(1×1) → flatten [B, 512]
+    → [global_pool=False] AdaptiveAvgPool(4×4) → flatten [B, 512×4×4 = 8192]
+
+Phase 3b default is global_pool=True (512-dim).  The spatial 8192-dim
+variant (global_pool=False) is kept as a diagnostic comparison only.
 
 Interface mirrors ConvF1Layer so it plugs into the existing eval pipeline:
     model(x)                           → dense [B, output_dim] for feature extraction
@@ -157,6 +161,7 @@ class SoftHebbNet(nn.Module):
         *,
         gamma: float = 10.0,
         eta: float = 0.01,
+        global_pool: bool = True,
     ) -> None:
         super().__init__()
         assert len(channels) == len(kernel_sizes), "channels and kernel_sizes must be same length"
@@ -168,10 +173,18 @@ class SoftHebbNet(nn.Module):
             ]
         )
         self._output_channels = int(channels[-1])
+        self._global_pool = bool(global_pool)
 
     @property
     def output_dim(self) -> int:
+        if self._global_pool:
+            return self._output_channels
         return self._output_channels * self.SPATIAL_GRID * self.SPATIAL_GRID
+
+    @property
+    def gamma(self) -> float:
+        """Return gamma of the first layer (all layers share the same γ)."""
+        return float(self.layers[0].gamma)
 
     # ── Forward (eval / feature extraction) ──────────────────────────────────
 
@@ -182,7 +195,10 @@ class SoftHebbNet(nn.Module):
             x = layer(x)
             if i < len(self.layers) - 1:
                 x = F.max_pool2d(x, kernel_size=2, stride=2)
-        x = F.adaptive_avg_pool2d(x, (self.SPATIAL_GRID, self.SPATIAL_GRID))
+        if self._global_pool:
+            x = F.adaptive_avg_pool2d(x, (1, 1))
+        else:
+            x = F.adaptive_avg_pool2d(x, (self.SPATIAL_GRID, self.SPATIAL_GRID))
         return x.flatten(1)
 
     # ── Hebbian training ──────────────────────────────────────────────────────

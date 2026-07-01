@@ -87,9 +87,10 @@ class LocalContrastiveEncoder(nn.Module):
         gamma: float = 10.0,
         eta: float = 0.01,
         contrastive_weight: float = 1.0,
+        global_pool: bool = True,
     ) -> None:
         super().__init__()
-        self.encoder = SoftHebbNet(channels=channels, kernel_sizes=kernel_sizes, gamma=gamma, eta=eta)
+        self.encoder = SoftHebbNet(channels=channels, kernel_sizes=kernel_sizes, gamma=gamma, eta=eta, global_pool=global_pool)
         self.contrastive_weight = float(contrastive_weight)
         self._rng = random.Random(42)
 

@@ -1,6 +1,6 @@
 # Hebbian Convolutional Feature Learning — CIFAR-10 Ceiling Analysis
 
-**Status:** Phase 3 complete (2026-07-01) — local SSL experiments revealed implementation issues; ceiling not broken; Phase 3b fixes proposed
+**Status:** Phase 3b in progress (2026-07-01) — γ sweep + global pooling + collapse diagnostics
 **Date:** 2026-06-29
 **Authors:** Bio-ARN Team (Sprint J + Final Validation + Bias Audit + Progressive Scaling)
 
@@ -322,7 +322,11 @@ Testing whether **more data + 512 features** breaks through the 37.6% LP ceiling
 
 **Script:** `experiments/data_scaling.py` | **Commit:** `4787808`
 
-## Local Self-Supervised Feature Learning (2026-07-01) — IN PROGRESS
+## Local Self-Supervised Feature Learning (2026-07-01) — COMPLETE (Phase 3)
+
+**Label: Negative result, but not a valid falsification of local SSL.**
+**Primary failure: representation collapse (γ=10) + evaluation mismatch (spatial 8192-dim vs global 512-dim).**
+**Next move: Phase 3b repair, not new architecture exploration.**
 
 Phase 3 tests whether **changing the learning signal** breaks the 37.6% LP ceiling confirmed by Phases 1–2. All four experiments use identical evaluation: CIFAR-10 50K train / 10K test, 100-epoch linear probe, checkpoints at passes 1/5/10/20/30.
 
@@ -407,12 +411,35 @@ Wraps SoftHebbNet. Masks one of 16 8×8 patches; gradient-trained MLP prediction
   1. **Architectural mismatch:** SoftHebbNet outputs 8192 spatial features (512 ch × 4×4); the sparse top-256 probe works for ConvF1's global 512 features but cannot capture class-discriminative signal from position-specific spatial features where objects appear at different locations per image.
   2. **Hyperparameter collapse:** γ=10 in SoftWTA acts as near hard-argmax, collapsing filter diversity. NC declines from ~25% to ~18% over 30 passes rather than improving — the opposite of what discriminative learning requires.
 
-**These are fixable.** Phase 3b (proposed):
-- Reduce γ to 2–4 (Journé et al. use γ=2 in softer variants)
-- Add global average pooling to SoftHebbNet: `AdaptiveAvgPool(1×1)` → 512-dim global features instead of 8192 spatial
-- Re-run B/C/D with these fixes before concluding local SSL cannot help
+**These are fixable.** Phase 3b implemented:
+- Reduced γ sweep: {0.5, 1, 2, 5, 10} to diagnose temperature-driven collapse
+- Global average pooling: 512×4×4 → 512-dim global features (fair comparison with ConvF1)
+- Collapse diagnostics per pass: effective_rank, dead_feature_pct, filter_cosim, sparsity
+- Best-pass selected by unsupervised health metric (effective_rank, no labels)
+- D debug: pred_loss trend, feature variance, two-image distinguishability
 
 **Script:** `experiments/local_ssl.py` | **Commit:** `1f5f3d1`
+
+---
+
+## Local SSL Phase 3b Repair (2026-07-01) — IN PROGRESS
+
+Repairs the two compounding issues from Phase 3. Fair comparison: all four models output 512-dim global features.
+
+**Script:** `experiments/local_ssl_3b.py` | **Commit:** TBD
+
+### Phase 3b Acceptance Ladder
+
+| Target | Fail | Weak pass | Real pass | Strong pass |
+|--------|------|-----------|-----------|-------------|
+| A control | — | — | ~38–39% | — |
+| B SoftHebb γ sweep + GAP | <25% | 30–35% | >38.87% | >45% |
+| C LocalContrastive + GAP | <25% | 30–35% | >38.87% | >45–50% |
+| D Predictive bug-fixed + GAP | ~10% | >20% | >30% | >38.87% |
+
+### Phase 3b Results — TBD
+
+*(Results to be filled when `experiments/local_ssl_3b.py` completes.)*
 
 ---
 
@@ -420,6 +447,7 @@ Wraps SoftHebbNet. Masks one of 16 8×8 patches; gradient-trained MLP prediction
 
 | File | Description |
 |------|-------------|
+| `experiments/local_ssl_3b.py` | **Phase 3b: repair of collapse/probe issues (γ sweep, GAP, diagnostics)** |
 | `experiments/local_ssl.py` | **Phase 3: local self-supervised feature learning (A/B/C/D)** |
 | `experiments/data_scaling.py` | **Data scaling experiments (aug, multi-dataset C10+C100+SVHN, 512 feat)** |
 | `experiments/hebbian_scaling.py` | **Progressive scaling experiments (combined scale, full data, divisive norm)** |
@@ -439,7 +467,8 @@ Wraps SoftHebbNet. Masks one of 16 8×8 patches; gradient-trained MLP prediction
 **Competition mechanism: CLOSED.** SoftHebb ≈ baseline at all scales.
 **Normalisation mechanism: CLOSED.** Divisive norm hurts (−5.6 pp).
 **Data scaling: CLOSED.** 50K → 173K (3.5×) + augmentation + 512 features → no improvement. Ceiling is real.
-**Phase 3 (learning signal change): COMPLETE — negative result, implementation issues identified.** SoftHebbNet with γ=10 shows feature collapse; spatial features don't work with sparse probe. Phase 3b fix (global pooling + γ=2) proposed.
+**Phase 3 (learning signal change): COMPLETE — negative result due to γ=10 collapse + spatial feature mismatch (not a valid falsification of local SSL).**
+**Phase 3b (repair + fair comparison): IN PROGRESS** — γ sweep {0.5,1,2,5,10}, global pooling 512-dim, collapse diagnostics.
 
 All prior scaling axes tested and closed:
 
