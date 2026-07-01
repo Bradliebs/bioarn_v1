@@ -1,21 +1,20 @@
 # Hebbian Convolutional Feature Learning — CIFAR-10 Ceiling Analysis
 
-**Status:** In progress — data scaling experiments running (2026-06-30)
+**Status:** Complete — data scaling experiments done (2026-07-01)
 **Date:** 2026-06-29
 **Authors:** Bio-ARN Team (Sprint J + Final Validation + Bias Audit + Progressive Scaling)
 
 ## Summary
 
-Pure unsupervised Hebbian convolutional learning reaches a **revised ceiling of 37.6% accuracy on CIFAR-10** — up from the original ~20% estimate and +17.6 pp over baseline. All three scaling axes have now been tested.
+Pure unsupervised Hebbian convolutional learning reaches a **confirmed ceiling of ~37.6% accuracy on CIFAR-10** — up from the original ~20% estimate (+17.6 pp). All four scaling axes have now been tested and closed.
 
 **Final results:**
 - **Capacity** (64→256 features): +7.4 pp
 - **Full data** (5K→50K training images): **+10.2 pp** — the largest single gain
-- **Bio-plausible divisive normalization**: **−5.6 pp** — hurts, same story as competition mechanism
+- **Bio-plausible divisive normalization**: **−5.6 pp** — hurts
+- **More data + 512 features + augmentation**: **+0.1 pp** — flat; ceiling is real
 
-The competition mechanism conclusion (SoftHebb ≈ hard top-K) extends to normalization: adding cortical-style divisive suppression also fails to improve features. **The bottleneck is data scale and representation capacity, not the local learning rule or normalization mechanism.**
-
-This finding is **closed on three axes** (competition, normalization, capacity within reach) and **open on one** (data scale — the curve was still rising at pass 50 with 50K data).
+The ceiling is **not** a data problem. Adding 3.5× more images (50K → 173K via CIFAR-100 + SVHN), doubling features to 512, and applying augmentation all leave the result in the 37.3–37.7% band. **The bottleneck is the learning rule:** pure Hebbian updates cannot organise features into class-discriminative representations without a contrastive or error-driven signal.
 
 ## What Was Tried
 
@@ -106,6 +105,7 @@ Based on the literature and our experiments, breaking this ceiling would require
 | Bio-ARN Hebbian (this work, initial) | ~20% | None |
 | Bio-ARN Hebbian (this work, combined scale, 5K) | 27.4% | None |
 | Bio-ARN Hebbian (this work, full data 50K) | **37.6%** | None |
+| Bio-ARN Hebbian (this work, data scaling — ceiling confirmed) | **37.7%** (best of 4 exps) | None |
 | SoftHebb MLP (Journé et al., ICLR 2023) | 54.5% (MLP) | None |
 | Modern Hebbian CNNs (literature) | 64–76% | None* |
 | Supervised CNN baseline | 90%+ | Full |
@@ -259,57 +259,65 @@ Testing whether **more data + 512 features** breaks through the 37.6% LP ceiling
 | Pass | Nearest-Centroid | Linear Probe |
 |------|-----------------|--------------|
 | 1    | 25.58%          | 28.75%       |
-| 5    | TBD             | TBD          |
-| 10   | TBD             | TBD          |
-| 20   | TBD             | TBD          |
-| 25   | TBD             | TBD          |
-| 30   | TBD             | TBD          |
-| 40   | TBD             | TBD          |
-| 50   | TBD             | TBD          |
+| 5    | 28.47%          | 34.05%       |
+| 10   | 30.18%          | 36.82%       |
+| 20   | 29.72%          | 37.29%       |
+| 25   | 28.30%          | 37.14%       |
+| 30   | 28.27%          | 37.23%       |
+| 40   | 27.73%          | 37.27%       |
+| 50   | 27.85%          | **37.68%**   |
 
-*Pass 1 confirmed LP=28.75% — identical to prior run, pipeline verified.*
+**Best: 37.68% LP (pass 50)** — just barely edges the prior ceiling. NC peaks early (pass 10) then declines as LP keeps climbing.
 
 ### Experiment 2: multi-100k — C10+C100 100K, no aug, 30 passes
 
 | Pass | Nearest-Centroid | Linear Probe |
 |------|-----------------|--------------|
-| 1    | TBD             | TBD          |
-| 5    | TBD             | TBD          |
-| 10   | TBD             | TBD          |
-| 20   | TBD             | TBD          |
-| 25   | TBD             | TBD          |
-| 30   | TBD             | TBD          |
+| 1    | 26.54%          | 31.11%       |
+| 5    | 30.81%          | 36.82%       |
+| 10   | 29.31%          | **37.35%**   |
+| 20   | 27.43%          | 37.15%       |
+| 25   | 27.48%          | 37.07%       |
+| 30   | 27.44%          | 37.06%       |
+
+**Best: 37.35% LP (pass 10)** — peaks earlier than Exp 1, then saturates. 2× data with no augmentation matches the ceiling but doesn't beat it.
 
 ### Experiment 3: multi-173k — C10+C100+SVHN ~173K, no aug, 25 passes
 
 | Pass | Nearest-Centroid | Linear Probe |
 |------|-----------------|--------------|
-| 1    | TBD             | TBD          |
-| 5    | TBD             | TBD          |
-| 10   | TBD             | TBD          |
-| 20   | TBD             | TBD          |
-| 25   | TBD             | TBD          |
+| 1    | 27.08%          | 33.25%       |
+| 5    | 27.48%          | 35.95%       |
+| 10   | 27.59%          | **37.49%**   |
+| 20   | 28.22%          | 36.64%       |
+| 25   | 27.49%          | 36.72%       |
+
+**Best: 37.49% LP (pass 10)** — 3.5× data, same result as 2× data. LP peaks at pass 10 then dips slightly. SVHN (different domain) does not add useful signal.
 
 ### Experiment 4: multi-173k-aug — C10+C100+SVHN ~173K + aug, 20 passes
 
 | Pass | Nearest-Centroid | Linear Probe |
 |------|-----------------|--------------|
-| 1    | TBD             | TBD          |
-| 5    | TBD             | TBD          |
-| 10   | TBD             | TBD          |
-| 20   | TBD             | TBD          |
+| 1    | 27.47%          | 33.44%       |
+| 5    | 28.67%          | **37.31%**   |
+| 10   | 28.00%          | 37.02%       |
+| 20   | 27.68%          | 36.83%       |
 
-### Data Scaling Summary (to be updated on completion)
+**Best: 37.31% LP (pass 5)** — augmentation + more data peaks fastest but no higher. Adding augmentation to a larger heterogeneous dataset does not compound the gains.
+
+### Data Scaling Summary
 
 | Experiment | Data | Aug | Features | Passes | Best LP | Δ vs 37.6% |
 |------------|------|-----|----------|--------|---------|------------|
-| Previous ceiling (Exp 2, `hebbian_scaling.py`) | CIFAR-10 50K | ✗ | 256 | 50 | 37.6% | — |
-| Exp 1: aug-c10 | CIFAR-10 50K | ✓ | 512 | 50 | TBD | TBD |
-| Exp 2: multi-100k | C10+C100 100K | ✗ | 512 | 30 | TBD | TBD |
-| Exp 3: multi-173k | C10+C100+SVHN 173K | ✗ | 512 | 25 | TBD | TBD |
-| Exp 4: multi-173k-aug | C10+C100+SVHN 173K | ✓ | 512 | 20 | TBD | TBD |
+| Previous ceiling | CIFAR-10 50K | ✗ | 256 | 50 | 37.6% | — |
+| Exp 1: aug-c10 | CIFAR-10 50K | ✓ | 512 | 50 | **37.68%** | +0.1 pp |
+| Exp 2: multi-100k | C10+C100 100K | ✗ | 512 | 30 | 37.35% | −0.3 pp |
+| Exp 3: multi-173k | C10+C100+SVHN 173K | ✗ | 512 | 25 | 37.49% | −0.1 pp |
+| Exp 4: multi-173k-aug | C10+C100+SVHN 173K | ✓ | 512 | 20 | 37.31% | −0.3 pp |
 
-**Script:** `experiments/data_scaling.py` | **Log:** `logs/data_scaling_gpu_20260630_102947.log`
+**All four experiments cluster within 37.3–37.7% — a spread of just 0.4 pp across 3.5× data range.** The ceiling is real and is not a data problem.
+
+**Script:** `experiments/data_scaling.py` | **Commit:** `4787808`
 
 ## Files
 
@@ -330,13 +338,23 @@ Testing whether **more data + 512 features** breaks through the 37.6% LP ceiling
 
 **Competition mechanism: CLOSED.** SoftHebb ≈ baseline at all scales.
 **Normalisation mechanism: CLOSED.** Divisive norm hurts (−5.6 pp).
-**Scaling investigation: IN PROGRESS.** Data scaling experiments running (2026-06-30).
+**Data scaling: CLOSED.** 50K → 173K (3.5×) + augmentation + 512 features → no improvement. Ceiling is real.
 
-Three axes tested and closed; one axis actively being explored:
+All four axes tested and closed:
 
 1. ~~Combined scale (256 feat × 50 pass × 5K)~~ ✅ **27.4% LP**
 2. ~~Full dataset (50K)~~ ✅ **37.6% LP — +10.2 pp, biggest gain**
 3. ~~Bio-plausible divisive norm~~ ✅ **−5.6 pp — skip this axis**
-4. **More data + 512 features + augmentation:** ⏳ Running overnight. Exp 1 pass 1 = 28.75% LP (CIFAR-10 50K+aug, 512 feat) — 50K augmented matches prior 50K without aug at pass 1, 512 features adding capacity. Multi-dataset exps (100K → 173K, C10+C100+SVHN) follow.
+4. ~~More data + aug + 512 feat~~ ✅ **37.3–37.7% — flat, ceiling confirmed**
 
-**Bottom line:** The Hebbian approach works — it just needs more room to breathe. 20% → 37.6% from scaling alone, with three local-rule variants all confirmed to be neutral/harmful. The limiting factor is data, not the plasticity rule.
+**The ceiling is ~37.6% and is not a data problem.** Adding 3.5× more training images from CIFAR-100 and SVHN, doubling features to 512, and applying online augmentation all fail to move the needle. Every experiment lands in the 37.3–37.7% band — a spread of 0.4 pp across wildly different configurations.
+
+**What this means:** The bottleneck is the learning rule itself. Pure Hebbian updates learn local correlations (edges, textures, frequency patches) but cannot organise features into class-discriminative representations without some form of supervision or contrastive signal. More data gives more of the same kind of features, not better-organised ones.
+
+**To break the ceiling, the learning signal must change, not the data volume:**
+- Contrastive local learning (SimCLR-style objectives without backprop)
+- Error-driven local rules (target propagation, difference target propagation)
+- Predictive coding with top-down error signals
+- Accepting a small amount of supervision (contrastive Hebbian learning with labels)
+
+**Bottom line:** 20% → 37.6% from capacity + data scaling. The remaining gap to supervised (90%+) and modern unsupervised Hebbian (64–76%) requires a fundamentally different learning signal, not more of the same data.
