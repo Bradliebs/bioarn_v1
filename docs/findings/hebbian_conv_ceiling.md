@@ -328,7 +328,7 @@ Phase 3 tests whether **changing the learning signal** breaks the 37.6% LP ceili
 
 **Hypothesis:** The ceiling is the learning rule, not data volume. Adding contrastive or predictive objectives should break the ceiling even with the same data.
 
-**Script:** `experiments/local_ssl.py` | **Commit:** TBD
+**Script:** `experiments/local_ssl.py` | **Commit:** `1f5f3d1`
 
 ### Experiment A: ConvF1Layer baseline (512 feat, aug) — control
 
@@ -412,7 +412,7 @@ Wraps SoftHebbNet. Masks one of 16 8×8 patches; gradient-trained MLP prediction
 - Add global average pooling to SoftHebbNet: `AdaptiveAvgPool(1×1)` → 512-dim global features instead of 8192 spatial
 - Re-run B/C/D with these fixes before concluding local SSL cannot help
 
-**Script:** `experiments/local_ssl.py` | **Commit:** TBD
+**Script:** `experiments/local_ssl.py` | **Commit:** `1f5f3d1`
 
 ---
 
