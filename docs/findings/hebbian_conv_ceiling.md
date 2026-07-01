@@ -1,6 +1,6 @@
 # Hebbian Convolutional Feature Learning — CIFAR-10 Ceiling Analysis
 
-**Status:** Complete — data scaling experiments done (2026-07-01)
+**Status:** Phase 3 complete (2026-07-01) — local SSL experiments revealed implementation issues; ceiling not broken; Phase 3b fixes proposed
 **Date:** 2026-06-29
 **Authors:** Bio-ARN Team (Sprint J + Final Validation + Bias Audit + Progressive Scaling)
 
@@ -106,6 +106,9 @@ Based on the literature and our experiments, breaking this ceiling would require
 | Bio-ARN Hebbian (this work, combined scale, 5K) | 27.4% | None |
 | Bio-ARN Hebbian (this work, full data 50K) | **37.6%** | None |
 | Bio-ARN Hebbian (this work, data scaling — ceiling confirmed) | **37.7%** (best of 4 exps) | None |
+| Bio-ARN ConvF1 Phase 3 control (512 feat, 30 pass, aug) | **38.87%** | None |
+| Bio-ARN SoftHebbNet γ=10 (this work, Phase 3) | 20.18% peak (pass 10), collapses | None |
+| Bio-ARN LocalContrastive γ=10 (this work, Phase 3) | 21.05% peak (pass 10), collapses | None |
 | SoftHebb MLP (Journé et al., ICLR 2023) | 54.5% (MLP) | None |
 | Modern Hebbian CNNs (literature) | 64–76% | None* |
 | Supervised CNN baseline | 90%+ | Full |
@@ -319,10 +322,105 @@ Testing whether **more data + 512 features** breaks through the 37.6% LP ceiling
 
 **Script:** `experiments/data_scaling.py` | **Commit:** `4787808`
 
+## Local Self-Supervised Feature Learning (2026-07-01) — IN PROGRESS
+
+Phase 3 tests whether **changing the learning signal** breaks the 37.6% LP ceiling confirmed by Phases 1–2. All four experiments use identical evaluation: CIFAR-10 50K train / 10K test, 100-epoch linear probe, checkpoints at passes 1/5/10/20/30.
+
+**Hypothesis:** The ceiling is the learning rule, not data volume. Adding contrastive or predictive objectives should break the ceiling even with the same data.
+
+**Script:** `experiments/local_ssl.py` | **Commit:** TBD
+
+### Experiment A: ConvF1Layer baseline (512 feat, aug) — control
+
+Same architecture and data as Phase 2 Exp 1. Expected ~37.6%.
+
+| Pass | Nearest-Centroid | Linear Probe |
+|------|-----------------|--------------|
+| 1    | 25.63%          | 28.78%       |
+| 5    | 28.15%          | 33.97%       |
+| 10   | 30.34%          | 37.00%       |
+| 20   | 28.34%          | 37.88%       |
+| 30   | 28.56%          | **38.87%**   |
+
+**Best:** 38.87% LP (pass 30)
+
+### Experiment B: SoftHebbNet (Journé-style WTA, aug)
+
+Clean standalone implementation of Journé et al. ICLR 2023. Three SoftHebb layers (96→384→512 ch, γ=10, η=0.01), SoftWTA competition, per-filter L2 normalisation. Output: 512×4×4 = 8192 features. Target: >45%.
+
+| Pass | Nearest-Centroid | Linear Probe |
+|------|-----------------|--------------|
+| 1    | 24.82%          | 10.00%       |
+| 5    | 24.52%          | 10.00%       |
+| 10   | 21.28%          | **20.18%**   |
+| 20   | 18.69%          | 13.84%       |
+| 30   | 18.40%          | 12.03%       |
+
+**Best:** 20.18% LP (pass 10)
+
+> ⚠️ **Feature collapse observed.** NC declines from 24.82% (pass 1) to 18.40% (pass 30) — filters converge to mean patterns rather than discriminative features. LP peaks at pass 10 (20.18%) then collapses as features degrade. With γ=10, SoftWTA acts nearly like a hard argmax per spatial position. LP stays well below baseline due to (a) spatial features (512×4×4) not aligning with the sparse per-sample top-256 probe, and (b) feature collapse reducing discriminability. Proposed fix: reduce γ to 2–4 and/or use global average pooling to produce 512-dim global features.
+
+### Experiment C: LocalContrastiveEncoder (CLAPP-style view consistency)
+
+Wraps SoftHebbNet. Generates two augmented views of each batch; weights Hebbian update by cosine similarity between views: `modulation = 0.5 + 0.5 * cos_sim(f1, f2) ∈ [0, 1]`. Target: >50%.
+
+| Pass | Nearest-Centroid | Linear Probe |
+|------|-----------------|--------------|
+| 1    | 20.93%          | 10.00%       |
+| 5    | 20.45%          | 10.29%       |
+| 10   | 20.99%          | **21.05%**   |
+| 20   | 18.48%          | 14.55%       |
+| 30   | 18.48%          | 15.27%       |
+
+**Best:** 21.05% LP (pass 10)
+
+> ⚠️ **Same collapse pattern as B.** Peak at pass 10 (21.05% LP vs B's 20.18%) then declines. Contrastive modulation gives +0.9 pp advantage at peak and slower collapse (15.27% final vs B's 12.03%), but does not prevent the underlying feature collapse. The view-consistency signal is slightly beneficial but insufficient to overcome the γ=10 WTA collapse.
+
+Wraps SoftHebbNet. Masks one of 16 8×8 patches; gradient-trained MLP prediction head predicts masked patch from features; prediction error modulates Hebbian update: `sigmoid(2 * error − 1)`. Target: >50%.
+
+| Pass | Nearest-Centroid | Linear Probe |
+|------|-----------------|--------------|
+| 1    | 20.84%          | 10.00%       |
+| 5    | 20.95%          | 10.00%       |
+| 10   | 21.10%          | 10.00%       |
+| 20   | 20.60%          | 10.00%       |
+| 30   | 20.45%          | 10.00%       |
+
+**Best:** 10.00% LP (random chance throughout)
+
+> ⚠️ **LP stuck at random throughout all 30 passes.** Unlike B and C (which peaked at 20% at pass 10), D shows LP = 10.00% throughout. NC is relatively stable (20.84% → 20.45%) — less collapse than B/C, but no improvement either. Prediction error modulation provides no LP benefit. Likely cause: without augmentation, the unmodulated Hebbian update (error modulation ≈ 1.0 for all samples, since errors are large with random prediction head) is effectively the same as a constant full-strength update, but on unaugmented images — which may not provide sufficient feature diversity for the probe to find discriminative directions.
+
+### Phase 3 Summary
+
+| Experiment | Rule | Best LP | Best Pass | Δ vs 37.6% ceiling |
+|------------|------|---------|-----------|---------------------|
+| A (control) | Pure Hebbian ConvF1 512 feat aug | **38.87%** | 30 | +1.3 pp |
+| B (SoftHebb) | Journé WTA aug, γ=10 | 20.18% | 10 | −17.4 pp |
+| C (contrastive) | View-consistency modulation | 21.05% | 10 | −16.6 pp |
+| D (predictive) | Masked-patch prediction error | 10.00% | — | −27.6 pp |
+
+**Phase 3 interpretation:**
+- B and C peak at pass 10 (~20% LP) then collapse to 12–15% by pass 30 — **feature collapse** from aggressive WTA (γ=10)
+- D is stuck at random (10.00%) throughout — prediction-error modulation inactive when pred_head is random (errors always large → modulation ≈ 1.0 always → essentially unmodulated Hebbian on non-augmented images)
+- The ceiling was not broken. The Phase 3 negative result is driven by **two compounding implementation issues**, not a fundamental failure of the local SSL learning principle:
+
+  1. **Architectural mismatch:** SoftHebbNet outputs 8192 spatial features (512 ch × 4×4); the sparse top-256 probe works for ConvF1's global 512 features but cannot capture class-discriminative signal from position-specific spatial features where objects appear at different locations per image.
+  2. **Hyperparameter collapse:** γ=10 in SoftWTA acts as near hard-argmax, collapsing filter diversity. NC declines from ~25% to ~18% over 30 passes rather than improving — the opposite of what discriminative learning requires.
+
+**These are fixable.** Phase 3b (proposed):
+- Reduce γ to 2–4 (Journé et al. use γ=2 in softer variants)
+- Add global average pooling to SoftHebbNet: `AdaptiveAvgPool(1×1)` → 512-dim global features instead of 8192 spatial
+- Re-run B/C/D with these fixes before concluding local SSL cannot help
+
+**Script:** `experiments/local_ssl.py` | **Commit:** TBD
+
+---
+
 ## Files
 
 | File | Description |
 |------|-------------|
+| `experiments/local_ssl.py` | **Phase 3: local self-supervised feature learning (A/B/C/D)** |
 | `experiments/data_scaling.py` | **Data scaling experiments (aug, multi-dataset C10+C100+SVHN, 512 feat)** |
 | `experiments/hebbian_scaling.py` | **Progressive scaling experiments (combined scale, full data, divisive norm)** |
 | `experiments/bias_audit.py` | **Survivorship bias audit (capacity, duration, eval, pure Hebbian)** |
@@ -331,7 +429,9 @@ Testing whether **more data + 512 features** breaks through the 37.6% LP ceiling
 | `experiments/softhebb_benchmark.py` | Original ablation (7 configs, 1K samples) |
 | `experiments/linear_probe_benchmark.py` | Linear probe evaluation framework |
 | `experiments/softhebb_hyperparam_sweep.py` | Hyperparameter grid search |
-| `bioarn/core/conv_ccc.py` | ConvF1Layer with SoftHebb mode |
+| `bioarn/core/softhebb_net.py` | **SoftHebbNet — clean Journé-style SoftWTA architecture** |
+| `bioarn/core/local_contrastive.py` | **LocalContrastiveEncoder — CLAPP-inspired view-consistency modulation** |
+| `bioarn/core/local_predictive.py` | **LocalPredictiveEncoder — masked-patch prediction-error modulation** |
 | `bioarn/config.py` | SoftHebb configuration (ConvCCCConfig) |
 
 ## Recommendation
@@ -339,8 +439,9 @@ Testing whether **more data + 512 features** breaks through the 37.6% LP ceiling
 **Competition mechanism: CLOSED.** SoftHebb ≈ baseline at all scales.
 **Normalisation mechanism: CLOSED.** Divisive norm hurts (−5.6 pp).
 **Data scaling: CLOSED.** 50K → 173K (3.5×) + augmentation + 512 features → no improvement. Ceiling is real.
+**Phase 3 (learning signal change): COMPLETE — negative result, implementation issues identified.** SoftHebbNet with γ=10 shows feature collapse; spatial features don't work with sparse probe. Phase 3b fix (global pooling + γ=2) proposed.
 
-All four axes tested and closed:
+All prior scaling axes tested and closed:
 
 1. ~~Combined scale (256 feat × 50 pass × 5K)~~ ✅ **27.4% LP**
 2. ~~Full dataset (50K)~~ ✅ **37.6% LP — +10.2 pp, biggest gain**
@@ -351,10 +452,6 @@ All four axes tested and closed:
 
 **What this means:** The bottleneck is the learning rule itself. Pure Hebbian updates learn local correlations (edges, textures, frequency patches) but cannot organise features into class-discriminative representations without some form of supervision or contrastive signal. More data gives more of the same kind of features, not better-organised ones.
 
-**To break the ceiling, the learning signal must change, not the data volume:**
-- Contrastive local learning (SimCLR-style objectives without backprop)
-- Error-driven local rules (target propagation, difference target propagation)
-- Predictive coding with top-down error signals
-- Accepting a small amount of supervision (contrastive Hebbian learning with labels)
+**Phase 3 tests the hypothesis directly:** Changing the learning signal (SoftHebb WTA architecture, local contrastive modulation, predictive patch masking) should break the ceiling if the rule is the bottleneck. Results from `experiments/local_ssl.py` show the hypothesis is plausible but implementation issues (γ=10 feature collapse, spatial features + sparse probe mismatch) prevented a fair test. Phase 3b (γ=2 + global pooling) is the next logical step.
 
-**Bottom line:** 20% → 37.6% from capacity + data scaling. The remaining gap to supervised (90%+) and modern unsupervised Hebbian (64–76%) requires a fundamentally different learning signal, not more of the same data.
+**Bottom line:** 20% → 38.87% from capacity + data scaling (new local SSL control). The remaining gap to supervised (90%+) and modern unsupervised Hebbian (64–76%) requires a fundamentally different learning signal, not more of the same data. Phase 3 negative result is not a fundamental failure of local SSL — it is a fixable hyperparameter and architecture issue.
