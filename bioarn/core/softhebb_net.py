@@ -66,6 +66,8 @@ class SoftHebbLayer(nn.Module):
         *,
         gamma: float = 10.0,
         eta: float = 0.01,
+        oja_decay: float = 0.0,
+        filter_decorr: float = 0.0,
     ) -> None:
         super().__init__()
         self.in_channels = int(in_channels)
@@ -73,6 +75,8 @@ class SoftHebbLayer(nn.Module):
         self.kernel_size = int(kernel_size) | 1  # force odd
         self.gamma = float(gamma)
         self.eta = float(eta)
+        self.oja_decay = float(oja_decay)
+        self.filter_decorr = float(filter_decorr)
         self.padding = self.kernel_size // 2
 
         weight = torch.empty(out_channels, in_channels, self.kernel_size, self.kernel_size)
@@ -125,12 +129,31 @@ class SoftHebbLayer(nn.Module):
         self._n_acc.add_(B * H * W)
 
     def flush(self) -> None:
-        """Apply accumulated Hebbian update, then renormalise filters."""
+        """Apply accumulated Hebbian update, Oja decay, filter decorrelation, then renormalise."""
         n = int(self._n_acc.item())
         if n == 0:
             return
         dw = (self._dw_acc / n).reshape_as(self.weight.data)
         self.weight.data.add_(dw, alpha=self.eta)
+
+        if self.oja_decay > 0.0:
+            # Oja decay: prevent weight magnitude explosion, maintain unit-norm tendency
+            w_flat = self.weight.data.reshape(self.out_channels, -1)
+            w_norm_sq = (w_flat ** 2).sum(dim=1, keepdim=True)
+            self.weight.data.sub_(
+                (self.oja_decay * self.weight.data.reshape(self.out_channels, -1) * w_norm_sq)
+                .reshape_as(self.weight.data)
+            )
+
+        if self.filter_decorr > 0.0:
+            # Filter decorrelation: push filter pair-wise correlations toward zero
+            w_flat = self.weight.data.reshape(self.out_channels, -1)
+            w_norm = F.normalize(w_flat, dim=1, eps=1e-8)
+            gram = w_norm @ w_norm.T  # [C, C] pairwise cosine similarities
+            gram.fill_diagonal_(0.0)
+            decorr_signal = (gram @ w_norm).reshape_as(self.weight.data)
+            self.weight.data.sub_(decorr_signal, alpha=self.filter_decorr)
+
         self._normalise_weights_()
         self._dw_acc.zero_()
         self._n_acc.zero_()
@@ -162,13 +185,19 @@ class SoftHebbNet(nn.Module):
         gamma: float = 10.0,
         eta: float = 0.01,
         global_pool: bool = True,
+        oja_decay: float = 0.0,
+        filter_decorr: float = 0.0,
     ) -> None:
         super().__init__()
         assert len(channels) == len(kernel_sizes), "channels and kernel_sizes must be same length"
         in_chs = [3, *list(channels[:-1])]
         self.layers: nn.ModuleList = nn.ModuleList(
             [
-                SoftHebbLayer(in_chs[i], channels[i], kernel_sizes[i], gamma=gamma, eta=eta)
+                SoftHebbLayer(
+                    in_chs[i], channels[i], kernel_sizes[i],
+                    gamma=gamma, eta=eta,
+                    oja_decay=oja_decay, filter_decorr=filter_decorr,
+                )
                 for i in range(len(channels))
             ]
         )
@@ -216,8 +245,9 @@ class SoftHebbNet(nn.Module):
         """
         self.train()
         if learning_signal is not None:
-            # Scale input by per-sample signal before accumulation
-            scale = learning_signal.reshape(-1, 1, 1, 1).clamp(min=0.0)
+            # Scale input by per-sample signal before accumulation.
+            # Negative signals produce anti-Hebbian updates (decorrelation).
+            scale = learning_signal.reshape(-1, 1, 1, 1)
             x = x * scale
         self(x)
 
