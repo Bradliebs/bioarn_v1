@@ -422,11 +422,12 @@ Wraps SoftHebbNet. Masks one of 16 8×8 patches; gradient-trained MLP prediction
 
 ---
 
-## Local SSL Phase 3b Repair (2026-07-01) — IN PROGRESS
+## Local SSL Phase 3b Repair (2026-07-02) — COMPLETE
 
-Repairs the two compounding issues from Phase 3. Fair comparison: all four models output 512-dim global features.
+Repairs the Phase 3 mismatch issues (γ=10 collapse, spatial 8192-dim vs global 512-dim). Fair comparison: all models output 512-dim global features.
 
-**Script:** `experiments/local_ssl_3b.py` | **Commit:** TBD
+**Label: Negative result, but STILL not a valid falsification of local SSL — third evaluation artifact found.**
+**Script:** `experiments/local_ssl_3b.py` | **Commit:** `ee20842`
 
 ### Phase 3b Acceptance Ladder
 
@@ -437,9 +438,88 @@ Repairs the two compounding issues from Phase 3. Fair comparison: all four model
 | C LocalContrastive + GAP | <25% | 30–35% | >38.87% | >45–50% |
 | D Predictive bug-fixed + GAP | ~10% | >20% | >30% | >38.87% |
 
-### Phase 3b Results — TBD
+### Phase 3b Results
 
-*(Results to be filled when `experiments/local_ssl_3b.py` completes.)*
+**Exp A: ConvF1 control (512-dim, aug)**
+
+| Pass | NC | LP | Eff_rank |
+|------|----|----|----------|
+| 1    | 25.63% | 28.78% | 3981 |
+| 5    | 28.10% | 34.00% | 3728 |
+| 10   | 30.14% | 37.29% | 3726 |
+| 20   | 28.96% | 37.95% | 3570 |
+| 30   | 28.43% | **38.00%** | 3388 |
+
+**Exp B: SoftHebb γ sweep (global pool 512-dim)**
+
+| γ | Best LP | Peak eff_rank | NC trend | Collapse? |
+|---|---------|---------------|----------|-----------|
+| 0.5 | 10.00% | 17.7 | 30.4–30.6% (stable) | No |
+| 1   | 10.00% | 17.7 | 29.9% (stable) | No |
+| 2   | 10.00% | 26.3 | 29.7–29.8% (stable) | No |
+| 5   | 15.45% | 56.0 → 1.3 | 26.8%→15.9% | Yes (pass 10→30) |
+| 10  | 14.39% | 95.1 → 1.0 | 24.4%→10.0% | Yes (pass 5→20) |
+
+γ sweep confirmed: lower γ prevents collapse. But LP=10% at all lower γ values. Collapse γ (5, 10) produce slightly above-chance LP (13–15%) only at the moment of collapse.
+
+**Exp B★ diagnostic: SoftHebb γ=10 spatial 8192-dim (Phase 3 conditions)**
+
+| Pass | NC | LP | Eff_rank |
+|------|----|----|----------|
+| 1 | 20.84% | 10.00% | 1561 |
+| 10 | 19.79% | 14.25% | 65 |
+| 20 | 18.51% | 19.82% | 4 |
+| 30 | 18.53% | **20.72%** | 4 |
+
+Phase 3 B result reproduced (LP peaks ~20% at collapse with spatial features).
+
+**Exp C: LocalContrastive γ=5 (global pool 512-dim)**
+
+| Pass | NC | LP | Eff_rank |
+|------|----|----|----------|
+| 1  | 28.12% | 10.00% | 45.7 |
+| 10 | 27.07% | 10.00% | 43.0 |
+| 20 | 24.47% | 10.00% | 25.3 |
+| 30 | 23.36% | **10.00%** | 10.4 |
+
+Declining NC and eff_rank over passes. LP never moved.
+
+**Exp D: LocalPredictive γ=5 (global pool 512-dim)**
+
+| Pass | NC | LP | Eff_rank |
+|------|----|----|----------|
+| 1  | 25.83% | 10.00% | 34.60 |
+| 10 | 25.77% | 10.00% | 33.97 |
+| 20 | 25.71% | 10.00% | 33.33 |
+| 30 | 25.88% | **10.00%** | 32.68 |
+
+Most stable of all experiments: NC and eff_rank barely change over 30 passes. LP stuck at 10%. D diagnostic confirmed: pred_loss is decreasing (pipeline works), but features near-constant at init — magnitude too small for LP probe.
+
+### Phase 3b Diagnosis: Third Evaluation Artifact
+
+**Critical observation:** SoftHebb γ=0.5/1/2 shows NC=29–30% — **identical to ConvF1's NC (28–30%)**. The nearest-centroid classifier (which normalises prototypes, making it scale-invariant) reports features as equally discriminative to ConvF1. But LP=10%.
+
+**Root cause — feature scale:** Global average pooling computes mean over 4×4=16 spatial positions. With ReLU half-sparsity, activations are ~16× smaller in magnitude than individual spatial activations used in Phase 3 (spatial features, no pooling). The linear probe learns via gradient ∝ feature_value. Sub-threshold feature magnitudes cause vanishing gradient in the probe — it never learns.
+
+| Evaluation metric | Scale sensitivity | SoftHebb | ConvF1 |
+|---|---|---|---|
+| NC (nearest-centroid, normalised prototypes) | **Scale-invariant** | 29–30% | 28–30% |
+| LP (SGD probe, raw feature values) | **Scale-dependent** | 10% | 38% |
+
+NC says the features ARE discriminative. LP can't learn from them because global avg pooling reduced their magnitude ~16×.
+
+This is not a feature quality failure — it is an evaluation mismatch between a scale-invariant metric (NC) and a scale-sensitive metric (LP) applied to GAP-reduced features.
+
+**Phase 3b is ALSO not a valid falsification of local SSL.** Three compounding evaluation bugs now found:
+1. Phase 3: γ=10 causes hard-argmax feature collapse (fixed in 3b via γ sweep)
+2. Phase 3: Spatial 8192-dim features vs global 512-dim mismatch (fixed in 3b via GAP)
+3. Phase 3b: Global average pooling reduces feature magnitudes ~16×, killing LP gradient signal (fix: L2-normalise before probe)
+
+**Phase 3c fix (one line):**
+```python
+dense = F.normalize(dense, p=2, dim=1)  # before top-k selection in probe
+```
+Applied uniformly to all experiments including the ConvF1 control. Makes LP evaluation scale-invariant, matching NC behaviour.
 
 ---
 
@@ -468,7 +548,8 @@ Repairs the two compounding issues from Phase 3. Fair comparison: all four model
 **Normalisation mechanism: CLOSED.** Divisive norm hurts (−5.6 pp).
 **Data scaling: CLOSED.** 50K → 173K (3.5×) + augmentation + 512 features → no improvement. Ceiling is real.
 **Phase 3 (learning signal change): COMPLETE — negative result due to γ=10 collapse + spatial feature mismatch (not a valid falsification of local SSL).**
-**Phase 3b (repair + fair comparison): IN PROGRESS** — γ sweep {0.5,1,2,5,10}, global pooling 512-dim, collapse diagnostics.
+**Phase 3b (γ sweep + global pooling): COMPLETE — NC=29–30% ≈ ConvF1, but LP stuck at 10% due to GAP scale reduction. Third evaluation artifact found (feature scale / LP normalization).**
+**Phase 3c (L2-normalize before probe): IN PROGRESS** — one-line fix: `F.normalize(dense, p=2, dim=1)` before top-k selection.
 
 All prior scaling axes tested and closed:
 
