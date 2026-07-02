@@ -1,6 +1,6 @@
 # Hebbian Convolutional Feature Learning — CIFAR-10 Ceiling Analysis
 
-**Status:** Phase 3b in progress (2026-07-01) — γ sweep + global pooling + collapse diagnostics
+**Status:** Phase 4 complete (2026-07-02) — contrastive objective valid, local approximation failed
 **Date:** 2026-06-29
 **Authors:** Bio-ARN Team (Sprint J + Final Validation + Bias Audit + Progressive Scaling)
 
@@ -483,6 +483,120 @@ Phase 3 B result reproduced (LP peaks ~20% at collapse with spatial features).
 | 30 | 23.36% | **10.00%** | 10.4 |
 
 Declining NC and eff_rank over passes. LP never moved.
+
+---
+
+## Phase 3c Repair — L2-Normalisation Fix (2026-07-02) — COMPLETE
+
+**Label: True gap found. Phase 3b result invalidated by feature-scale bug.**
+**Script:** `experiments/local_ssl_3c.py` | **Commit:** `00c00b6`
+
+Third evaluation artifact: global average pooling reduces feature magnitudes ~16× relative to spatial features. LP gradient ∝ raw feature value → vanishes. NC (argmax-based, scale-invariant) was unaffected and correctly showed SoftHebb NC ≈ ConvF1 NC. Fix: `F.normalize(dense, p=2, dim=1)` before sparse probe selection.
+
+### Phase 3c Results (50K, 30 passes, L2-norm fix applied)
+
+| Exp | Model | Pass 1 LP | Pass 30 LP (best) | Δ vs ConvF1 | eff_rank (pass 30) |
+|-----|-------|-----------|-------------------|-------------|---------------------|
+| A | ConvF1 control | 28.78% | **38.00%** | — | 3387 |
+| B | SoftHebb γ=0.5 | — | 29.97% | −8.0 pp | 18 |
+| B | SoftHebb γ=1 | — | 30.42% | −7.6 pp | 18 |
+| B | SoftHebb γ=2 | — | **31.38%** | −6.6 pp | 26 |
+| B | SoftHebb γ=5 | — | 31.87% peak → collapse | — | — |
+| B | SoftHebb γ=10 | — | 32.47% pass 1 → collapse | — | 1 |
+| C | LocalContrastive γ=10 | — | 31.14% peak → collapse | −6.9 pp | — |
+| D | LocalPredictive γ=10 | — | 29.19% (slow decline) | −8.8 pp | — |
+
+**True gap (post all-artifact-repair): SoftHebb/local-SSL ~30–32% vs ConvF1 38.00% — a 6–9 pp gap.**
+
+**Cause:** ConvF1 eff_rank ≈ 3700 (near full-rank, 3 diversity mechanisms: Oja decay, filter decorr, competitive_k). SoftHebb eff_rank ≈ 17–30 (stable but low — no explicit filter diversity beyond soft-WTA). ConvF1 keeps improving pass 1→30 (+9.2 pp). SoftHebb plateau from pass 1 (+0.3 pp).
+
+**Interpretation:** The gap is caused by filter diversity, not the evaluation artifact. Phase 3 view-consistency (Exp C) is not true contrastive learning — it has no negative pairs or anti-collapse mechanism. The missing ingredient is explicit representational separation with negatives.
+
+---
+
+## Phase 4 — Contrastive InfoNCE: Two-Lane Experiment (2026-07-02) — COMPLETE
+
+**Status:** Phase 4 control matched, backprop ceiling shattered, local approximation failed.
+**Script:** `experiments/local_contrastive_infonce.py` | **Commit:** `bd8649b`
+
+### Design
+
+Two lanes with identical CIFAR-10 evaluation protocol (50K train / 10K test, 100-epoch LP):
+
+- **Lane 1 (Exp E) — Backprop InfoNCE upper bound:** SimCLR-style NT-Xent loss, two augmented views, backprop through encoder. Labelled BACKPROP_UPPER_BOUND. Used only as a diagnostic ceiling — not Bio-ARN-pure.
+- **Lane 2 (Exp F) — Local InfoNCE (BIO_ARN_LOCAL):** Same batch construction. SoftHebbNet backbone (γ=2.0). Positive Hebbian modulation for same-image view pairs; negative anti-Hebbian modulation for shuffled-batch (different-image) pairs. No backprop through encoder. Oja decay=0.05, filter decorrelation=0.02.
+
+**Augmentation:** RandomResizedCrop (scale 0.2–1.0), horizontal flip, colour jitter (brightness/contrast/saturation 0.6–1.4, p=0.8), random grayscale (p=0.2). Implemented as batched `affine_grid + grid_sample` (19× speedup over per-image interpolation).
+
+### Phase 4 Results (50K, 30 passes/epochs, 100-epoch LP, seed=42)
+
+| Exp | Model | Pass 1 LP | Pass 5 LP | Pass 10 LP | Pass 20 LP | Pass 30 LP | eff_rank (final) |
+|-----|-------|-----------|-----------|------------|------------|------------|-------------------|
+| A | ConvF1 control | 28.78% | 34.00% | 37.29% | 37.95% | **38.00%** | 3388 |
+| E | SimCLR BACKPROP_UPPER_BOUND | 42.64% | 53.32% | 58.19% | 62.73% | **65.54%** | 246 |
+| F | LocalInfoNCE BIO_ARN_LOCAL | 31.06% | 31.16% | 31.29% | 31.78% | **31.95%** | 28 |
+
+### Acceptance Ladder Verdict
+
+| Target | Threshold | Result | Verdict |
+|--------|-----------|--------|---------|
+| Local LP > 38.00% | SUCCESS | 31.95% | ❌ FAIL |
+| Local LP > 45.00% | STRONG SUCCESS | 31.95% | ❌ FAIL |
+| Local LP > 50.00% | BREAKTHROUGH | 31.95% | ❌ FAIL |
+| Objective valid (only E > 38%) | — | E=65.54% | ✅ CONFIRMED |
+
+**Verdict: "Objective valid, local approximation not yet solved."**
+
+### Phase 4 Interpretation
+
+**What Exp E (SimCLR) proved:**
+- The contrastive objective shatters the 38% ceiling: +27.54 pp (38.00% → 65.54%)
+- LP improves monotonically through all 30 epochs (42.64% → 65.54%)
+- eff_rank grows with training (66 → 246) — backprop actively diversifies representations
+- Loss falls steadily (epoch 1: ~3.60 → epoch 30: ~2.60) — training is stable
+- **The architecture is not the bottleneck. The objective is.**
+
+**What Exp F (LocalInfoNCE) showed:**
+- LP is near-flat throughout: 31.06% → 31.16% → 31.29% → 31.78% → 31.95%
+- eff_rank is near-constant: 29.79 → 29.57 → 29.27 → 28.64 → 28.02 (stable, very low)
+- filter_cosim near-zero and falling (0.013 → 0.004) — filters ARE becoming more diverse
+- NC stable at ~30% throughout — same as SoftHebb Phase 3c without any contrastive signal
+- **The local contrastive modulation is not transmitting into the representations.**
+
+**Why the local approximation fails:**
+1. **LP matches pure SoftHebb** (31.95% vs 31.38% Phase 3c γ=2 SoftHebb — identical within noise). The positive/negative Hebbian modulation is not adding representational signal beyond the baseline SoftHebb dynamics.
+2. **eff_rank does not grow** (28 stable vs SimCLR's 66→246). Backprop InfoNCE actively diversifies representations across all layers simultaneously. Local updates modify weights per-layer without coordinating the representational geometry across the full encoder.
+3. **The anti-Hebbian push is weak.** Negative modulation uses shuffled-batch pairs with weight −0.5 × neg_mod. At SoftHebb γ=2 where many filters weakly co-activate, the negative signal diffuses rather than selectively pushing discriminative dimensions apart.
+4. **No credit assignment.** The representational objective (push different-class features apart) requires distributing that error signal across multiple layers. Local Hebbian updates can only modify the immediately post-synaptic weights — they cannot propagate the "these two features are too similar" signal to earlier layers.
+
+### Phase 4 Confirmed Findings
+
+| Finding | Evidence |
+|---------|----------|
+| The 38% ConvF1 ceiling is not architectural — it is objective-limited | SimCLR (same architecture backbone) reaches 65.54% |
+| The contrastive objective alone is sufficient to break the ceiling | +27.54 pp with backprop InfoNCE |
+| Local Hebbian contrastive modulation does not approximate the backprop contrastive benefit | LocalInfoNCE LP = 31.95% ≈ pure SoftHebb 31.38% |
+| Layer-local weight updates cannot coordinate multi-layer representational geometry | eff_rank stable at 28 vs SimCLR's 66→246 growth |
+| The credit-assignment problem remains unsolved for this architecture | No LP improvement from negative pairs across 30 passes |
+
+### What This Rules Out
+
+- ❌ "The ceiling is architectural" — disproved by SimCLR 65.54% on same backbone width
+- ❌ "More Hebbian passes will eventually close the gap" — LP flat 31→32% across all 30 passes
+- ❌ "Local positive+negative modulation approximates InfoNCE" — LP = SoftHebb baseline
+- ❌ "Filter diversity alone explains the gap" — LocalInfoNCE has very low filter_cosim (filters ARE diverse) but LP does not improve
+
+### What Remains Open
+
+- ✅ Can a stronger local objective (BYOL-style, LFNA, predictive coding) transmit more contrastive signal?
+- ✅ Can layer-wise target propagation (instead of pure Hebbian) approximate the backprop credit path?
+- ✅ Does recurrence or temporal continuity (missing in current Bio-ARN) provide implicit credit assignment?
+
+### Recommended Phase 5
+
+If continuing: the next experiment should test **local target propagation** (e.g., Difference Target Propagation or DRTP) as the credit-assignment mechanism, keeping the contrastive objective from Exp E but replacing backprop with a locally-computed target.
+
+Alternatively: accept the Phase 4 result as the final Bio-ARN finding — that biologically-constrained local learning cannot approximate contrastive self-supervision without some form of non-local credit signal — and document this as the principal conclusion.
 
 **Exp D: LocalPredictive γ=5 (global pool 512-dim)**
 
